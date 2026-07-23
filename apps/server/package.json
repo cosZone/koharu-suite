@@ -27,7 +27,7 @@
     "db:generate": "drizzle-kit generate",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "test": "vitest run --exclude test/integration/**",
+    "test": "vitest run --exclude \"test/integration/**\"",
     "test:integration": "vitest run test/integration",
     "typecheck": "tsc --noEmit"
   },

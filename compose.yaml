@@ -26,8 +26,12 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-koharu}:${POSTGRES_PASSWORD:-koharu}@db:5432/${POSTGRES_DB:-koharu}
       PORT: 3000
+      POSTGRES_DB: ${POSTGRES_DB:-koharu}
+      POSTGRES_HOST: db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-koharu}
     healthcheck:
       test:
         - CMD

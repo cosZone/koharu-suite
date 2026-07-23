@@ -54,7 +54,6 @@ function parseCli(): { command: string | undefined; options: CliOptions } {
 }
 
 async function main(): Promise<void> {
-  loadEnvironmentFile();
   const { command, options } = parseCli();
 
   if (options.version) {
@@ -66,6 +65,8 @@ async function main(): Promise<void> {
     printHelp();
     return;
   }
+
+  loadEnvironmentFile();
 
   if (command === 'serve') {
     registerGracefulShutdown(startServer(resolvePort(options.port)));

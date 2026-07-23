@@ -16,4 +16,16 @@ describe('configuration', () => {
     );
     expect(() => resolveDatabaseUrl('https://example.com')).toThrow();
   });
+
+  it('encodes discrete PostgreSQL settings without corrupting reserved password characters', () => {
+    expect(
+      resolveDatabaseUrl(undefined, {
+        POSTGRES_DB: 'koharu',
+        POSTGRES_HOST: 'db',
+        POSTGRES_PASSWORD: 'slash/pass#word',
+        POSTGRES_PORT: '5432',
+        POSTGRES_USER: 'koharu',
+      }),
+    ).toBe('postgresql://koharu:slash%2Fpass%23word@db:5432/koharu');
+  });
 });
