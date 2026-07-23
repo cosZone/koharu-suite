@@ -400,6 +400,32 @@ describe('owner admin endpoints', () => {
     await expect(revealed.json()).resolves.toEqual({ update: rawUpdate });
   });
 
+  it('rejects service tokens at the raw provenance boundary', async () => {
+    const getRawUpdate = vi.fn(async () => channelPostFixture());
+    const authorize = vi.fn(async () => ({
+      allowed: true,
+      principal: serviceTokenPrincipal,
+    }));
+    const response = await createApp({
+      admin: {
+        getRawUpdate,
+        getStatus: vi.fn(),
+      },
+      auth: createAuthorizedAuth(serviceTokenPrincipal, authorize),
+    }).request(`/api/v1/admin/messages/${MESSAGE_ID}/raw`, {
+      headers: { Authorization: 'Bearer khs_test' },
+    });
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('vary')).toBe('Cookie, Authorization');
+    expect(authorize).toHaveBeenCalledWith(expect.any(Headers), 'admin:read');
+    expect(getRawUpdate).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'owner_session_required' },
+    });
+  });
+
   it('requests admin:read for a service-token status request and never makes it cacheable', async () => {
     const authorize = vi.fn(async (_headers: Headers) => ({
       allowed: true,

@@ -3,18 +3,26 @@ import type { Database } from '../db/client.js';
 import {
   messageMedia,
   messageRevisions,
+  messageSourceObservations,
   messages,
   telegramChannels,
   telegramUpdates,
 } from '../db/schema.js';
 import type { NormalizedChannelPost } from '../telegram/types.js';
+import { CURRENT_MESSAGE_FINGERPRINT_VERSION, fingerprintMessageSnapshot } from './fingerprint.js';
 import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from './renderer.js';
 import type {
   MessageListOptions,
   MessagePage,
   MessageReader,
+  NormalizedMessageSnapshot,
   PublicMedia,
   PublicMessage,
+  SourceNeutralMedia,
+  SourceObservation,
+  SourceResolution,
+  SourceWriteDecision,
+  SourceWriteResult,
 } from './types.js';
 
 export interface IngestResult {
@@ -25,6 +33,14 @@ export interface IngestResult {
 
 export interface MessageWriter {
   ingest(post: NormalizedChannelPost): Promise<IngestResult>;
+  ingestSnapshot(
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<SourceWriteResult>;
+  previewSnapshot(
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<SourceWriteDecision>;
 }
 
 type MessageRow = Awaited<ReturnType<PostgresMessageRepository['selectMessages']>>[number];
@@ -32,6 +48,28 @@ type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0]
 
 function sourceUrl(username: string | null, telegramMessageId: bigint): string | null {
   return username ? `https://t.me/${username}/${telegramMessageId}` : null;
+}
+
+function snapshotFromBotPost(post: NormalizedChannelPost): NormalizedMessageSnapshot {
+  return {
+    channel: post.channel,
+    media: post.media.map((media) => ({
+      availabilityReason: null,
+      duration: media.duration,
+      fileName: media.fileName,
+      fileSize: media.fileSize,
+      height: media.height,
+      kind: media.kind,
+      mimeType: media.mimeType,
+      sourceMediaType: media.kind,
+      sourceMetadata: {},
+      sourcePath: null,
+      telegramFileId: media.fileId,
+      telegramFileUniqueId: media.fileUniqueId,
+      width: media.width,
+    })),
+    message: post.message,
+  };
 }
 
 function publicMedia(row: typeof messageMedia.$inferSelect): PublicMedia {
@@ -80,20 +118,183 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     transaction: DatabaseTransaction,
     post: NormalizedChannelPost,
   ): Promise<IngestResult> {
+    const result = await this.ingestSnapshotInTransaction(transaction, snapshotFromBotPost(post), {
+      importRunId: null,
+      kind: 'telegram_bot_update',
+      observedAt: null,
+      raw: post.rawUpdate,
+      sourceMetadata: {},
+      sourceKey: post.telegramUpdateId.toString(),
+      telegramUpdateId: post.telegramUpdateId,
+      updateType: post.updateType,
+    });
+    return {
+      channelId: result.channelId,
+      messageId: result.messageId,
+      replayed: result.replayed || (post.updateType === 'channel_post' && !result.createdRevision),
+    };
+  }
+
+  async ingestSnapshot(
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<SourceWriteResult> {
+    return this.database.transaction((transaction) =>
+      this.ingestSnapshotInTransaction(transaction, snapshot, observation),
+    );
+  }
+
+  async previewSnapshot(
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<SourceWriteDecision> {
+    return this.database.transaction(async (transaction) => {
+      const [channel] = await transaction
+        .select({ id: telegramChannels.id })
+        .from(telegramChannels)
+        .where(eq(telegramChannels.telegramChatId, snapshot.channel.telegramChatId))
+        .limit(1);
+      if (!channel) {
+        return {
+          createdMessage: true,
+          createdRevision: true,
+          replayed: false,
+          resolution: 'created',
+        };
+      }
+
+      const identity = await this.selectIdentity(
+        transaction,
+        channel.id,
+        snapshot.message.telegramMessageId,
+      );
+      if (!identity) {
+        return {
+          createdMessage: true,
+          createdRevision: true,
+          replayed: false,
+          resolution: 'created',
+        };
+      }
+
+      const [existingObservation] = await transaction
+        .select({
+          channelId: messageSourceObservations.channelId,
+          messageId: messageSourceObservations.messageId,
+          resolution: messageSourceObservations.resolution,
+          telegramMessageId: messageSourceObservations.telegramMessageId,
+        })
+        .from(messageSourceObservations)
+        .where(
+          and(
+            eq(messageSourceObservations.sourceKind, observation.kind),
+            eq(messageSourceObservations.sourceKey, observation.sourceKey),
+          ),
+        )
+        .limit(1);
+      if (existingObservation) {
+        if (
+          existingObservation.channelId !== channel.id ||
+          existingObservation.messageId !== identity.id ||
+          existingObservation.telegramMessageId !== snapshot.message.telegramMessageId
+        ) {
+          throw new Error('Source observation key is already associated with another message');
+        }
+        return {
+          createdMessage: false,
+          createdRevision: false,
+          replayed: true,
+          resolution: existingObservation.resolution,
+        };
+      }
+
+      if (observation.kind === 'telegram_bot_update') {
+        if (observation.updateType === 'edited_channel_post') {
+          return {
+            createdMessage: false,
+            createdRevision: true,
+            replayed: false,
+            resolution: 'created',
+          };
+        }
+        const fingerprint = fingerprintMessageSnapshot(snapshot);
+        const matchingRevisionId = await this.selectMatchingRevisionId(
+          transaction,
+          identity.id,
+          snapshot,
+          fingerprint,
+        );
+        return {
+          createdMessage: false,
+          createdRevision: false,
+          replayed: false,
+          resolution: matchingRevisionId ? 'matched' : 'conflict',
+        };
+      }
+
+      const fingerprint = fingerprintMessageSnapshot(snapshot);
+      const matchingRevisionId = await this.selectMatchingRevisionId(
+        transaction,
+        identity.id,
+        snapshot,
+        fingerprint,
+      );
+      if (matchingRevisionId) {
+        return {
+          createdMessage: false,
+          createdRevision: false,
+          replayed: false,
+          resolution: 'matched',
+        };
+      }
+
+      const current = await this.selectCurrentRevision(
+        transaction,
+        identity.id,
+        identity.currentRevisionNumber,
+      );
+      const candidateTime = snapshot.message.editedAt;
+      const currentTime = current.editedAt ?? identity.publishedAt;
+      if (candidateTime && candidateTime.getTime() > currentTime.getTime()) {
+        return {
+          createdMessage: false,
+          createdRevision: true,
+          replayed: false,
+          resolution: 'created',
+        };
+      }
+      return {
+        createdMessage: false,
+        createdRevision: false,
+        replayed: false,
+        resolution:
+          candidateTime && candidateTime.getTime() < currentTime.getTime() ? 'stale' : 'conflict',
+      };
+    });
+  }
+
+  async ingestSnapshotInTransaction(
+    transaction: DatabaseTransaction,
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<SourceWriteResult> {
     const now = new Date();
     const [channel] = await transaction
       .insert(telegramChannels)
       .values({
-        telegramChatId: post.channel.telegramChatId,
-        title: post.channel.title,
-        username: post.channel.username,
+        telegramChatId: snapshot.channel.telegramChatId,
+        title: snapshot.channel.title,
+        username: snapshot.channel.username,
       })
       .onConflictDoUpdate({
         target: telegramChannels.telegramChatId,
         set: {
-          title: post.channel.title,
+          title: snapshot.channel.title,
           updatedAt: now,
-          username: post.channel.username,
+          username:
+            observation.kind === 'telegram_desktop_json' && snapshot.channel.username === null
+              ? telegramChannels.username
+              : snapshot.channel.username,
         },
       })
       .returning({ id: telegramChannels.id });
@@ -102,84 +303,180 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       throw new Error('Failed to resolve Telegram channel');
     }
 
-    const [insertedUpdate] = await transaction
-      .insert(telegramUpdates)
-      .values({
-        channelId: channel.id,
-        rawJson: post.rawUpdate,
-        telegramUpdateId: post.telegramUpdateId,
-        updateType: post.updateType,
-      })
-      .onConflictDoNothing({ target: telegramUpdates.telegramUpdateId })
-      .returning({ telegramUpdateId: telegramUpdates.telegramUpdateId });
-
-    if (!insertedUpdate) {
-      const existing = await this.selectIdentity(
-        transaction,
-        channel.id,
-        post.message.telegramMessageId,
-      );
-      if (!existing) {
-        throw new Error('Telegram update exists without its normalized message');
-      }
-
-      return {
-        channelId: channel.id,
-        messageId: existing.id,
-        replayed: true,
-      };
-    }
-
-    const existing = await this.selectIdentity(
-      transaction,
-      channel.id,
-      post.message.telegramMessageId,
-      true,
-    );
-    if (!existing) {
-      const [insertedMessage] = await transaction
-        .insert(messages)
+    if (observation.kind === 'telegram_bot_update') {
+      await transaction
+        .insert(telegramUpdates)
         .values({
           channelId: channel.id,
-          publishedAt: post.message.publishedAt,
-          telegramMessageId: post.message.telegramMessageId,
+          rawJson: observation.raw,
+          telegramUpdateId: observation.telegramUpdateId,
+          updateType: observation.updateType,
         })
-        .returning({ id: messages.id });
-
-      if (!insertedMessage) {
-        throw new Error('Failed to create normalized Telegram message');
-      }
-
-      await this.insertRevision(transaction, insertedMessage.id, 1, post);
-      return {
-        channelId: channel.id,
-        messageId: insertedMessage.id,
-        replayed: false,
-      };
+        .onConflictDoNothing({ target: telegramUpdates.telegramUpdateId });
     }
 
-    if (post.updateType === 'channel_post') {
-      return {
+    const [insertedMessage] = await transaction
+      .insert(messages)
+      .values({
         channelId: channel.id,
-        messageId: existing.id,
-        replayed: true,
-      };
-    }
-
-    const revisionNumber = existing.currentRevisionNumber + 1;
-    await this.insertRevision(transaction, existing.id, revisionNumber, post);
-    await transaction
-      .update(messages)
-      .set({
-        currentRevisionNumber: revisionNumber,
-        updatedAt: now,
+        publishedAt: snapshot.message.publishedAt,
+        telegramMessageId: snapshot.message.telegramMessageId,
       })
-      .where(eq(messages.id, existing.id));
+      .onConflictDoNothing({
+        target: [messages.channelId, messages.telegramMessageId],
+      })
+      .returning({ id: messages.id });
+    const identity = await this.selectIdentity(
+      transaction,
+      channel.id,
+      snapshot.message.telegramMessageId,
+      true,
+    );
+    if (!identity) {
+      throw new Error('Failed to resolve normalized Telegram message');
+    }
 
+    const [replayedObservation] = await transaction
+      .select({
+        channelId: messageSourceObservations.channelId,
+        messageId: messageSourceObservations.messageId,
+        resolution: messageSourceObservations.resolution,
+        revisionId: messageSourceObservations.revisionId,
+        telegramMessageId: messageSourceObservations.telegramMessageId,
+      })
+      .from(messageSourceObservations)
+      .where(
+        and(
+          eq(messageSourceObservations.sourceKind, observation.kind),
+          eq(messageSourceObservations.sourceKey, observation.sourceKey),
+        ),
+      )
+      .limit(1);
+    if (replayedObservation) {
+      if (
+        replayedObservation.channelId !== channel.id ||
+        replayedObservation.messageId !== identity.id ||
+        replayedObservation.telegramMessageId !== snapshot.message.telegramMessageId
+      ) {
+        throw new Error('Source observation key is already associated with another message');
+      }
+      return {
+        channelId: channel.id,
+        createdMessage: false,
+        createdRevision: false,
+        messageId: identity.id,
+        replayed: true,
+        resolution: replayedObservation.resolution,
+        revisionId: replayedObservation.revisionId,
+      };
+    }
+
+    const fingerprint = fingerprintMessageSnapshot(snapshot);
+    let createdRevision = false;
+    let resolution: SourceResolution;
+    let revisionId: string | null;
+
+    if (insertedMessage) {
+      revisionId = await this.insertRevision(transaction, identity.id, 1, snapshot, observation);
+      createdRevision = true;
+      resolution = 'created';
+    } else if (observation.kind === 'telegram_bot_update') {
+      if (observation.updateType === 'edited_channel_post') {
+        const revisionNumber = identity.currentRevisionNumber + 1;
+        revisionId = await this.insertRevision(
+          transaction,
+          identity.id,
+          revisionNumber,
+          snapshot,
+          observation,
+        );
+        await transaction
+          .update(messages)
+          .set({
+            currentRevisionNumber: revisionNumber,
+            updatedAt: now,
+          })
+          .where(eq(messages.id, identity.id));
+        createdRevision = true;
+        resolution = 'created';
+      } else {
+        revisionId = await this.selectMatchingRevisionId(
+          transaction,
+          identity.id,
+          snapshot,
+          fingerprint,
+        );
+        resolution = revisionId ? 'matched' : 'conflict';
+      }
+    } else {
+      const matchingRevisionId = await this.selectMatchingRevisionId(
+        transaction,
+        identity.id,
+        snapshot,
+        fingerprint,
+      );
+      if (matchingRevisionId) {
+        revisionId = matchingRevisionId;
+        resolution = 'matched';
+      } else {
+        const current = await this.selectCurrentRevision(
+          transaction,
+          identity.id,
+          identity.currentRevisionNumber,
+        );
+        const candidateTime = snapshot.message.editedAt;
+        const currentTime = current.editedAt ?? identity.publishedAt;
+        if (candidateTime && candidateTime.getTime() > currentTime.getTime()) {
+          const revisionNumber = identity.currentRevisionNumber + 1;
+          revisionId = await this.insertRevision(
+            transaction,
+            identity.id,
+            revisionNumber,
+            snapshot,
+            observation,
+          );
+          await transaction
+            .update(messages)
+            .set({
+              currentRevisionNumber: revisionNumber,
+              updatedAt: now,
+            })
+            .where(eq(messages.id, identity.id));
+          createdRevision = true;
+          resolution = 'created';
+        } else {
+          revisionId = null;
+          resolution =
+            candidateTime && candidateTime.getTime() < currentTime.getTime() ? 'stale' : 'conflict';
+        }
+      }
+    }
+
+    await transaction.insert(messageSourceObservations).values({
+      channelId: channel.id,
+      contentFingerprint: fingerprint,
+      contentFingerprintVersion: CURRENT_MESSAGE_FINGERPRINT_VERSION,
+      importRunId: observation.kind === 'telegram_desktop_json' ? observation.importRunId : null,
+      messageId: identity.id,
+      observedAt: observation.observedAt,
+      rawJson: observation.raw,
+      resolution,
+      revisionId,
+      sourceMetadata: observation.sourceMetadata,
+      sourceKey: observation.sourceKey,
+      sourceKind: observation.kind,
+      telegramMessageId: snapshot.message.telegramMessageId,
+      telegramUpdateId:
+        observation.kind === 'telegram_bot_update' ? observation.telegramUpdateId : null,
+    });
     return {
       channelId: channel.id,
-      messageId: existing.id,
+      createdMessage: insertedMessage !== undefined,
+      createdRevision,
+      messageId: identity.id,
       replayed: false,
+      resolution,
+      revisionId,
     };
   }
 
@@ -252,6 +549,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       .select({
         currentRevisionNumber: messages.currentRevisionNumber,
         id: messages.id,
+        publishedAt: messages.publishedAt,
       })
       .from(messages)
       .where(
@@ -267,25 +565,27 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     transaction: DatabaseTransaction,
     messageId: string,
     revisionNumber: number,
-    post: NormalizedChannelPost,
-  ): Promise<void> {
+    snapshot: NormalizedMessageSnapshot,
+    observation: SourceObservation,
+  ): Promise<string> {
     const [revision] = await transaction
       .insert(messageRevisions)
       .values({
-        authorSignature: post.message.authorSignature,
-        contentKind: post.message.contentKind,
-        editedAt: post.message.editedAt,
-        entities: post.message.entities,
+        authorSignature: snapshot.message.authorSignature,
+        contentKind: snapshot.message.contentKind,
+        editedAt: snapshot.message.editedAt,
+        entities: snapshot.message.entities,
         html:
-          post.message.text === null
+          snapshot.message.text === null
             ? null
-            : renderTelegramMessage(post.message.text, post.message.entities),
-        mediaGroupId: post.message.mediaGroupId,
+            : renderTelegramMessage(snapshot.message.text, snapshot.message.entities),
+        mediaGroupId: snapshot.message.mediaGroupId,
         messageId,
         rendererVersion: CURRENT_RENDERER_VERSION,
         revisionNumber,
-        telegramUpdateId: post.telegramUpdateId,
-        text: post.message.text,
+        telegramUpdateId:
+          observation.kind === 'telegram_bot_update' ? observation.telegramUpdateId : null,
+        text: snapshot.message.text,
       })
       .returning({ id: messageRevisions.id });
 
@@ -293,9 +593,10 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       throw new Error('Failed to create message revision');
     }
 
-    if (post.media.length > 0) {
+    if (snapshot.media.length > 0) {
       await transaction.insert(messageMedia).values(
-        post.media.map((media, position) => ({
+        snapshot.media.map((media, position) => ({
+          availabilityReason: media.availabilityReason,
           duration: media.duration,
           fileName: media.fileName,
           fileSize: media.fileSize,
@@ -304,12 +605,116 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
           mimeType: media.mimeType,
           position,
           revisionId: revision.id,
-          telegramFileId: media.fileId,
-          telegramFileUniqueId: media.fileUniqueId,
+          sourceKind: observation.kind,
+          sourceMediaType: media.sourceMediaType,
+          sourceMetadata: media.sourceMetadata,
+          sourcePath: media.sourcePath,
+          telegramFileId: media.telegramFileId,
+          telegramFileUniqueId: media.telegramFileUniqueId,
           width: media.width,
         })),
       );
     }
+
+    return revision.id;
+  }
+
+  private async selectCurrentRevision(
+    transaction: DatabaseTransaction,
+    messageId: string,
+    revisionNumber: number,
+  ) {
+    const [revision] = await transaction
+      .select({
+        editedAt: messageRevisions.editedAt,
+        id: messageRevisions.id,
+      })
+      .from(messageRevisions)
+      .where(
+        and(
+          eq(messageRevisions.messageId, messageId),
+          eq(messageRevisions.revisionNumber, revisionNumber),
+        ),
+      )
+      .limit(1);
+    if (!revision) {
+      throw new Error('Current message revision was not found');
+    }
+    return revision;
+  }
+
+  private async selectMatchingRevisionId(
+    transaction: DatabaseTransaction,
+    messageId: string,
+    candidate: NormalizedMessageSnapshot,
+    candidateFingerprint: string,
+  ): Promise<string | null> {
+    const revisions = await transaction
+      .select({
+        authorSignature: messageRevisions.authorSignature,
+        contentKind: messageRevisions.contentKind,
+        editedAt: messageRevisions.editedAt,
+        entities: messageRevisions.entities,
+        id: messageRevisions.id,
+        mediaGroupId: messageRevisions.mediaGroupId,
+        publishedAt: messages.publishedAt,
+        telegramMessageId: messages.telegramMessageId,
+        text: messageRevisions.text,
+      })
+      .from(messageRevisions)
+      .innerJoin(messages, eq(messages.id, messageRevisions.messageId))
+      .where(eq(messageRevisions.messageId, messageId))
+      .orderBy(asc(messageRevisions.revisionNumber));
+    const mediaRows = await transaction
+      .select()
+      .from(messageMedia)
+      .where(
+        inArray(
+          messageMedia.revisionId,
+          revisions.map((revision) => revision.id),
+        ),
+      )
+      .orderBy(asc(messageMedia.position));
+    const mediaByRevision = new Map<string, SourceNeutralMedia[]>();
+    for (const media of mediaRows) {
+      const revisionMedia = mediaByRevision.get(media.revisionId) ?? [];
+      revisionMedia.push({
+        availabilityReason: media.availabilityReason,
+        duration: media.duration,
+        fileName: media.fileName,
+        fileSize: media.fileSize,
+        height: media.height,
+        kind: media.kind,
+        mimeType: media.mimeType,
+        sourceMediaType: media.sourceMediaType,
+        sourceMetadata: media.sourceMetadata,
+        sourcePath: media.sourcePath,
+        telegramFileId: media.telegramFileId,
+        telegramFileUniqueId: media.telegramFileUniqueId,
+        width: media.width,
+      });
+      mediaByRevision.set(media.revisionId, revisionMedia);
+    }
+    for (const revision of revisions) {
+      const fingerprint = fingerprintMessageSnapshot({
+        channel: candidate.channel,
+        media: mediaByRevision.get(revision.id) ?? [],
+        message: {
+          authorSignature: revision.authorSignature,
+          contentKind: revision.contentKind,
+          editedAt: revision.editedAt,
+          entities: revision.entities,
+          mediaGroupId: revision.mediaGroupId,
+          publishedAt: revision.publishedAt,
+          telegramMessageId: revision.telegramMessageId,
+          text: revision.text,
+        },
+      });
+      if (fingerprint === candidateFingerprint) {
+        return revision.id;
+      }
+    }
+    return null;
   }
 
   private selectMessages(where: SQL | undefined, limit = 50) {

@@ -43,6 +43,13 @@
       "when": 1784843454260,
       "tag": "0005_silent_pixie",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784849572392,
+      "tag": "0006_unusual_wolfsbane",
+      "breakpoints": true
     }
   ]
 }

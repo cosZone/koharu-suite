@@ -160,6 +160,43 @@ default to 120 requests per client per 60 seconds, configurable with `PUBLIC_RAT
 replicas do not share quotas. `TRUST_PROXY` defaults to `false`; enable it and trust the first
 `X-Forwarded-For` value only when the server is reachable exclusively through a trusted reverse proxy.
 
+## Import Telegram Desktop history
+
+Export each target public channel as JSON from Telegram Desktop first. Every target must already exist in the
+database allowlist through `kodama channel add`; the command never imports private chats, groups, private
+channels, or channels that were not selected explicitly.
+
+```bash
+# The default analyzes the file and database without writing a run, message, or provenance
+pnpm exec kodama import telegram-desktop \
+  --input /path/to/result.json \
+  --channel=-1001234567890
+
+# Apply only after reviewing the dry-run; --channel is repeatable
+pnpm exec kodama import telegram-desktop \
+  --input /path/to/result.json \
+  --channel=-1001234567890 \
+  --channel=-1009876543210 \
+  --apply
+
+# Automation can consume the versioned JSON report
+pnpm exec kodama import telegram-desktop \
+  --input /path/to/result.json \
+  --channel=-1001234567890 \
+  --json
+```
+
+Exit code `0` means clean/replay, `2` means the run completed with conflicts or item errors, and `1` means a
+fatal error or interruption. Apply uses a dedicated advisory lock, bounded transactions, and replay-safe
+provenance, so the same input can safely resume after an interruption. A Desktop export is only a final
+snapshot: only a snapshot with unambiguously newer time can become current, while stale or ambiguous content
+is reported without replacing the archive. G2.1 stores media metadata and constrained relative references
+only; it never reads, copies, or hashes media files, and absence from an export never implies deletion.
+
+Reports contain only counts, numeric channel/message IDs, and bounded sanitized errors. They exclude message
+text, unselected chats, absolute paths, and secrets. Apply stores owner-only source evidence for selected
+public channels; dry-run does not write to the database.
+
 ## Deployment diagnostics
 
 Run the read-only doctor after deployment:

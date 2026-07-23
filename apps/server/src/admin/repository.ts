@@ -1,8 +1,8 @@
-import { and, count, eq, gt, isNotNull, isNull, lt } from 'drizzle-orm';
-import type { Update } from 'grammy/types';
+import { and, count, desc, eq, gt, isNotNull, isNull, lt } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   messageRevisions,
+  messageSourceObservations,
   messages,
   telegramChannelAllowlist,
   telegramIngestTasks,
@@ -32,7 +32,7 @@ export interface AdminStatusSnapshot {
 }
 
 export interface AdminReader {
-  getRawUpdate(messageId: string): Promise<Update | null>;
+  getRawUpdate(messageId: string): Promise<unknown | null>;
   getStatus(): Promise<AdminStatusSnapshot>;
 }
 
@@ -128,9 +128,9 @@ export class PostgresAdminRepository implements AdminReader {
     };
   }
 
-  async getRawUpdate(messageId: string): Promise<Update | null> {
+  async getRawUpdate(messageId: string): Promise<unknown | null> {
     const [row] = await this.database
-      .select({ update: telegramUpdates.rawJson })
+      .select({ update: messageSourceObservations.rawJson })
       .from(messages)
       .innerJoin(
         messageRevisions,
@@ -140,10 +140,11 @@ export class PostgresAdminRepository implements AdminReader {
         ),
       )
       .innerJoin(
-        telegramUpdates,
-        eq(telegramUpdates.telegramUpdateId, messageRevisions.telegramUpdateId),
+        messageSourceObservations,
+        eq(messageSourceObservations.revisionId, messageRevisions.id),
       )
       .where(eq(messages.id, messageId))
+      .orderBy(desc(messageSourceObservations.createdAt), desc(messageSourceObservations.id))
       .limit(1);
 
     return row?.update ?? null;

@@ -1,0 +1,17 @@
+{
+  "name": "Koharu Rich Archive",
+  "type": "public_channel",
+  "id": 1234567890,
+  "messages": [
+    {
+      "id": 99,
+      "type": "message",
+      "date": "2025-01-02T03:04:05+00:00",
+      "date_unixtime": "1735787045",
+      "rich_message": {
+        "type": "page",
+        "blocks": []
+      }
+    }
+  ]
+}

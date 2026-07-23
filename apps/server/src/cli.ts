@@ -10,6 +10,7 @@ import {
   type ServiceTokenPermissions,
   ServiceTokenService,
 } from './auth/service-token.js';
+import { normalizeCliArguments } from './cli-arguments.js';
 import {
   parseTelegramChannelId,
   resolveAuthConfig,
@@ -22,6 +23,16 @@ import {
 import { createDatabaseConnection } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { loadEnvironmentFile } from './env.js';
+import { closeImportResources, registerImportCancellation } from './imports/import-lifecycle.js';
+import { PostgresTelegramDesktopImportRepository } from './imports/import-repository.js';
+import {
+  renderTelegramDesktopImportReport,
+  TELEGRAM_DESKTOP_REPORT_SCHEMA_VERSION,
+  telegramDesktopImportExitCode,
+} from './imports/report.js';
+import { TelegramDesktopInputError } from './imports/telegram-desktop-parser.js';
+import { TelegramDesktopImportService } from './imports/telegram-desktop-service.js';
+import { PostgresMessageRepository } from './messages/repository.js';
 import {
   doctorHasFailures,
   renderDoctorReport,
@@ -48,6 +59,7 @@ Commands:
   owner       Create or reset the singleton owner
   token       Create, list, or revoke scoped service tokens
   channel     Add, list, enable, or disable Telegram channels
+  import      Import historical content
   doctor      Run read-only deployment diagnostics
   health      Run a container-local health check
   help        Show this help
@@ -64,6 +76,10 @@ Options:
       --scope <scope>          Repeatable service token scope
       --expires-in <duration>  Optional token expiry in whole days, for example 30d
       --id <id>                Service token ID
+      --input <path>           Telegram Desktop result.json
+      --channel <id>           Repeatable canonical Telegram channel ID
+      --apply                  Apply an import (default: dry-run)
+      --json                   Print a versioned JSON import report
 
 Owner commands:
   kodama owner create --email owner@example.com [--password-stdin]
@@ -80,6 +96,9 @@ Channel commands:
   kodama channel enable --telegram-id -1001234567890
   kodama channel disable --telegram-id -1001234567890
 
+Import command:
+  kodama import telegram-desktop --input /path/to/result.json --channel -1001234567890 [--apply] [--json]
+
 Doctor command:
   kodama doctor
 
@@ -92,11 +111,15 @@ TELEGRAM_CHANNEL_ID is an optional one-time bootstrap when the allowlist is empt
 `;
 
 interface CliOptions {
+  apply?: boolean;
+  channel?: string[];
   'database-url'?: string;
   email?: string;
   'expires-in'?: string;
   help?: boolean;
   id?: string;
+  input?: string;
+  json?: boolean;
   name?: string;
   'password-stdin'?: boolean;
   port?: string;
@@ -115,13 +138,18 @@ function parseCli(): {
   subcommand: string | undefined;
 } {
   const { positionals, values } = parseArgs({
+    args: normalizeCliArguments(process.argv.slice(2)),
     allowPositionals: true,
     options: {
+      apply: { type: 'boolean' },
+      channel: { multiple: true, type: 'string' },
       'database-url': { type: 'string' },
       email: { type: 'string' },
       'expires-in': { type: 'string' },
       help: { short: 'h', type: 'boolean' },
       id: { type: 'string' },
+      input: { type: 'string' },
+      json: { type: 'boolean' },
       name: { type: 'string' },
       'password-stdin': { type: 'boolean' },
       port: { short: 'p', type: 'string' },
@@ -209,6 +237,71 @@ async function main(): Promise<void> {
   if (command === 'migrate') {
     await runMigrations(resolveDatabaseUrl(options['database-url']));
     process.stdout.write('Database migrations applied.\n');
+    return;
+  }
+
+  if (command === 'import') {
+    if (subcommand !== 'telegram-desktop') {
+      throw new Error('import command must be telegram-desktop');
+    }
+    if (!options.input) {
+      throw new Error('import telegram-desktop requires --input');
+    }
+    if (!options.channel || options.channel.length === 0) {
+      throw new Error('import telegram-desktop requires at least one --channel');
+    }
+
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const channelIds = options.channel.map(parseTelegramChannelId);
+    const connection = createDatabaseConnection(databaseUrl);
+    const repository = new PostgresTelegramDesktopImportRepository(databaseUrl, connection.db);
+    const cancellation = registerImportCancellation();
+    try {
+      const report = await new TelegramDesktopImportService(
+        repository,
+        new PostgresMessageRepository(connection.db),
+      ).run({
+        apply: options.apply === true,
+        channelIds,
+        inputPath: options.input,
+        signal: cancellation.signal,
+      });
+      process.stdout.write(renderTelegramDesktopImportReport(report, options.json === true));
+      process.exitCode = telegramDesktopImportExitCode(report);
+    } catch (error) {
+      const message = sanitizeDiagnosticText(error, [...sensitiveEnvironmentValues(), databaseUrl]);
+      if (options.json) {
+        const code =
+          error instanceof TelegramDesktopInputError
+            ? error.code
+            : 'telegram_desktop_import_failed';
+        process.stdout.write(
+          `${JSON.stringify({
+            error: { code, message },
+            schemaVersion: TELEGRAM_DESKTOP_REPORT_SCHEMA_VERSION,
+            status: 'fatal',
+          })}\n`,
+        );
+      } else {
+        process.stderr.write(`kodama: ${message}\n`);
+      }
+      process.exitCode = 1;
+    } finally {
+      cancellation.cleanup();
+      try {
+        await closeImportResources(
+          () => repository.close(),
+          () => connection.close(),
+        );
+      } catch (error) {
+        const message = sanitizeDiagnosticText(error, [
+          ...sensitiveEnvironmentValues(),
+          databaseUrl,
+        ]);
+        process.stderr.write(`kodama: import cleanup failed: ${message}\n`);
+        process.exitCode = 1;
+      }
+    }
     return;
   }
 

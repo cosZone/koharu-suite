@@ -108,6 +108,41 @@ pg_restore --list "backups/koharu-before-upgrade.dump" >/dev/null
 同时记录当前镜像 digest、版本、commit 和 `docker compose config` 的脱敏副本。不要把展开后的
 secret 写进 Issue、PR 或日志。
 
+## 导入 Telegram Desktop 历史
+
+导入前先完成数据库备份，并确认目标公开频道已经由 `kodama channel add` 加入 allowlist。把
+Telegram Desktop JSON export 只读挂载到一次性 server 容器；不要把整个个人导出目录复制进镜像：
+
+```bash
+# 默认 dry-run，不写数据库
+docker compose run --rm --no-deps \
+  -v /host/export/result.json:/imports/result.json:ro \
+  server node dist/cli.js import telegram-desktop \
+  --input /imports/result.json \
+  --channel=-1001234567890
+
+# 审阅报告后显式 apply
+docker compose run --rm --no-deps \
+  -v /host/export/result.json:/imports/result.json:ro \
+  server node dist/cli.js import telegram-desktop \
+  --input /imports/result.json \
+  --channel=-1001234567890 \
+  --apply --json
+```
+
+`--channel` 可重复，但每个目标都必须在 export 中恰好匹配一个 `public_channel`，且已存在于
+allowlist。disabled channel 可由这个显式命令导入；导入不会改变 enabled 状态、Bot binding、
+cursor、inbox 或 worker heartbeat。
+
+apply 使用独立 advisory lock 与有限批次。进程或数据库中断时，已经提交的批次会保留；修复原因后
+用相同文件重跑，source provenance 会把已经处理的 snapshot 收敛为 replay/matched。退出码 `0`
+表示 clean/replay，`2` 表示有 conflict 或单条错误，`1` 表示 fatal/interrupted。只有时间明确更新
+的 Desktop snapshot 会切换 current；stale/ambiguous 内容不覆盖。导入不会读取媒体文件或推断
+删除。
+
+持久化 report 与 owner-only source evidence 不包含未选择 chat、account contacts/sessions 或本机
+绝对路径。仍应把原始 export 当作敏感备份保管；不要上传到 Issue、PR、CI artifact 或公共对象存储。
+
 ## 升级
 
 Preview 允许短维护窗口。先阅读 GitHub pre-release notes，确认 migration 和最低 Node/PostgreSQL

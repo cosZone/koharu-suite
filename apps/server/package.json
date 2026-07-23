@@ -34,6 +34,8 @@
   "dependencies": {
     "@better-auth/api-key": "catalog:",
     "@hono/node-server": "catalog:",
+    "@streamparser/json": "0.0.22",
+    "@streamparser/json-node": "0.0.22",
     "better-auth": "catalog:",
     "drizzle-orm": "catalog:",
     "grammy": "catalog:",

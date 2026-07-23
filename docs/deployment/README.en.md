@@ -113,6 +113,43 @@ pg_restore --list "backups/koharu-before-upgrade.dump" >/dev/null
 Also record the current image digest, version, commit, and a redacted copy of `docker compose config`. Do not
 put expanded secrets in an Issue, pull request, or log.
 
+## Import Telegram Desktop history
+
+Create a database backup first and confirm every target public channel was added to the allowlist with
+`kodama channel add`. Read-only mount the Telegram Desktop JSON export into a one-shot server container; do
+not copy a complete personal export directory into the image:
+
+```bash
+# Dry-run is the default and does not write to the database
+docker compose run --rm --no-deps \
+  -v /host/export/result.json:/imports/result.json:ro \
+  server node dist/cli.js import telegram-desktop \
+  --input /imports/result.json \
+  --channel=-1001234567890
+
+# Apply explicitly after reviewing the report
+docker compose run --rm --no-deps \
+  -v /host/export/result.json:/imports/result.json:ro \
+  server node dist/cli.js import telegram-desktop \
+  --input /imports/result.json \
+  --channel=-1001234567890 \
+  --apply --json
+```
+
+`--channel` is repeatable. Every target must match exactly one `public_channel` in the export and already
+exist in the allowlist. This explicit command may import a disabled channel, but never changes its enabled
+state, bot binding, cursor, inbox, or worker heartbeat.
+
+Apply uses a dedicated advisory lock and bounded transactions. Batches committed before a process or database
+interruption remain durable; after fixing the cause, rerun the same file and source provenance converges
+completed snapshots to replay/matched. Exit code `0` means clean/replay, `2` means conflicts or item errors,
+and `1` means fatal/interrupted. Only an unambiguously newer Desktop snapshot becomes current; stale or
+ambiguous content never replaces it. The importer neither reads media files nor infers deletion.
+
+Persisted reports and owner-only source evidence exclude unselected chats, account contacts/sessions, and host
+absolute paths. Treat the original export as a sensitive backup; never upload it to an Issue, pull request, CI
+artifact, or public object storage.
+
 ## Upgrade
 
 Preview upgrades permit a short maintenance window. Read the GitHub pre-release notes and confirm migration
