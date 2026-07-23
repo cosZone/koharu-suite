@@ -32,6 +32,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-koharu}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:--1001234567890}
     healthcheck:
       test:
         - CMD

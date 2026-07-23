@@ -1,7 +1,7 @@
 import { serve } from '@hono/node-server';
-import { app } from './app.js';
+import type { Hono } from 'hono';
 
-export function startServer(port: number) {
+export function startServer(app: Hono, port: number) {
   return serve(
     {
       fetch: app.fetch,
@@ -13,17 +13,15 @@ export function startServer(port: number) {
   );
 }
 
-export function registerGracefulShutdown(server: ReturnType<typeof startServer>): void {
-  const cleanup = () => {
-    process.off('SIGINT', shutdown);
-    process.off('SIGTERM', shutdown);
-  };
-  const shutdown = () => {
-    cleanup();
-    server.close();
-  };
+export function closeServer(server: ReturnType<typeof startServer>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
 
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
-  server.once('close', cleanup);
+      resolve();
+    });
+  });
 }

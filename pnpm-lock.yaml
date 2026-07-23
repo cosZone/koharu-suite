@@ -33,6 +33,9 @@ catalogs:
     drizzle-orm:
       specifier: 0.45.2
       version: 0.45.2
+    grammy:
+      specifier: 1.45.1
+      version: 1.45.1
     hono:
       specifier: 4.12.31
       version: 4.12.31
@@ -108,6 +111,9 @@ importers:
       drizzle-orm:
         specifier: 'catalog:'
         version: 0.45.2(postgres@3.4.9)
+      grammy:
+        specifier: 'catalog:'
+        version: 1.45.1
       hono:
         specifier: 'catalog:'
         version: 4.12.31
@@ -662,6 +668,9 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@grammyjs/types@4.0.0':
+    resolution: {integrity: sha512-Z8lDLTvOlo12e5Vnly/vQh3JC9ppaitS1dGZ3w068gNitOd/y8tTSiib+Xm38aBGbtYGmUZwOc6afYrLs2CSTg==}
 
   '@grpc/grpc-js@1.14.4':
     resolution: {integrity: sha512-k9Dj3DV/itK9D06Y8f190Qgop7/Ui+D0njFV3LHMPwPT75DpXLQohE9Wmz0QElrJnzsjB7KPWiKJbOl7IPDArQ==}
@@ -1429,6 +1438,10 @@ packages:
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
 
+  grammy@1.45.1:
+    resolution: {integrity: sha512-Y4VL/hqJMZZxwlUr5ZgM68CFu2iIeEkNLR1cY3+Ww68CIvWARDsoXFix7+31rmyC0+7L85ZI+Pq3E5JSG5+nLQ==}
+    engines: {node: ^12.20.0 || >=14.13.1}
+
   hono@4.12.31:
     resolution: {integrity: sha512-zJIHFrl6bq3RDd2YusFNCDlM8qUprxKswyi/OPzPyzKDdyBXDqWx8bZlZ7R+saTdSTatUmb3O7K4SspGPaEOQg==}
     engines: {node: '>=16.9.0'}
@@ -1579,6 +1592,15 @@ packages:
     resolution: {integrity: sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==}
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
+
+  node-fetch@2.7.0:
+    resolution: {integrity: sha512-c4FRfUm/dbcWZ7U+1Wq0AwCyFL+3nt2bEw05wfxSz+DWpWsitgmSgYmy2dQdWyKC1694ELPqMs/YzUSNozLt8A==}
+    engines: {node: 4.x || >=6.0.0}
+    peerDependencies:
+      encoding: ^0.1.0
+    peerDependenciesMeta:
+      encoding:
+        optional: true
 
   normalize-path@3.0.0:
     resolution: {integrity: sha512-6eZs5Ls3WtCisHWp9S2GUy8dqkpGi4BVSz3GaqiE6ezub0512ESztXUwUB6C6IKbQkY2Pnb/mD4WYojCRwcwLA==}
@@ -1803,6 +1825,9 @@ packages:
     resolution: {integrity: sha512-e0votIpp4Uo2AJYSzVHV6xCcawuiez3DzqDAbrTc3YxBkplN6e+dM13ZeIcZnDg/QpSuU2zfZ3rzwY8ukEnaXw==}
     engines: {node: '>=14.14'}
 
+  tr46@0.0.3:
+    resolution: {integrity: sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==}
+
   tslib@2.8.1:
     resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
 
@@ -1915,6 +1940,12 @@ packages:
         optional: true
       jsdom:
         optional: true
+
+  webidl-conversions@3.0.1:
+    resolution: {integrity: sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==}
+
+  whatwg-url@5.0.0:
+    resolution: {integrity: sha512-saE57nupxk6v3HY35+jzBwYa0rKSy0XR8JSxZPwgLr7ys0IBzhGviA1/TUGJLmSVqs8pb9AnvICXEuOHLprYTw==}
 
   which@2.0.2:
     resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
@@ -2249,6 +2280,8 @@ snapshots:
 
   '@esbuild/win32-x64@0.28.1':
     optional: true
+
+  '@grammyjs/types@4.0.0': {}
 
   '@grpc/grpc-js@1.14.4':
     dependencies:
@@ -2900,6 +2933,16 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
+  grammy@1.45.1:
+    dependencies:
+      '@grammyjs/types': 4.0.0
+      abort-controller: 3.0.0
+      debug: 4.4.3
+      node-fetch: 2.7.0
+    transitivePeerDependencies:
+      - encoding
+      - supports-color
+
   hono@4.12.31: {}
 
   ieee754@1.2.1: {}
@@ -3005,6 +3048,10 @@ snapshots:
     optional: true
 
   nanoid@3.3.16: {}
+
+  node-fetch@2.7.0:
+    dependencies:
+      whatwg-url: 5.0.0
 
   normalize-path@3.0.0: {}
 
@@ -3307,6 +3354,8 @@ snapshots:
 
   tmp@0.2.7: {}
 
+  tr46@0.0.3: {}
+
   tslib@2.8.1:
     optional: true
 
@@ -3389,6 +3438,13 @@ snapshots:
       '@types/node': 22.20.1
     transitivePeerDependencies:
       - msw
+
+  webidl-conversions@3.0.1: {}
+
+  whatwg-url@5.0.0:
+    dependencies:
+      tr46: 0.0.3
+      webidl-conversions: 3.0.1
 
   which@2.0.2:
     dependencies:
