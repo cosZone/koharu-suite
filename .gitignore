@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.astro/
+coverage/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+pnpm-debug.log*
+
+# Local data and caches
+.cache/
+data/
+media/
+backups/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
