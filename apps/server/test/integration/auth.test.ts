@@ -482,5 +482,28 @@ describe('owner authentication', () => {
       jsonRequest({ code: recoveryCode }, cookieHeader(replayJar)),
     );
     expect(replayRecovery.status).toBe(401);
+
+    const rotateTotp = await app.request(
+      '/api/auth/two-factor/enable',
+      jsonRequest(
+        {
+          issuer: 'koharu-suite',
+          password: NEW_PASSWORD,
+        },
+        cookieHeader(challengeJar),
+      ),
+    );
+    const rotateTotpBody = (await rotateTotp.clone().json()) as unknown;
+    expect(rotateTotp.status, JSON.stringify(rotateTotpBody)).toBe(200);
+
+    const [sessionsAfterRotation] = await connection.db
+      .select({ value: count() })
+      .from(authSessions);
+    expect(sessionsAfterRotation?.value).toBe(0);
+
+    const revokedAfterRotation = await app.request('/api/v1/admin/status', {
+      headers: { cookie: cookieHeader(recoveryJar) },
+    });
+    expect(revokedAfterRotation.status).toBe(401);
   }, 30_000);
 });

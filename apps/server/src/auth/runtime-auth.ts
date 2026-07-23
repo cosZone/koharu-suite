@@ -6,6 +6,7 @@ import { createAuth, type KoharuAuth } from './auth.js';
 
 const PASSWORD_CHANGE_PATH = '/api/auth/change-password';
 const TOTP_DISABLE_PATH = '/api/auth/two-factor/disable';
+const TOTP_ENABLE_PATH = '/api/auth/two-factor/enable';
 const TOTP_VERIFY_PATH = '/api/auth/two-factor/verify-totp';
 
 export interface AuthenticatedUser {
@@ -51,7 +52,10 @@ export class BetterAuthRuntime implements RuntimeAuth {
   async handle(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const shouldInspectSession =
-      path === PASSWORD_CHANGE_PATH || path === TOTP_DISABLE_PATH || path === TOTP_VERIFY_PATH;
+      path === PASSWORD_CHANGE_PATH ||
+      path === TOTP_DISABLE_PATH ||
+      path === TOTP_ENABLE_PATH ||
+      path === TOTP_VERIFY_PATH;
     const sessionBefore = shouldInspectSession ? await this.getSession(request.headers) : null;
     const authRequest =
       path === PASSWORD_CHANGE_PATH ? await forcePasswordSessionRevocation(request) : request;
@@ -63,9 +67,11 @@ export class BetterAuthRuntime implements RuntimeAuth {
       !sessionBefore.user.twoFactorEnabled &&
       response.ok;
     const disabledTotp = path === TOTP_DISABLE_PATH && sessionBefore !== null && response.ok;
+    const rotatedTotp =
+      path === TOTP_ENABLE_PATH && sessionBefore?.user.twoFactorEnabled === true && response.ok;
     const changedPassword = path === PASSWORD_CHANGE_PATH && sessionBefore !== null && response.ok;
 
-    if (changedPassword || finishedTotpSetup || disabledTotp) {
+    if (changedPassword || finishedTotpSetup || disabledTotp || rotatedTotp) {
       await this.database
         .delete(authSessions)
         .where(eq(authSessions.userId, sessionBefore.user.id));
