@@ -466,6 +466,7 @@ describe('owner authentication', () => {
       jsonRequest({ code: recoveryCode }, cookieHeader(recoveryJar)),
     );
     expect(firstRecovery.status).toBe(200);
+    absorbCookies(recoveryJar, firstRecovery);
 
     const replayJar: CookieJar = new Map();
     const replaySignIn = await app.request(
@@ -482,6 +483,15 @@ describe('owner authentication', () => {
       jsonRequest({ code: recoveryCode }, cookieHeader(replayJar)),
     );
     expect(replayRecovery.status).toBe(401);
+
+    const sessionsBeforeRotation = await connection.db
+      .select({ value: count() })
+      .from(authSessions);
+    expect(sessionsBeforeRotation[0]?.value).toBeGreaterThanOrEqual(2);
+    const secondBrowserBeforeRotation = await app.request('/api/v1/admin/status', {
+      headers: { cookie: cookieHeader(recoveryJar) },
+    });
+    expect(secondBrowserBeforeRotation.status).toBe(200);
 
     const rotateTotp = await app.request(
       '/api/auth/two-factor/enable',
