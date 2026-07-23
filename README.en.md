@@ -24,6 +24,8 @@ multi-channel ingestion:
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the complete roadmap.
+See the [deployment guide](./docs/deployment/README.en.md) for production setup, upgrades, backups, and
+rollback.
 
 ## Local development
 
@@ -51,9 +53,18 @@ Initialize the database and singleton owner:
 docker compose up -d db
 pnpm build
 pnpm exec kodama migrate
-pnpm exec kodama channel add --telegram-id -1001234567890
+pnpm exec kodama channel add --telegram-id=-1001234567890
 pnpm exec kodama owner create --email you@example.com
+```
+
+Then run the two roles in separate terminals:
+
+```bash
+# Terminal 1: HTTP server and Admin (does not read the bot token or collect updates)
 pnpm dev
+
+# Terminal 2: the singleton Telegram collector/task worker
+pnpm dev:worker
 ```
 
 The CLI hides password input and confirms it when attached to a TTY. Automation must explicitly use
@@ -102,13 +113,13 @@ of every target public channel; do not run another `getUpdates` consumer for tha
 default-deny, and raw payloads from unknown channels are not persisted:
 
 ```bash
-pnpm exec kodama channel add --telegram-id -1001234567890
+pnpm exec kodama channel add --telegram-id=-1001234567890
 pnpm exec kodama channel list
-pnpm exec kodama channel disable --telegram-id -1001234567890
-pnpm exec kodama channel enable --telegram-id -1001234567890
+pnpm exec kodama channel disable --telegram-id=-1001234567890
+pnpm exec kodama channel enable --telegram-id=-1001234567890
 ```
 
-The first `channel add` (or `serve`) binds the database to that Bot's numeric ID. Every later token must belong
+The first `channel add` (or `worker` start) binds the database to that Bot's numeric ID. Every later token must belong
 to the same Bot; changing Bots requires an explicit migration of the existing cursor and inbox.
 
 The poller stores allowed updates and its next cursor in one PostgreSQL transaction. Four workers run by
@@ -170,16 +181,20 @@ high-entropy `BETTER_AUTH_SECRET`.
 
 ```bash
 docker compose up -d db
-docker compose build server
-docker compose run --rm server node dist/cli.js migrate
-docker compose run --rm server node dist/cli.js channel add --telegram-id -1001234567890
-docker compose run --rm server node dist/cli.js owner create --email you@example.com
-docker compose up -d server
+docker compose build migrate
+docker compose run --rm migrate
+docker compose run --rm --no-deps worker \
+  node dist/cli.js channel add --telegram-id=-1001234567890
+docker compose run --rm --no-deps server \
+  node dist/cli.js owner create --email you@example.com
+docker compose up -d server worker
 ```
 
-Compose uses PostgreSQL 18. Run migrations, configure channels, and create the owner before starting the
-collector. Production Admin is available at `http://localhost:3000/admin/`, or at `/admin/` under the configured
-HTTPS origin.
+Compose uses PostgreSQL 18 and binds its published database port to host loopback `127.0.0.1` by default.
+`migrate`, `server`, and `worker` use one image with distinct commands. Run migrations, configure channels,
+and create the owner before starting the server and singleton worker. Production Admin is available at
+`http://localhost:3000/admin/`, or at `/admin/` under the configured HTTPS origin. See the
+[deployment guide](./docs/deployment/README.en.md) for the complete procedure.
 
 ## Commands
 

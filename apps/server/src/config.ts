@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { parseCorsOriginAllowlist } from './http/public-policy.js';
 
 const portSchema = z.coerce.number().int().min(1).max(65_535);
+const workerInstanceIdSchema = z.string().trim().min(1).max(255);
 const databaseUrlSchema = z.url({ protocol: /^postgres(?:ql)?$/ });
 const telegramIdLowerBound = -((1n << 52n) - 1n);
 const telegramChannelIdSchema = z
@@ -12,6 +13,8 @@ const telegramChannelIdSchema = z
   .refine((value) => value < 0n, 'must be a negative Telegram channel ID')
   .refine((value) => value >= telegramIdLowerBound, 'is outside Telegram safe integer range');
 const telegramEnvironmentSchema = z.object({
+  KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: z.enum(['false', 'true']).default('false'),
+  KOHARU_TEST_TELEGRAM_API_ROOT: z.url().optional(),
   TELEGRAM_BOT_TOKEN: z.string().trim().min(1),
   TELEGRAM_CHANNEL_ID: z.preprocess(
     (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
@@ -57,6 +60,10 @@ export function resolvePort(value = process.env.PORT): number {
   return portSchema.parse(value ?? 3000);
 }
 
+export function resolveWorkerInstanceId(environment: NodeJS.ProcessEnv = process.env): string {
+  return workerInstanceIdSchema.parse(environment.HOSTNAME);
+}
+
 export function resolveDatabaseUrl(
   value = process.env.DATABASE_URL,
   environment: NodeJS.ProcessEnv = process.env,
@@ -65,6 +72,7 @@ export function resolveDatabaseUrl(
 }
 
 export interface TelegramConfig {
+  apiRoot: string | undefined;
   botToken: string;
   legacyChannelId: bigint | undefined;
   workerConcurrency: number;
@@ -132,8 +140,20 @@ export function resolveTelegramConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): TelegramConfig {
   const parsed = telegramEnvironmentSchema.parse(environment);
+  const testApiRootEnabled = parsed.KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT === 'true';
+  if (parsed.KOHARU_TEST_TELEGRAM_API_ROOT && !testApiRootEnabled) {
+    throw new Error(
+      'KOHARU_TEST_TELEGRAM_API_ROOT requires KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT=true',
+    );
+  }
+  if (testApiRootEnabled && !parsed.KOHARU_TEST_TELEGRAM_API_ROOT) {
+    throw new Error(
+      'KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT=true requires KOHARU_TEST_TELEGRAM_API_ROOT',
+    );
+  }
 
   return {
+    apiRoot: testApiRootEnabled ? parsed.KOHARU_TEST_TELEGRAM_API_ROOT : undefined,
     botToken: parsed.TELEGRAM_BOT_TOKEN,
     legacyChannelId: parsed.TELEGRAM_CHANNEL_ID,
     workerConcurrency: parsed.TELEGRAM_WORKER_CONCURRENCY,

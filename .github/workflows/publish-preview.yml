@@ -1,0 +1,267 @@
+name: Publish Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_ghcr:
+        description: Publish the validated image to GHCR (never latest)
+        required: true
+        type: boolean
+        default: false
+      confirm_public_visibility:
+        description: I accept that making the first GHCR package public cannot be reversed
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish-preview
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish Preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check irreversible GHCR gate
+        env:
+          GHCR_PUBLIC_APPROVED: ${{ vars.GHCR_PUBLIC_APPROVED }}
+          PUBLISH_GHCR: ${{ inputs.publish_ghcr }}
+          VISIBILITY_CONFIRMED: ${{ inputs.confirm_public_visibility }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" && "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Preview releases must be dispatched from main or an existing Preview tag." >&2
+            exit 1
+          fi
+          if [[ "$PUBLISH_GHCR" == "true" && "$VISIBILITY_CONFIRMED" != "true" ]]; then
+            echo "GHCR publishing requires explicit public-visibility confirmation." >&2
+            exit 1
+          fi
+          if [[ "$PUBLISH_GHCR" == "true" && "$GHCR_PUBLIC_APPROVED" != "true" ]]; then
+            echo "Set the owner-controlled GHCR_PUBLIC_APPROVED repository variable to true first." >&2
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve release metadata
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          version="$(node -p "require('./apps/server/package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Server version is not valid SemVer: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git show-ref --tags --verify --quiet "refs/tags/$tag"; then
+            tag_commit="$(git rev-list --max-count=1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "Existing tag $tag points to $tag_commit, not $GITHUB_SHA." >&2
+              exit 1
+            fi
+            if [[ "$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)" != "true" ]]; then
+              echo "Existing release $tag is not a Preview pre-release." >&2
+              exit 1
+            fi
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "A new Preview release must be dispatched from main." >&2
+              exit 1
+            fi
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF" != "refs/tags/$tag" ]]; then
+            echo "Selected ref $GITHUB_REF does not match package version $tag." >&2
+            exit 1
+          fi
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/$repository" >> "$GITHUB_OUTPUT"
+          echo "local_image=koharu-preview:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Run unit tests
+        run: pnpm test
+
+      - name: Run PostgreSQL 18 integration test
+        run: pnpm test:integration
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Build Storybook
+        run: pnpm build:storybook
+
+      - name: Install Storybook browser
+        run: pnpm --filter @koharu-suite/ui exec playwright install --with-deps chromium
+
+      - name: Test Storybook interactions and accessibility
+        run: pnpm test:storybook
+
+      - name: Smoke-test CLI
+        run: pnpm exec kodama --help
+
+      - name: Build Preview image once
+        env:
+          LOCAL_IMAGE: ${{ steps.release.outputs.local_image }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          docker build \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            --build-arg "SOURCE=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "VERSION=$VERSION" \
+            --tag "$LOCAL_IMAGE" \
+            .
+
+      - name: Run Compose smoke against validated image
+        env:
+          KOHARU_IMAGE: ${{ steps.release.outputs.local_image }}
+          KOHARU_REVISION: ${{ github.sha }}
+          KOHARU_SMOKE_SKIP_BUILD: "true"
+          KOHARU_VERSION: ${{ steps.release.outputs.version }}
+        run: ./scripts/compose-smoke/run.sh
+
+      - name: Create GitHub pre-release
+        if: steps.release.outputs.release_exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --generate-notes \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "koharu-suite $TAG (Preview)"
+
+      - name: Log in to GHCR
+        if: inputs.publish_ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable and Preview image tags
+        if: inputs.publish_ghcr
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          LOCAL_IMAGE: ${{ steps.release.outputs.local_image }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          minor="${VERSION%.*}"
+          short_sha="${GITHUB_SHA:0:12}"
+          version_ref="$IMAGE:$VERSION"
+          sha_ref="$IMAGE:sha-$short_sha"
+
+          remote_digest() {
+            local digest
+            local reference="$1"
+            local result
+            if result="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' 2>&1)"; then
+              if ! digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$result")"; then
+                echo "Registry returned an invalid manifest digest for $reference." >&2
+                exit 1
+              fi
+              printf '%s' "$digest"
+              return
+            fi
+            if [[ "$result" != *"no such manifest"* && "$result" != *"manifest unknown"* ]]; then
+              echo "Could not inspect immutable GHCR tag: $reference" >&2
+              printf '%s\n' "$result" >&2
+              exit 1
+            fi
+          }
+
+          version_digest="$(remote_digest "$version_ref")"
+          sha_digest="$(remote_digest "$sha_ref")"
+          if [[ -n "$version_digest" && -n "$sha_digest" && "$version_digest" != "$sha_digest" ]]; then
+            echo "Immutable GHCR tags point to different digests." >&2
+            echo "$version_ref -> $version_digest" >&2
+            echo "$sha_ref -> $sha_digest" >&2
+            exit 1
+          fi
+
+          canonical_digest="${version_digest:-$sha_digest}"
+          if [[ -z "$canonical_digest" ]]; then
+            docker tag "$LOCAL_IMAGE" "$version_ref"
+            docker push "$version_ref"
+            canonical_digest="$(remote_digest "$version_ref")"
+            if [[ -z "$canonical_digest" ]]; then
+              echo "Published version tag has no readable digest: $version_ref" >&2
+              exit 1
+            fi
+            version_digest="$canonical_digest"
+          fi
+
+          docker pull "$IMAGE@$canonical_digest"
+          remote_revision="$(docker image inspect "$IMAGE@$canonical_digest" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          remote_version="$(docker image inspect "$IMAGE@$canonical_digest" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+          if [[ "$remote_revision" != "$GITHUB_SHA" || "$remote_version" != "$VERSION" ]]; then
+            echo "Existing immutable image provenance does not match this release." >&2
+            echo "Expected revision=$GITHUB_SHA version=$VERSION." >&2
+            echo "Found revision=$remote_revision version=$remote_version." >&2
+            exit 1
+          fi
+
+          if [[ -z "$version_digest" ]]; then
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$version_ref" \
+              "$IMAGE@$canonical_digest"
+          fi
+          if [[ -z "$sha_digest" ]]; then
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$sha_ref" \
+              "$IMAGE@$canonical_digest"
+          fi
+
+          resolved_version_digest="$(remote_digest "$version_ref")"
+          resolved_sha_digest="$(remote_digest "$sha_ref")"
+          if [[ "$resolved_version_digest" != "$canonical_digest" || "$resolved_sha_digest" != "$canonical_digest" ]]; then
+            echo "Immutable GHCR aliases did not resolve to the canonical digest." >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$IMAGE:$minor" \
+            --tag "$IMAGE:preview" \
+            "$IMAGE@$canonical_digest"

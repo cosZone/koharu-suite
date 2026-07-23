@@ -11,18 +11,26 @@
   "packageManager": "pnpm@10.28.2",
   "scripts": {
     "build": "pnpm -r --if-present build",
+    "build:storybook": "pnpm --filter @koharu-suite/ui build:storybook",
+    "changeset": "pnpm exec changeset",
+    "compose:smoke": "./scripts/compose-smoke/run.sh",
     "db:generate": "pnpm --filter @koharu-suite/server db:generate",
     "dev": "pnpm --parallel --filter @koharu-suite/server --filter @koharu-suite/admin dev",
+    "dev:worker": "pnpm --filter @koharu-suite/server exec tsx src/cli.ts worker",
     "format": "biome format --write .",
     "kodama": "kodama",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "test": "pnpm --filter @koharu-suite/server test",
+    "storybook": "pnpm --filter @koharu-suite/ui storybook",
+    "test": "pnpm -r --if-present test",
     "test:integration": "pnpm --filter @koharu-suite/server test:integration",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "test:storybook": "pnpm --filter @koharu-suite/ui test:storybook",
+    "typecheck": "pnpm --filter @koharu-suite/ui build && pnpm -r --if-present typecheck",
+    "version:packages": "pnpm exec changeset version"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
+    "@changesets/cli": "2.31.1",
     "@koharu-suite/server": "workspace:*"
   }
 }

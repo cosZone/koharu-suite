@@ -106,6 +106,11 @@ export const EXPECTED_DATABASE_OBJECTS = [
   'telegram_ingest_tasks.skipped_at',
   'telegram_polling_state',
   'telegram_updates',
+  'worker_runtime',
+  'worker_runtime.heartbeat_at',
+  'worker_runtime.instance_id',
+  'worker_runtime.last_telegram_success_at',
+  'worker_runtime.state',
 ] as const;
 
 const EXPECTED_POSTGRES_MAJOR = 18;

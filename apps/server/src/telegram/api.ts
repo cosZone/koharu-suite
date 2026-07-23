@@ -19,8 +19,8 @@ export interface TelegramApi {
 export class GrammyTelegramApi implements TelegramApi {
   private readonly api: Api;
 
-  constructor(token: string) {
-    this.api = new Api(token);
+  constructor(token: string, options: { apiRoot?: string } = {}) {
+    this.api = new Api(token, options);
   }
 
   getChat(chatId: number | string, signal?: AbortSignal): Promise<ChatFullInfo> {

@@ -1,0 +1,63 @@
+name: Version Packages
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: version-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Create or update Version Packages PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CHANGESETS_APP_CONFIGURED: ${{ vars.CHANGESETS_APP_CONFIGURED }}
+      CHANGESETS_APP_ID: ${{ vars.CHANGESETS_APP_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create short-lived Changesets App token
+        id: app-token
+        if: env.CHANGESETS_APP_CONFIGURED == 'true' && env.CHANGESETS_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.CHANGESETS_APP_ID }}
+          private-key: ${{ secrets.CHANGESETS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create or update Version Packages PR
+        uses: changesets/action@v1
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.CHANGESETS_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          commit: "chore: version packages"
+          github-token: ${{ steps.app-token.outputs.token || secrets.CHANGESETS_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          title: "chore: version packages"
+          version: pnpm changeset version

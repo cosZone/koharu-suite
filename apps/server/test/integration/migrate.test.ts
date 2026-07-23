@@ -764,6 +764,10 @@ describe('database migrations', () => {
     const second = new ReservedTelegramInboxRepository(container.getConnectionUri(), connection.db);
     let firstClosed = false;
     try {
+      const internals = first as unknown as {
+        client: { options: { max_lifetime: number | null } };
+      };
+      expect(internals.client.options.max_lifetime).toBeNull();
       await expect(first.acquirePollerLock()).resolves.toBeUndefined();
       await expect(first.assertPollerLock()).resolves.toBeUndefined();
       await expect(second.acquirePollerLock()).rejects.toThrow('already owns this database');
@@ -776,6 +780,29 @@ describe('database migrations', () => {
         await first.close();
       }
       await second.close();
+    }
+  }, 30_000);
+
+  it('fails closed when the reserved poller backend identity changes', async () => {
+    if (!container) {
+      throw new Error('PostgreSQL test container did not start');
+    }
+
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const repository = new ReservedTelegramInboxRepository(
+      container.getConnectionUri(),
+      connection.db,
+    );
+    try {
+      await repository.acquirePollerLock();
+      const internals = repository as unknown as { backendPid: number };
+      internals.backendPid += 1;
+
+      await expect(repository.assertPollerLock()).rejects.toThrow('lost advisory lock ownership');
+    } finally {
+      await repository.close();
     }
   }, 30_000);
 

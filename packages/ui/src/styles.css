@@ -1,0 +1,205 @@
+[data-koharu-ui] {
+  --ks-color-ink: #282019;
+  --ks-color-ink-soft: #6c5f54;
+  --ks-color-surface: #fff9ed;
+  --ks-color-surface-muted: #efe3cf;
+  --ks-color-line: rgba(72, 49, 32, 0.17);
+  --ks-color-line-strong: rgba(72, 49, 32, 0.28);
+  --ks-color-accent: #ad5134;
+  --ks-color-accent-strong: #7e3424;
+  --ks-color-accent-contrast: #fff9ef;
+  --ks-color-danger: #8a3829;
+  --ks-color-danger-surface: #f4dcd2;
+  --ks-color-success: #4f704f;
+  --ks-color-success-surface: #e3eee0;
+  --ks-color-warning: #8b452d;
+  --ks-color-warning-surface: #f3d5c4;
+  --ks-focus-ring: color-mix(in srgb, var(--ks-color-accent) 45%, transparent);
+  --ks-shadow-panel: 0 10px 38px rgba(72, 49, 32, 0.055);
+}
+
+[data-koharu-ui][data-koharu-ui-tone="inverse"],
+[data-koharu-ui] [data-koharu-ui-tone="inverse"] {
+  --ks-color-ink: #f8eddc;
+  --ks-color-ink-soft: rgba(248, 237, 220, 0.68);
+  --ks-color-surface: #312922;
+  --ks-color-surface-muted: #40362d;
+  --ks-color-line: rgba(255, 249, 237, 0.14);
+  --ks-color-line-strong: rgba(255, 249, 237, 0.24);
+  --ks-color-accent: #ffd0b2;
+  --ks-color-accent-strong: #ffe2d0;
+  --ks-color-accent-contrast: #2f241d;
+  --ks-color-danger: #f4c3a9;
+  --ks-color-danger-surface: rgba(173, 81, 52, 0.22);
+  --ks-color-success: #c9e4c4;
+  --ks-color-success-surface: rgba(79, 112, 79, 0.22);
+  --ks-color-warning: #f4c3a9;
+  --ks-color-warning-surface: rgba(173, 81, 52, 0.24);
+  --ks-shadow-panel: 0 18px 48px rgba(20, 14, 10, 0.2);
+}
+
+[data-koharu-ui] .ks-ui-button {
+  box-sizing: border-box;
+  width: fit-content;
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 1px solid transparent;
+  border-radius: 4px 13px 4px 13px;
+  color: var(--ks-color-ink);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  transition:
+    transform 150ms ease,
+    box-shadow 150ms ease,
+    background 150ms ease;
+}
+
+[data-koharu-ui] .ks-ui-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+}
+
+[data-koharu-ui] .ks-ui-button:focus-visible,
+[data-koharu-ui] .ks-ui-input:focus-visible {
+  outline: 3px solid var(--ks-focus-ring);
+  outline-offset: 3px;
+}
+
+[data-koharu-ui] .ks-ui-button:disabled {
+  cursor: progress;
+  opacity: 0.58;
+}
+
+[data-koharu-ui] .ks-ui-button--primary {
+  background: var(--ks-color-accent);
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--ks-color-accent-strong) 18%, transparent);
+  color: var(--ks-color-accent-contrast);
+}
+
+[data-koharu-ui] .ks-ui-button--primary:hover:not(:disabled) {
+  background: var(--ks-color-accent-strong);
+}
+
+[data-koharu-ui] .ks-ui-button--quiet {
+  border-color: var(--ks-color-line-strong);
+  background: var(--ks-color-surface);
+}
+
+[data-koharu-ui] .ks-ui-button--danger {
+  border-color: color-mix(in srgb, var(--ks-color-danger) 32%, transparent);
+  background: var(--ks-color-danger-surface);
+  color: var(--ks-color-danger);
+}
+
+[data-koharu-ui] .ks-ui-badge {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 9px;
+  border: 1px solid var(--ks-color-line);
+  border-radius: 999px;
+  color: var(--ks-color-ink-soft);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+[data-koharu-ui] .ks-ui-badge--success {
+  border-color: color-mix(in srgb, var(--ks-color-success) 38%, transparent);
+  background: var(--ks-color-success-surface);
+  color: var(--ks-color-success);
+}
+
+[data-koharu-ui] .ks-ui-badge--warning {
+  border-color: color-mix(in srgb, var(--ks-color-warning) 40%, transparent);
+  background: var(--ks-color-warning-surface);
+  color: var(--ks-color-warning);
+}
+
+[data-koharu-ui] .ks-ui-panel {
+  box-sizing: border-box;
+  min-width: 0;
+  border: 1px solid var(--ks-color-line);
+  border-radius: 5px 22px 5px 22px;
+  background: color-mix(in srgb, var(--ks-color-surface) 80%, transparent);
+  box-shadow: var(--ks-shadow-panel);
+  color: var(--ks-color-ink);
+}
+
+[data-koharu-ui] .ks-ui-panel-header {
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px;
+  border-bottom: 1px solid var(--ks-color-line);
+}
+
+[data-koharu-ui] .ks-ui-field {
+  display: grid;
+  gap: 8px;
+  color: var(--ks-color-ink);
+}
+
+[data-koharu-ui] .ks-ui-field__label,
+[data-koharu-ui] .ks-ui-field__hint {
+  color: var(--ks-color-ink-soft);
+  font-size: 0.82rem;
+}
+
+[data-koharu-ui] .ks-ui-field__error {
+  color: var(--ks-color-danger);
+  font-size: 0.78rem;
+}
+
+[data-koharu-ui] .ks-ui-input {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid var(--ks-color-line-strong);
+  border-radius: 4px 12px 4px 12px;
+  background: color-mix(in srgb, var(--ks-color-surface) 85%, transparent);
+  color: var(--ks-color-ink);
+  font: inherit;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+[data-koharu-ui] .ks-ui-input:hover,
+[data-koharu-ui] .ks-ui-input:focus {
+  border-color: var(--ks-color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ks-color-accent) 8%, transparent);
+}
+
+[data-koharu-ui] .ks-ui-input[aria-invalid="true"],
+[data-koharu-ui] .ks-ui-field[data-invalid="true"] .ks-ui-input {
+  border-color: var(--ks-color-danger);
+}
+
+[data-koharu-ui] .ks-ui-kicker {
+  margin: 0;
+  color: var(--ks-color-accent);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.18em;
+}
+
+[data-koharu-ui] .ks-ui-empty-state {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 24px;
+  color: var(--ks-color-ink-soft);
+  font-size: 0.82rem;
+}
+
+[data-koharu-ui] .ks-ui-empty-state--success {
+  color: var(--ks-color-success);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-koharu-ui] .ks-ui-button,
+  [data-koharu-ui] .ks-ui-input {
+    transition: none;
+  }
+}

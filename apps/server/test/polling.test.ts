@@ -53,19 +53,22 @@ describe('Telegram long polling', () => {
       .fn<(botId: bigint, updates: Update[]) => Promise<bigint | null>>()
       .mockResolvedValueOnce(1_002n)
       .mockResolvedValue(1_002n);
+    const onTelegramSuccess = vi.fn(async () => {});
     const poller = new TelegramPoller({
       api,
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
-        acquirePollerLock: vi.fn(async () => {}),
         assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => 900n),
         checkpointBatch,
       },
       legacyChannelId: undefined,
+      onTelegramSuccess,
       retryDelay: vi.fn(async () => {}),
     });
 
+    await poller.authenticate();
+    await poller.initialize();
     poller.start();
     await vi.waitFor(() => expect(requests).toHaveLength(2));
     await poller.stop();
@@ -73,6 +76,7 @@ describe('Telegram long polling', () => {
     expect(requests[0]).toMatchObject({ offset: 900 });
     expect(requests[1]).toMatchObject({ offset: 1_002 });
     expect(checkpointBatch).toHaveBeenCalledOnce();
+    expect(onTelegramSuccess).toHaveBeenCalledOnce();
   });
 
   it('retries Telegram failures without advancing the durable cursor', async () => {
@@ -98,7 +102,6 @@ describe('Telegram long polling', () => {
       api,
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
-        acquirePollerLock: vi.fn(async () => {}),
         assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => null),
         checkpointBatch,
@@ -107,6 +110,8 @@ describe('Telegram long polling', () => {
       retryDelay,
     });
 
+    await poller.authenticate();
+    await poller.initialize();
     poller.start();
     await vi.waitFor(() => expect(calls).toBe(2));
     await poller.stop();
@@ -127,7 +132,6 @@ describe('Telegram long polling', () => {
       api,
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
-        acquirePollerLock: vi.fn(async () => {}),
         assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => 900n),
         checkpointBatch: vi.fn(async () => {
@@ -138,6 +142,8 @@ describe('Telegram long polling', () => {
       retryDelay: vi.fn(async () => {}),
     });
 
+    await poller.authenticate();
+    await poller.initialize();
     await expect(poller.start()).rejects.toBe(databaseError);
     expect(api.getUpdates).toHaveBeenCalledOnce();
   });

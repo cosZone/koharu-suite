@@ -10,8 +10,13 @@ import {
   telegramUpdates,
 } from '../db/schema.js';
 import { CURRENT_RENDERER_VERSION } from '../messages/renderer.js';
+import {
+  PostgresWorkerRuntimeRepository,
+  type WorkerRuntimeStatus,
+} from '../worker-runtime-repository.js';
 
 export interface AdminStatusSnapshot {
+  collector: WorkerRuntimeStatus;
   counts: {
     activeChannels: number;
     blockedTasks: number;
@@ -54,6 +59,7 @@ export class PostgresAdminRepository implements AdminReader {
       skippedTasks,
       staleRendererRevisions,
       pollingState,
+      collector,
     ] = await Promise.all([
       this.database
         .select({ value: count() })
@@ -98,10 +104,12 @@ export class PostgresAdminRepository implements AdminReader {
         .from(telegramPollingState)
         .where(eq(telegramPollingState.singleton, 1))
         .limit(1),
+      new PostgresWorkerRuntimeRepository(this.database).getStatus(),
     ]);
 
     const checkpoint = pollingState[0];
     return {
+      collector,
       counts: {
         activeChannels: activeChannels[0]?.value ?? 0,
         blockedTasks,

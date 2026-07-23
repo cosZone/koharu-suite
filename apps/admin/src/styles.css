@@ -126,8 +126,7 @@ button {
   font-size: 1.4rem;
 }
 
-.eyebrow,
-.kicker {
+.eyebrow {
   margin: 0;
   color: var(--persimmon);
   font-size: 0.7rem;
@@ -158,35 +157,11 @@ button {
   gap: 18px;
 }
 
-label {
-  display: grid;
-  gap: 8px;
-}
-
-label > span,
 .compact-form > p,
 .raw-zone p,
 .recovery-codes p {
   color: var(--ink-soft);
   font-size: 0.82rem;
-}
-
-input {
-  min-width: 0;
-  padding: 13px 14px;
-  border: 1px solid var(--line-strong);
-  border-radius: 4px 12px 4px 12px;
-  background: rgba(255, 253, 247, 0.85);
-  color: var(--ink);
-  transition:
-    border-color 160ms ease,
-    box-shadow 160ms ease;
-}
-
-input:hover,
-input:focus {
-  border-color: var(--persimmon);
-  box-shadow: 0 0 0 3px rgba(173, 81, 52, 0.08);
 }
 
 .check-field {
@@ -203,50 +178,6 @@ input:focus {
 
 .check-field span {
   color: var(--ink);
-}
-
-.button {
-  width: fit-content;
-  min-height: 42px;
-  padding: 10px 16px;
-  border: 1px solid transparent;
-  border-radius: 4px 13px 4px 13px;
-  cursor: pointer;
-  font-weight: 700;
-  transition:
-    transform 150ms ease,
-    box-shadow 150ms ease,
-    background 150ms ease;
-}
-
-.button:hover:not(:disabled) {
-  transform: translateY(-2px);
-}
-
-.button:disabled {
-  cursor: progress;
-  opacity: 0.58;
-}
-
-.button--primary {
-  background: var(--persimmon);
-  box-shadow: 0 8px 20px rgba(126, 52, 36, 0.18);
-  color: #fff9ef;
-}
-
-.button--primary:hover:not(:disabled) {
-  background: var(--persimmon-dark);
-}
-
-.button--quiet {
-  border-color: var(--line-strong);
-  background: var(--paper-light);
-}
-
-.button--danger {
-  border-color: rgba(153, 57, 39, 0.32);
-  background: #f4dcd2;
-  color: #8a3829;
 }
 
 .form-error,
@@ -366,6 +297,15 @@ input:focus {
   box-shadow: 0 0 0 5px rgba(91, 142, 88, 0.1);
 }
 
+.live-state.is-stale {
+  color: #8b452d;
+}
+
+.live-state.is-stale > span {
+  background: #d17b52;
+  box-shadow: 0 0 0 5px rgba(209, 123, 82, 0.1);
+}
+
 .text-button {
   padding: 6px 0;
   border: 0;
@@ -390,7 +330,7 @@ input:focus {
 }
 
 .rail h2,
-.panel h2 {
+.ks-ui-panel h2 {
   margin: 6px 0 22px;
   font-family: "Iowan Old Style", Baskerville, "Noto Serif SC", serif;
   font-size: 1.65rem;
@@ -482,46 +422,14 @@ input:focus {
   grid-template-columns: minmax(280px, 0.8fr) minmax(340px, 1.2fr);
 }
 
-.panel {
-  min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: 5px 22px 5px 22px;
-  background: rgba(255, 249, 237, 0.8);
-  box-shadow: 0 10px 38px rgba(72, 49, 32, 0.055);
-}
-
-.panel__heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 22px;
-  border-bottom: 1px solid var(--line);
-}
-
-.panel__heading h2 {
+.ks-ui-panel-header h2 {
   margin-bottom: 0;
 }
 
-.panel__heading a {
+.ks-ui-panel-header a {
   color: var(--persimmon-dark);
   font-size: 0.78rem;
   text-decoration: none;
-}
-
-.badge {
-  padding: 5px 9px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink-soft);
-  font-size: 0.7rem;
-  white-space: nowrap;
-}
-
-.badge--good {
-  border-color: rgba(79, 112, 79, 0.28);
-  background: #e3eee0;
-  color: var(--moss);
 }
 
 .message-list__items {
@@ -682,17 +590,6 @@ input:focus {
   white-space: pre-wrap;
 }
 
-.empty-state {
-  margin: 0;
-  padding: 24px;
-  color: var(--ink-soft);
-  font-size: 0.82rem;
-}
-
-.empty-state--good {
-  color: var(--moss);
-}
-
 .operations {
   margin-top: 24px;
   border: 1px solid var(--line);
@@ -725,23 +622,6 @@ input:focus {
   color: rgba(248, 237, 220, 0.63);
   font-size: 0.82rem;
   line-height: 1.6;
-}
-
-.operations .badge {
-  border-color: rgba(255, 249, 237, 0.16);
-  color: rgba(248, 237, 220, 0.72);
-}
-
-.operations .badge--good {
-  border-color: rgba(132, 173, 126, 0.38);
-  background: rgba(79, 112, 79, 0.18);
-  color: #c9e4c4;
-}
-
-.badge--warning {
-  border-color: rgba(222, 146, 104, 0.4);
-  background: rgba(173, 81, 52, 0.22);
-  color: #f4c3a9;
 }
 
 .operations__grid {
@@ -869,21 +749,21 @@ input:focus {
   white-space: pre-wrap;
 }
 
-.blocked-task label {
+.blocked-task .ks-ui-field {
   margin-top: 14px;
 }
 
-.blocked-task label > span {
+.blocked-task .ks-ui-field__label {
   color: rgba(248, 237, 220, 0.62);
 }
 
-.blocked-task input {
+.blocked-task .ks-ui-input {
   border-color: rgba(255, 249, 237, 0.18);
   background: rgba(255, 249, 237, 0.08);
   color: #fff8ed;
 }
 
-.blocked-task input::placeholder {
+.blocked-task .ks-ui-input::placeholder {
   color: rgba(248, 237, 220, 0.34);
 }
 
@@ -892,18 +772,6 @@ input:focus {
   flex-wrap: wrap;
   gap: 10px;
   margin-top: 12px;
-}
-
-.operations .button--quiet {
-  border-color: rgba(255, 249, 237, 0.2);
-  background: rgba(255, 249, 237, 0.08);
-  color: #fff8ed;
-}
-
-.operations .button--danger {
-  border-color: rgba(224, 127, 100, 0.3);
-  background: rgba(153, 57, 39, 0.22);
-  color: #ffc9b9;
 }
 
 .channel-switches {
@@ -952,7 +820,32 @@ input:focus {
   opacity: 0.55;
 }
 
-.rerender-card .button {
+.collector-runtime {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 16px 0 0;
+}
+
+.collector-runtime__item {
+  min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid rgba(255, 249, 237, 0.1);
+}
+
+.collector-runtime dt {
+  color: rgba(248, 237, 220, 0.46);
+  font-size: 0.62rem;
+}
+
+.collector-runtime dd {
+  margin: 4px 0 0;
+  color: rgba(248, 237, 220, 0.82);
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.rerender-card .ks-ui-button {
   margin-top: 2px;
 }
 
@@ -1118,8 +1011,12 @@ details .uri {
     flex-direction: column;
   }
 
-  .operations__heading .badge {
+  .operations__heading .ks-ui-badge {
     align-self: flex-start;
+  }
+
+  .collector-runtime {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -1127,10 +1024,5 @@ details .uri {
   .auth-card,
   .loading-mark {
     animation: none;
-  }
-
-  .button,
-  input {
-    transition: none;
   }
 }

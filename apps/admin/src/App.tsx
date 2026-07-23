@@ -1,3 +1,13 @@
+import {
+  Badge,
+  Button,
+  EmptyState,
+  Field,
+  Input,
+  Kicker,
+  Panel,
+  PanelHeader,
+} from '@koharu-suite/ui';
 import { twoFactorClient } from 'better-auth/client/plugins';
 import { createAuthClient } from 'better-auth/react';
 import {
@@ -8,6 +18,7 @@ import {
   useEffect,
   useState,
 } from 'react';
+import { startStatusPoller } from './status-poller';
 
 const authClient = createAuthClient({
   plugins: [twoFactorClient()],
@@ -60,7 +71,13 @@ interface Message {
 }
 
 interface AdminStatus {
-  collector: 'running' | 'stopped';
+  collector: {
+    heartbeatAt: string | null;
+    lastTelegramSuccessAt: string | null;
+    startedAt: string | null;
+    state: 'running' | 'stale' | 'stopped';
+    version: string | null;
+  };
   counts: {
     activeChannels: number;
     blockedTasks: number;
@@ -267,7 +284,7 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
   }
 
   return (
-    <main className="auth-page">
+    <main className="auth-page" data-koharu-ui>
       <div className="auth-page__folio" aria-hidden="true">
         01
       </div>
@@ -285,9 +302,8 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
 
         {authStep === 'login' ? (
           <form className="auth-form" onSubmit={submitPassword}>
-            <label>
-              <span>Owner email</span>
-              <input
+            <Field label="Owner email">
+              <Input
                 autoComplete="username"
                 name="email"
                 onChange={(event) => setEmail(event.target.value)}
@@ -295,10 +311,9 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
                 type="email"
                 value={email}
               />
-            </label>
-            <label>
-              <span>Password</span>
-              <input
+            </Field>
+            <Field label="Password">
+              <Input
                 autoComplete="current-password"
                 minLength={12}
                 name="password"
@@ -307,11 +322,11 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
                 type="password"
                 value={password}
               />
-            </label>
+            </Field>
             {error ? <p className="form-error">{error}</p> : null}
-            <button className="button button--primary" disabled={busy} type="submit">
+            <Button disabled={busy} type="submit">
               {busy ? '正在验证…' : '进入管理台'}
-            </button>
+            </Button>
           </form>
         ) : (
           <form className="auth-form" onSubmit={submitTwoFactor}>
@@ -338,9 +353,8 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
                 恢复代码
               </button>
             </fieldset>
-            <label>
-              <span>{verifyMethod === 'totp' ? '6 位动态代码' : '一次性恢复代码'}</span>
-              <input
+            <Field label={verifyMethod === 'totp' ? '6 位动态代码' : '一次性恢复代码'}>
+              <Input
                 autoComplete="one-time-code"
                 inputMode={verifyMethod === 'totp' ? 'numeric' : 'text'}
                 name="code"
@@ -348,7 +362,7 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
                 required
                 value={code}
               />
-            </label>
+            </Field>
             {verifyMethod === 'totp' ? (
               <label className="check-field">
                 <input
@@ -361,9 +375,9 @@ function Login({ onComplete }: { onComplete(): Promise<void> }) {
               </label>
             ) : null}
             {error ? <p className="form-error">{error}</p> : null}
-            <button className="button button--primary" disabled={busy} type="submit">
+            <Button disabled={busy} type="submit">
               {busy ? '正在确认…' : '完成验证'}
-            </button>
+            </Button>
           </form>
         )}
 
@@ -459,23 +473,20 @@ function SecurityPanel({
   }
 
   return (
-    <section className="panel security-panel" aria-labelledby="security-title">
-      <div className="panel__heading">
+    <Panel className="security-panel" aria-labelledby="security-title">
+      <PanelHeader>
         <div>
-          <p className="kicker">SECURITY</p>
+          <Kicker>SECURITY</Kicker>
           <h2 id="security-title">双重验证</h2>
         </div>
-        <span className={`badge ${enabled ? 'badge--good' : ''}`}>
-          {enabled ? '已启用' : '未启用'}
-        </span>
-      </div>
+        <Badge tone={enabled ? 'success' : 'neutral'}>{enabled ? '已启用' : '未启用'}</Badge>
+      </PanelHeader>
 
       {!enabled && !setup ? (
         <form className="compact-form" onSubmit={beginSetup}>
           <p>使用当前密码开始设置。完成验证前，TOTP 不会生效。</p>
-          <label>
-            <span>当前密码</span>
-            <input
+          <Field label="当前密码">
+            <Input
               autoComplete="current-password"
               minLength={12}
               name="totp-enable-password"
@@ -484,11 +495,11 @@ function SecurityPanel({
               type="password"
               value={password}
             />
-          </label>
+          </Field>
           {error ? <p className="form-error">{error}</p> : null}
-          <button className="button button--quiet" disabled={busy} type="submit">
+          <Button disabled={busy} type="submit" variant="quiet">
             开始设置
-          </button>
+          </Button>
         </form>
       ) : null}
 
@@ -511,9 +522,8 @@ function SecurityPanel({
               ))}
             </ul>
           </div>
-          <label>
-            <span>认证器代码</span>
-            <input
+          <Field label="认证器代码">
+            <Input
               autoComplete="one-time-code"
               inputMode="numeric"
               name="totp-setup-code"
@@ -521,20 +531,19 @@ function SecurityPanel({
               required
               value={code}
             />
-          </label>
+          </Field>
           {error ? <p className="form-error">{error}</p> : null}
-          <button className="button button--primary" disabled={busy} type="submit">
+          <Button disabled={busy} type="submit">
             {busy ? '正在启用…' : '验证并启用'}
-          </button>
+          </Button>
         </form>
       ) : null}
 
       {enabled ? (
         <form className="compact-form" onSubmit={disableTotp}>
           <p>关闭需要再次输入密码，并会撤销全部登录会话。</p>
-          <label>
-            <span>当前密码</span>
-            <input
+          <Field label="当前密码">
+            <Input
               autoComplete="current-password"
               minLength={12}
               name="totp-disable-password"
@@ -543,20 +552,21 @@ function SecurityPanel({
               type="password"
               value={password}
             />
-          </label>
+          </Field>
           {error ? <p className="form-error">{error}</p> : null}
-          <button className="button button--danger" disabled={busy} type="submit">
+          <Button disabled={busy} type="submit" variant="danger">
             关闭 TOTP
-          </button>
+          </Button>
         </form>
       ) : null}
-    </section>
+    </Panel>
   );
 }
 
 function OperationsPanel({
   blockedTasks,
   channels,
+  collector,
   loading,
   onChannelToggle,
   onRerender,
@@ -564,6 +574,7 @@ function OperationsPanel({
 }: {
   blockedTasks: BlockedTask[];
   channels: ConfiguredChannel[];
+  collector: AdminStatus['collector'] | null;
   loading: boolean;
   onChannelToggle(channel: ConfiguredChannel): Promise<void>;
   onRerender(): Promise<RerenderResult>;
@@ -626,16 +637,20 @@ function OperationsPanel({
   }
 
   return (
-    <section className="operations" aria-labelledby="operations-title">
+    <section
+      className="operations"
+      aria-labelledby="operations-title"
+      data-koharu-ui-tone="inverse"
+    >
       <div className="operations__heading">
         <div>
-          <p className="kicker">OPERATIONS</p>
+          <Kicker>OPERATIONS</Kicker>
           <h2 id="operations-title">运维台</h2>
           <p>处理阻塞任务、控制采集频道，以及更新过期的内容渲染。</p>
         </div>
-        <span className={`badge ${blockedTasks.length === 0 ? 'badge--good' : 'badge--warning'}`}>
+        <Badge tone={blockedTasks.length === 0 ? 'success' : 'warning'}>
           {loading ? '读取中…' : `${blockedTasks.length} 个阻塞任务`}
-        </span>
+        </Badge>
       </div>
 
       {error ? (
@@ -653,7 +668,7 @@ function OperationsPanel({
         <section className="operation-card operation-card--tasks" aria-labelledby="blocked-title">
           <div className="operation-card__heading">
             <div>
-              <p className="kicker">QUEUE</p>
+              <Kicker>QUEUE</Kicker>
               <h3 id="blocked-title">阻塞任务</h3>
             </div>
             <span>{blockedTasks.length}</span>
@@ -678,9 +693,8 @@ function OperationsPanel({
                     <time dateTime={task.blockedAt}>{formatDate(task.blockedAt)}</time>
                   </header>
                   {task.lastError ? <pre>{task.lastError}</pre> : null}
-                  <label>
-                    <span>操作原因（必填，将写入审计记录）</span>
-                    <input
+                  <Field label="操作原因（必填，将写入审计记录）">
+                    <Input
                       disabled={taskBusy}
                       maxLength={500}
                       onChange={(event) =>
@@ -692,30 +706,29 @@ function OperationsPanel({
                       placeholder="例如：已修复解析器，重新处理"
                       value={reason}
                     />
-                  </label>
+                  </Field>
                   <div className="blocked-task__actions">
-                    <button
-                      className="button button--primary"
+                    <Button
                       disabled={taskBusy || reason.trim().length === 0}
                       onClick={() => actOnTask(task, 'retry')}
                       type="button"
                     >
                       {busyAction === `task:${task.id}:retry` ? '正在重试…' : '重试任务'}
-                    </button>
-                    <button
-                      className="button button--danger"
+                    </Button>
+                    <Button
                       disabled={taskBusy || reason.trim().length === 0}
                       onClick={() => actOnTask(task, 'skip')}
                       type="button"
+                      variant="danger"
                     >
                       {busyAction === `task:${task.id}:skip` ? '正在跳过…' : '显式跳过'}
-                    </button>
+                    </Button>
                   </div>
                 </article>
               );
             })}
             {!loading && blockedTasks.length === 0 ? (
-              <p className="empty-state empty-state--good">队列畅通，没有等待 Owner 处理的任务。</p>
+              <EmptyState tone="success">队列畅通，没有等待 Owner 处理的任务。</EmptyState>
             ) : null}
           </div>
         </section>
@@ -724,7 +737,7 @@ function OperationsPanel({
           <section className="operation-card" aria-labelledby="configured-channels-title">
             <div className="operation-card__heading">
               <div>
-                <p className="kicker">COLLECTOR</p>
+                <Kicker>COLLECTOR</Kicker>
                 <h3 id="configured-channels-title">采集频道</h3>
               </div>
               <span>{channels.filter((channel) => channel.enabled).length} 启用</span>
@@ -759,16 +772,36 @@ function OperationsPanel({
                 );
               })}
               {!loading && channels.length === 0 ? (
-                <p className="empty-state">还没有配置 Telegram 频道。</p>
+                <EmptyState>还没有配置 Telegram 频道。</EmptyState>
               ) : null}
             </div>
+            <dl className="collector-runtime">
+              <div className="collector-runtime__item">
+                <dt>Worker</dt>
+                <dd>
+                  {collector?.state === 'running'
+                    ? '运行中'
+                    : collector?.state === 'stale'
+                      ? '心跳过期'
+                      : '未运行'}
+                </dd>
+              </div>
+              <div className="collector-runtime__item">
+                <dt>版本</dt>
+                <dd>{collector?.version ?? '—'}</dd>
+              </div>
+              <div className="collector-runtime__item">
+                <dt>心跳</dt>
+                <dd>{collector?.heartbeatAt ? formatDate(collector.heartbeatAt) : '—'}</dd>
+              </div>
+            </dl>
             <p className="operation-help">停用只会停止后续采集，不会删除已经归档的消息。</p>
           </section>
 
           <section className="operation-card rerender-card" aria-labelledby="rerender-title">
             <div className="operation-card__heading">
               <div>
-                <p className="kicker">RENDERER</p>
+                <Kicker>RENDERER</Kicker>
                 <h3 id="rerender-title">内容重渲染</h3>
               </div>
               {rerenderResult ? <span>v{rerenderResult.currentVersion}</span> : null}
@@ -776,18 +809,13 @@ function OperationsPanel({
             <p className="operation-help">
               仅处理 renderer 版本落后的修订，每次最多一批；已经是当前版本的内容不会改写。
             </p>
-            <button
-              className="button button--quiet"
-              disabled={busyAction !== null}
-              onClick={rerender}
-              type="button"
-            >
+            <Button disabled={busyAction !== null} onClick={rerender} type="button" variant="quiet">
               {busyAction === 'rerender'
                 ? '正在重渲染…'
                 : rerenderResult?.hasMore
                   ? '继续处理下一批'
                   : '重渲染过期内容'}
-            </button>
+            </Button>
             {rerenderResult ? (
               <p className="rerender-result">
                 本批更新 {rerenderResult.updated} 条
@@ -813,9 +841,11 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [raw, setRaw] = useState<unknown>(null);
   const [rawLoading, setRawLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
+    let stopStatusPoller: (() => void) | null = null;
 
     Promise.all([
       fetchJson<AdminStatus>('/api/v1/admin/status', { signal: controller.signal }),
@@ -843,10 +873,27 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
       .finally(() => {
         if (!controller.signal.aborted) {
           setOperationsLoading(false);
+          stopStatusPoller = startStatusPoller<AdminStatus>({
+            fetchStatus: (signal) =>
+              fetchJson<AdminStatus>('/api/v1/admin/status', {
+                cache: 'no-store',
+                signal,
+              }),
+            onError(reason) {
+              setStatusError(reason instanceof Error ? reason.message : '无法刷新采集状态');
+            },
+            onStatus(nextStatus) {
+              setStatus(nextStatus);
+              setStatusError(null);
+            },
+          });
         }
       });
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      stopStatusPoller?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -971,7 +1018,7 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   }
 
   return (
-    <main className="desk">
+    <main className="desk" data-koharu-ui>
       <header className="desk-header">
         <div className="desk-brand">
           <span className="brand-mark brand-mark--small" aria-hidden="true">
@@ -983,9 +1030,21 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           </div>
         </div>
         <div className="desk-header__actions">
-          <span className={`live-state ${status?.collector === 'running' ? 'is-live' : ''}`}>
+          <span
+            className={`live-state ${
+              status?.collector.state === 'running'
+                ? 'is-live'
+                : status?.collector.state === 'stale'
+                  ? 'is-stale'
+                  : ''
+            }`}
+          >
             <span aria-hidden="true" />
-            {status?.collector === 'running' ? 'Collector 运行中' : 'Collector 未运行'}
+            {status?.collector.state === 'running'
+              ? 'Collector 运行中'
+              : status?.collector.state === 'stale'
+                ? 'Collector 心跳过期'
+                : 'Collector 未运行'}
           </span>
           <button className="text-button" onClick={signOut} type="button">
             退出
@@ -993,15 +1052,15 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
         </div>
       </header>
 
-      {error ? (
+      {(error ?? statusError) ? (
         <div className="page-error" role="alert">
-          {error}
+          {error ?? statusError}
         </div>
       ) : null}
 
       <div className="desk-grid">
         <aside className="rail">
-          <p className="kicker">ARCHIVE</p>
+          <Kicker>ARCHIVE</Kicker>
           <h2>频道</h2>
           <nav aria-label="归档频道">
             {channels.map((channel) => (
@@ -1044,14 +1103,14 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           </section>
 
           <div className="content-grid">
-            <section className="panel message-list" aria-labelledby="message-list-title">
-              <div className="panel__heading">
+            <Panel className="message-list" aria-labelledby="message-list-title">
+              <PanelHeader>
                 <div>
-                  <p className="kicker">LEDGER</p>
+                  <Kicker>LEDGER</Kicker>
                   <h2 id="message-list-title">最近消息</h2>
                 </div>
-                <span className="badge">{messages.length} 条</span>
-              </div>
+                <Badge>{messages.length} 条</Badge>
+              </PanelHeader>
               <div className="message-list__items">
                 {messages.map((message) => (
                   <button
@@ -1070,16 +1129,14 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
                     </span>
                   </button>
                 ))}
-                {messages.length === 0 ? (
-                  <p className="empty-state">这个频道还没有归档消息。</p>
-                ) : null}
+                {messages.length === 0 ? <EmptyState>这个频道还没有归档消息。</EmptyState> : null}
               </div>
-            </section>
+            </Panel>
 
-            <section className="panel message-detail" aria-labelledby="message-detail-title">
-              <div className="panel__heading">
+            <Panel className="message-detail" aria-labelledby="message-detail-title">
+              <PanelHeader>
                 <div>
-                  <p className="kicker">MESSAGE</p>
+                  <Kicker>MESSAGE</Kicker>
                   <h2 id="message-detail-title">消息详情</h2>
                 </div>
                 {selectedMessage?.sourceUrl ? (
@@ -1087,7 +1144,7 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
                     原消息 ↗
                   </a>
                 ) : null}
-              </div>
+              </PanelHeader>
               {selectedMessage ? (
                 <>
                   <div className="message-copy">
@@ -1115,28 +1172,24 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
                       <strong>Telegram raw update</strong>
                       <p>仅在主动点击后读取；响应不会被缓存。</p>
                     </div>
-                    <button
-                      className="button button--quiet"
-                      disabled={rawLoading}
-                      onClick={revealRaw}
-                      type="button"
-                    >
+                    <Button disabled={rawLoading} onClick={revealRaw} type="button" variant="quiet">
                       {rawLoading ? '正在读取…' : raw === null ? '揭示原始数据' : '重新读取'}
-                    </button>
+                    </Button>
                   </div>
                   {raw !== null ? (
                     <pre className="raw-view">{JSON.stringify(raw, null, 2)}</pre>
                   ) : null}
                 </>
               ) : (
-                <p className="empty-state">选择一条消息查看详情。</p>
+                <EmptyState>选择一条消息查看详情。</EmptyState>
               )}
-            </section>
+            </Panel>
           </div>
 
           <OperationsPanel
             blockedTasks={blockedTasks}
             channels={configuredChannels}
+            collector={status?.collector ?? null}
             loading={operationsLoading}
             onChannelToggle={toggleConfiguredChannel}
             onRerender={rerenderOutdated}

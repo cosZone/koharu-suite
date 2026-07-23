@@ -1,0 +1,77 @@
+{
+  "name": "@koharu-suite/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Internal React UI primitives for koharu-suite.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./badge": {
+      "types": "./dist/badge.d.ts",
+      "import": "./dist/badge.js"
+    },
+    "./button": {
+      "types": "./dist/button.d.ts",
+      "import": "./dist/button.js"
+    },
+    "./empty-state": {
+      "types": "./dist/empty-state.d.ts",
+      "import": "./dist/empty-state.js"
+    },
+    "./field": {
+      "types": "./dist/field.d.ts",
+      "import": "./dist/field.js"
+    },
+    "./input": {
+      "types": "./dist/input.d.ts",
+      "import": "./dist/input.js"
+    },
+    "./kicker": {
+      "types": "./dist/kicker.d.ts",
+      "import": "./dist/kicker.js"
+    },
+    "./panel": {
+      "types": "./dist/panel.d.ts",
+      "import": "./dist/panel.js"
+    },
+    "./styles.css": "./dist/styles.css"
+  },
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "build:storybook": "storybook build",
+    "storybook": "storybook dev -p 6006",
+    "test:storybook": "vitest --project=storybook --run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@storybook/addon-a11y": "10.2.9",
+    "@storybook/addon-vitest": "10.2.9",
+    "@storybook/react-vite": "10.2.9",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "5.2.0",
+    "@vitest/browser-playwright": "catalog:",
+    "playwright": "1.61.1",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "storybook": "10.2.9",
+    "typescript": "catalog:",
+    "vite": "7.3.6",
+    "vitest": "catalog:"
+  }
+}

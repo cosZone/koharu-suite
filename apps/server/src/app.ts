@@ -33,7 +33,6 @@ export interface AppDependencies {
   admin: AdminReader;
   adminAssetsRoot?: string;
   auth: RuntimeAuth;
-  collectorState: () => 'running' | 'stopped';
   messages: MessageReader;
   operations: Pick<
     PostgresAdminOperations,
@@ -50,6 +49,7 @@ export interface AppDependencies {
   };
   publicApi: PublicApiConfig;
   publicClientAddress: (context: Context) => string;
+  readiness: () => Promise<void>;
 }
 
 const healthResponse = (): HealthResponse => ({
@@ -66,6 +66,13 @@ const unavailableMessageReader: MessageReader = {
 const unavailableAdminReader: AdminReader = {
   getRawUpdate: async () => null,
   getStatus: async () => ({
+    collector: {
+      heartbeatAt: null,
+      lastTelegramSuccessAt: null,
+      startedAt: null,
+      state: 'stopped',
+      version: null,
+    },
     counts: {
       activeChannels: 0,
       blockedTasks: 0,
@@ -153,11 +160,15 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     admin: dependencies.admin ?? unavailableAdminReader,
     adminAssetsRoot: dependencies.adminAssetsRoot,
     auth: dependencies.auth ?? unavailableAuth,
-    collectorState: dependencies.collectorState ?? (() => 'stopped' as const),
     messages: dependencies.messages ?? unavailableMessageReader,
     operations: dependencies.operations ?? unavailableOperations,
     publicApi: dependencies.publicApi ?? defaultPublicApi,
     publicClientAddress: dependencies.publicClientAddress ?? defaultPublicClientAddress,
+    readiness:
+      dependencies.readiness ??
+      (async () => {
+        throw new Error('Readiness probe is not configured');
+      }),
   };
   const limiter = new FixedWindowRateLimiter({
     max: resolved.publicApi.rateLimitMax,
@@ -236,6 +247,14 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
 
   app.on(['GET', 'POST'], '/api/auth/*', (context) => resolved.auth.handle(context.req.raw));
   app.get('/healthz', (context) => context.json(healthResponse()));
+  app.get('/readyz', async (context) => {
+    try {
+      await resolved.readiness();
+      return context.json(healthResponse());
+    } catch {
+      return context.json(apiError('not_ready', 'Database is unavailable'), 503);
+    }
+  });
   app.get('/api/v1/health', (context) => context.json(healthResponse()));
   app.get('/api/v1/channels', async (context) =>
     context.json({ items: await resolved.messages.listChannels() }),
@@ -292,7 +311,6 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     }
     const status = await resolved.admin.getStatus();
     return context.json({
-      collector: resolved.collectorState(),
       ...status,
       owner: {
         email: authorization.principal.email,

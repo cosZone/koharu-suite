@@ -1,0 +1,14 @@
+[data-koharu-ui] .ks-story-canvas {
+  min-width: min(720px, calc(100vw - 48px));
+  padding: 36px;
+  border-radius: 6px 24px 6px 24px;
+  background:
+    radial-gradient(
+      circle at 10% 0%,
+      color-mix(in srgb, var(--ks-color-accent) 15%, transparent),
+      transparent 32%
+    ),
+    var(--ks-color-surface-muted);
+  color: var(--ks-color-ink);
+  font-family: "Avenir Next", Avenir, "Hiragino Kaku Gothic ProN", "Noto Sans CJK SC", sans-serif;
+}

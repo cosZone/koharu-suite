@@ -145,6 +145,7 @@ export class ReservedTelegramInboxRepository {
   constructor(databaseUrl: string, database: Database) {
     this.client = postgres(databaseUrl, {
       max: 1,
+      max_lifetime: null,
       onclose: () => {
         this.sessionLost = true;
       },
@@ -177,11 +178,27 @@ export class ReservedTelegramInboxRepository {
   }
 
   async assertPollerLock(): Promise<void> {
-    if (!this.reserved || this.backendPid === undefined) {
+    const reserved = this.reserved;
+    const backendPid = this.backendPid;
+    if (!reserved || backendPid === undefined) {
       throw new Error('Telegram poller session has not been reserved');
     }
     if (this.sessionLost) {
       throw new Error('Telegram poller database session changed and lost advisory lock ownership');
+    }
+
+    try {
+      const [status] = await reserved<{ backendPid: number }[]>`
+        select pg_backend_pid() as "backendPid"
+      `;
+      if (this.sessionLost || status?.backendPid !== backendPid) {
+        throw new Error('Telegram poller backend identity changed');
+      }
+    } catch (error) {
+      this.sessionLost = true;
+      throw new Error('Telegram poller database session changed and lost advisory lock ownership', {
+        cause: error,
+      });
     }
   }
 

@@ -107,6 +107,21 @@ describe('health endpoints', () => {
       version: '0.1.0',
     });
   });
+
+  it('reports readiness only after the database probe succeeds', async () => {
+    const ready = await createApp({ readiness: async () => {} }).request('/readyz');
+    expect(ready.status).toBe(200);
+
+    const unavailable = await createApp({
+      readiness: async () => {
+        throw new Error('database unavailable');
+      },
+    }).request('/readyz');
+    expect(unavailable.status).toBe(503);
+    await expect(unavailable.json()).resolves.toMatchObject({
+      error: { code: 'not_ready' },
+    });
+  });
 });
 
 describe('public message endpoints', () => {
@@ -315,6 +330,13 @@ describe('owner admin endpoints', () => {
       admin: {
         getRawUpdate: async (messageId) => (messageId === MESSAGE_ID ? rawUpdate : null),
         getStatus: async () => ({
+          collector: {
+            heartbeatAt: '2026-07-24T12:00:00.000Z',
+            lastTelegramSuccessAt: '2026-07-24T11:59:58.000Z',
+            startedAt: '2026-07-24T11:00:00.000Z',
+            state: 'running',
+            version: '0.1.0',
+          },
           counts: {
             activeChannels: 1,
             blockedTasks: 0,
@@ -330,14 +352,19 @@ describe('owner admin endpoints', () => {
         }),
       },
       auth: ownerAuth,
-      collectorState: () => 'running',
       owners: { isOwner: async () => true },
     });
 
     const status = await app.request('/api/v1/admin/status');
     expect(status.status).toBe(200);
     await expect(status.json()).resolves.toEqual({
-      collector: 'running',
+      collector: {
+        heartbeatAt: '2026-07-24T12:00:00.000Z',
+        lastTelegramSuccessAt: '2026-07-24T11:59:58.000Z',
+        startedAt: '2026-07-24T11:00:00.000Z',
+        state: 'running',
+        version: '0.1.0',
+      },
       counts: {
         activeChannels: 1,
         blockedTasks: 0,

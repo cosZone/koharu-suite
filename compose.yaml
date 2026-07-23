@@ -1,5 +1,15 @@
 name: koharu-suite
 
+x-kodama-image: &kodama-image
+  image: ${KOHARU_IMAGE:-koharu-suite:local}
+
+x-postgres-environment: &postgres-environment
+  POSTGRES_DB: ${POSTGRES_DB:-koharu}
+  POSTGRES_HOST: db
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: ${POSTGRES_USER:-koharu}
+
 services:
   db:
     image: postgres:18-alpine
@@ -15,40 +25,93 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PUBLISHED_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
 
-  server:
+  migrate:
+    <<: *kodama-image
     build:
       context: .
+      args:
+        REVISION: ${KOHARU_REVISION:-unknown}
+        SOURCE: ${KOHARU_SOURCE:-https://github.com/cosZone/koharu-suite}
+        VERSION: ${KOHARU_VERSION:-dev}
+    command:
+      - node
+      - dist/cli.js
+      - migrate
     depends_on:
       db:
         condition: service_healthy
     environment:
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      <<: *postgres-environment
+    init: true
+    restart: "no"
+
+  server:
+    <<: *kodama-image
+    command:
+      - node
+      - dist/cli.js
+      - serve
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *postgres-environment
+      ADMIN_ASSETS_ROOT: /app/admin
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET to at least 32 high-entropy characters}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:?Set BETTER_AUTH_URL to the canonical public origin}
       PORT: 3000
-      POSTGRES_DB: ${POSTGRES_DB:-koharu}
-      POSTGRES_HOST: db
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: ${POSTGRES_USER:-koharu}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      PUBLIC_CORS_ORIGINS: ${PUBLIC_CORS_ORIGINS:-}
+      PUBLIC_RATE_LIMIT_MAX: ${PUBLIC_RATE_LIMIT_MAX:-120}
+      PUBLIC_RATE_LIMIT_WINDOW_SECONDS: ${PUBLIC_RATE_LIMIT_WINDOW_SECONDS:-60}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000/readyz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    init: true
+    ports:
+      - "${KOHARU_HTTP_PORT:-3000}:3000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  worker:
+    <<: *kodama-image
+    command:
+      - node
+      - dist/cli.js
+      - worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *postgres-environment
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
       TELEGRAM_WORKER_CONCURRENCY: ${TELEGRAM_WORKER_CONCURRENCY:-4}
     healthcheck:
       test:
         - CMD
         - node
-        - -e
-        - fetch('http://localhost:3000/healthz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))
+        - dist/cli.js
+        - health
+        - worker
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
     init: true
-    ports:
-      - "3000:3000"
+    restart: unless-stopped
+    stop_grace_period: 30s
 
 volumes:
   postgres-data:

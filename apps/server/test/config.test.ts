@@ -5,11 +5,19 @@ import {
   resolvePort,
   resolvePublicApiConfig,
   resolveTelegramConfig,
+  resolveWorkerInstanceId,
 } from '../src/config.js';
 
 describe('configuration', () => {
   it('accepts a valid port', () => {
     expect(resolvePort('4321')).toBe(4321);
+  });
+
+  it('uses the container hostname as the fenced worker instance ID', () => {
+    expect(resolveWorkerInstanceId({ HOSTNAME: 'worker-container-id' })).toBe(
+      'worker-container-id',
+    );
+    expect(() => resolveWorkerInstanceId({})).toThrow();
   });
 
   it('rejects an invalid port', () => {
@@ -42,6 +50,7 @@ describe('configuration', () => {
         TELEGRAM_CHANNEL_ID: '-1001234567890',
       }),
     ).toEqual({
+      apiRoot: undefined,
       botToken: '123456:test-token',
       legacyChannelId: -1_001_234_567_890n,
       workerConcurrency: 4,
@@ -55,6 +64,7 @@ describe('configuration', () => {
         TELEGRAM_WORKER_CONCURRENCY: '16',
       }),
     ).toEqual({
+      apiRoot: undefined,
       botToken: 'token',
       legacyChannelId: undefined,
       workerConcurrency: 16,
@@ -65,6 +75,31 @@ describe('configuration', () => {
         TELEGRAM_WORKER_CONCURRENCY: '17',
       }),
     ).toThrow();
+  });
+
+  it('enables a custom Telegram API root only behind the explicit test gate', () => {
+    expect(
+      resolveTelegramConfig({
+        KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: 'true',
+        KOHARU_TEST_TELEGRAM_API_ROOT: 'http://telegram-fixture:8080',
+        TELEGRAM_BOT_TOKEN: 'fixture-token',
+      }),
+    ).toMatchObject({
+      apiRoot: 'http://telegram-fixture:8080',
+      botToken: 'fixture-token',
+    });
+    expect(() =>
+      resolveTelegramConfig({
+        KOHARU_TEST_TELEGRAM_API_ROOT: 'http://telegram-fixture:8080',
+        TELEGRAM_BOT_TOKEN: 'fixture-token',
+      }),
+    ).toThrow('requires KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT=true');
+    expect(() =>
+      resolveTelegramConfig({
+        KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: 'true',
+        TELEGRAM_BOT_TOKEN: 'fixture-token',
+      }),
+    ).toThrow('requires KOHARU_TEST_TELEGRAM_API_ROOT');
   });
 
   it('rejects missing token, non-channel IDs, and unsafe Telegram IDs', () => {

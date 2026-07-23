@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,7 +18,7 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -52,11 +53,24 @@ jobs:
       - name: Build workspace
         run: pnpm build
 
+      - name: Build Storybook
+        run: pnpm build:storybook
+
+      - name: Install Storybook browser
+        run: pnpm --filter @koharu-suite/ui exec playwright install --with-deps chromium
+
+      - name: Test Storybook interactions and accessibility
+        run: pnpm test:storybook
+
       - name: Smoke-test CLI
         run: pnpm exec kodama --help
 
       - name: Validate Compose
+        env:
+          BETTER_AUTH_SECRET: ci-only-better-auth-secret-32-chars
+          BETTER_AUTH_URL: http://localhost:3000
+          TELEGRAM_BOT_TOKEN: 123456789:ci-compose-config-only
         run: docker compose config --quiet
 
-      - name: Build server image
-        run: docker build .
+      - name: Run Compose smoke
+        run: ./scripts/compose-smoke/run.sh
