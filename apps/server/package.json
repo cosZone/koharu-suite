@@ -1,0 +1,49 @@
+{
+  "name": "@koharu-suite/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HTTP server, database migrations, and kodama CLI for koharu-suite.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": {
+    "kodama": "./bin/kodama.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/app.d.ts",
+      "default": "./dist/app.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "drizzle"
+  ],
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "db:generate": "drizzle-kit generate",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run --exclude \"test/integration/**\"",
+    "test:integration": "vitest run test/integration",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "catalog:",
+    "drizzle-orm": "catalog:",
+    "hono": "catalog:",
+    "postgres": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "catalog:",
+    "@types/node": "catalog:",
+    "drizzle-kit": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

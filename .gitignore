@@ -5,6 +5,7 @@ node_modules/
 dist/
 .astro/
 coverage/
+*.tsbuildinfo
 
 # Environment and secrets
 .env
@@ -20,6 +21,9 @@ pnpm-debug.log*
 data/
 media/
 backups/
+
+# Testcontainers
+.testcontainers.properties
 
 # Editors and operating systems
 .DS_Store
