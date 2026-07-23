@@ -14,13 +14,13 @@ Core principles:
   posts;
 - build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
 
-[G1.4 #8](https://github.com/cosZone/koharu-suite/issues/8) adds reliable multi-channel ingestion to the
-first owner control surface:
+[G1.5 #10](https://github.com/cosZone/koharu-suite/issues/10) adds baseline operations on top of reliable
+multi-channel ingestion:
 
-- `apps/server`: Hono API, a durable Telegram inbox and cursor, channel-ordered workers, a Drizzle repository,
-  Better Auth, and the `kodama` CLI;
-- `apps/admin`: a React and Vite Owner Desk for authentication, archive status, message browsing, explicit raw
-  reveal, and TOTP;
+- `apps/server`: Hono API, scoped service tokens, blocked-task recovery, channel state controls, a versioned
+  HTML renderer, cursor pagination, public API safeguards, and `kodama doctor`;
+- `apps/admin`: a React and Vite Owner Desk for authentication, archive status, message browsing, blocked
+  retry/skip, channel state controls, rerendering, explicit raw reveal, and TOTP;
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the complete roadmap.
@@ -77,6 +77,24 @@ the checkbox is off by default. Trust skips only the second factor and never byp
 TOTP state changes revoke every database session. Sign-in always uses a seven-day sliding session and does not
 offer a “remember me” switch.
 
+### Service tokens
+
+Browsers use only the owner session and never store a shared token. CLI and CI clients can create revocable,
+least-privilege service tokens:
+
+```bash
+pnpm exec kodama token create --name deploy --scope admin:read --expires-in 30d
+pnpm exec kodama token create --name renderer --scope content:write
+pnpm exec kodama token list
+pnpm exec kodama token revoke --id <api-key-id>
+```
+
+`--scope` is repeatable; accepted values are `admin:read`, `ingestion:write`, and `content:write`. Create
+requires at least one scope, and `--expires-in` accepts a whole number of days from `1d` through `3650d`. The
+plaintext key is printed only once at creation time, the database stores only its hash, and list never prints
+the key or hash. Send it to management APIs as `Authorization: Bearer <key>`; an invalid Bearer credential
+never falls back to a browser cookie.
+
 ## Telegram and the public API
 
 Telegram updates form one bot-wide stream. Run exactly one suite poller and make the same bot an administrator
@@ -86,6 +104,8 @@ default-deny, and raw payloads from unknown channels are not persisted:
 ```bash
 pnpm exec kodama channel add --telegram-id -1001234567890
 pnpm exec kodama channel list
+pnpm exec kodama channel disable --telegram-id -1001234567890
+pnpm exec kodama channel enable --telegram-id -1001234567890
 ```
 
 The first `channel add` (or `serve`) binds the database to that Bot's numeric ID. Every later token must belong
@@ -95,7 +115,10 @@ The poller stores allowed updates and its next cursor in one PostgreSQL transact
 default: different channels can progress concurrently, while each channel remains strictly ordered by update
 ID. Every `edited_channel_post` creates an immutable revision; a first-known edit starts at revision 1. A failed
 task retries exponentially ten times, then blocks only its channel. The initial version never skips it
-automatically; owner retry and skip controls are planned for a later Goal.
+automatically. Owner Desk can retry or explicitly skip it with a required reason, and records the action in the
+audit trail while retaining raw/error evidence. Disabling a channel stops only future ingestion and does not
+delete its archive. Because the bot-wide offset still advances, updates sent while disabled are not backfilled
+after re-enabling.
 
 Telegram retains unfetched updates for at most roughly 24 hours. If the service remains offline beyond that
 upstream window, the Bot API cannot restore updates Telegram has already removed.
@@ -104,13 +127,41 @@ After publishing a message, discover the suite channel ID before reading its mes
 
 ```bash
 curl http://localhost:3000/api/v1/channels
-curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>"
+curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50"
+curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50&cursor=<nextCursor>"
 curl http://localhost:3000/api/v1/messages/<suiteMessageId>
 ```
 
+Message lists return `{ items, nextCursor }`. `limit` defaults to 50 and accepts 1–100; `cursor` is an opaque
+value bound to the selected channel and clients should neither decode nor modify it. Archived revisions store
+safe HTML rendered from escaped text/entities. After a renderer upgrade, “Rerender outdated” in Owner Desk
+updates only derived HTML/version fields and leaves revision history unchanged.
+
 The public API uses stable suite IDs. M1 archives Telegram media metadata without downloading files. Public
-responses omit raw updates, numeric Telegram IDs, internal file IDs, and the bot token. Raw updates are
-available only to the owner through a separate `private, no-store` endpoint after an explicit click in Admin.
+responses omit raw updates, numeric Telegram IDs, internal file IDs, and the bot token. Raw updates are exposed
+only on an explicit request by the owner/session or a service token with `admin:read`, with a
+`private, no-store` response.
+
+Cross-origin reads are denied by default. If a separate frontend needs them, set exact canonical origins as a
+comma-separated `PUBLIC_CORS_ORIGINS` value; wildcard and credentialed CORS are not supported. Public endpoints
+default to 120 requests per client per 60 seconds, configurable with `PUBLIC_RATE_LIMIT_MAX` and
+`PUBLIC_RATE_LIMIT_WINDOW_SECONDS`. This is a basic in-process fixed-window limiter: restarts clear it and
+replicas do not share quotas. `TRUST_PROXY` defaults to `false`; enable it and trust the first
+`X-Forwarded-For` value only when the server is reachable exclusively through a trusted reverse proxy.
+
+## Deployment diagnostics
+
+Run the read-only doctor after deployment:
+
+```bash
+pnpm exec kodama doctor
+```
+
+It checks configuration, PostgreSQL 18 and the schema, the singleton owner, bot identity, and whether enabled
+channels remain public with the bot as an administrator. It never calls `getUpdates`, changes the cursor, or
+prints database passwords, bot tokens, auth secrets, raw updates, or API keys. A critical failure produces exit
+code 1. Because the command does call Telegram `getMe/getChat/getChatMember`, tests and CI should use
+fixtures/a safe environment rather than an unauthorized real channel.
 
 ## Docker
 

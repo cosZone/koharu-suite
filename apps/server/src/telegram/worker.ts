@@ -102,6 +102,7 @@ export class TelegramWorkerPool {
           select task.id
           from ${telegramIngestTasks} task
           where task.processed_at is null
+            and task.skipped_at is null
             and task.blocked_at is null
             and task.available_at <= now()
             and not exists (
@@ -110,6 +111,7 @@ export class TelegramWorkerPool {
               where earlier.telegram_chat_id = task.telegram_chat_id
                 and earlier.telegram_update_id < task.telegram_update_id
                 and earlier.processed_at is null
+                and earlier.skipped_at is null
             )
           order by task.telegram_update_id
           for update skip locked

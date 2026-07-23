@@ -1,6 +1,13 @@
 import { twoFactorClient } from 'better-auth/client/plugins';
 import { createAuthClient } from 'better-auth/react';
-import { type FormEvent, useEffect, useState } from 'react';
+import {
+  createElement,
+  type FormEvent,
+  Fragment,
+  type ReactNode,
+  useEffect,
+  useState,
+} from 'react';
 
 const authClient = createAuthClient({
   plugins: [twoFactorClient()],
@@ -19,10 +26,29 @@ interface Channel {
   username: string | null;
 }
 
+interface ConfiguredChannel {
+  disabledAt: string | null;
+  enabled: boolean;
+  telegramChatId: string;
+  title: string;
+  username: string | null;
+}
+
+interface BlockedTask {
+  attemptCount: number;
+  blockedAt: string;
+  channelTitle: string;
+  channelUsername: string | null;
+  id: string;
+  lastError: string | null;
+  telegramUpdateId: string;
+}
+
 interface Message {
   authorSignature: string | null;
   channel: Channel;
   content: {
+    html: string | null;
     kind: 'caption' | 'none' | 'text';
     text: string | null;
   };
@@ -42,6 +68,8 @@ interface AdminStatus {
     messages: number;
     pendingTasks: number;
     retryingTasks: number;
+    skippedTasks: number;
+    staleRendererRevisions: number;
     updates: number;
   };
   lastCheckpoint: string | null;
@@ -56,6 +84,12 @@ interface TotpSetup {
   backupCodes: string[];
   secret: string;
   totpURI: string;
+}
+
+interface RerenderResult {
+  currentVersion: number;
+  hasMore: boolean;
+  updated: number;
 }
 
 type AuthStep = 'login' | 'two-factor';
@@ -81,6 +115,96 @@ function formatDate(value: string): string {
     month: 'short',
     year: 'numeric',
   }).format(new Date(value));
+}
+
+const SAFE_MESSAGE_TAGS = new Set([
+  'a',
+  'blockquote',
+  'code',
+  'em',
+  'pre',
+  's',
+  'span',
+  'strong',
+  'u',
+]);
+const SAFE_MESSAGE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tg:']);
+const SAFE_LANGUAGE_CLASS = /^language-[a-zA-Z0-9_+-]{1,64}$/;
+
+function safeMessageHref(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const url = new URL(value);
+    return SAFE_MESSAGE_PROTOCOLS.has(url.protocol.toLowerCase()) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeMessageClass(element: Element): string | undefined {
+  const value = element.getAttribute('class');
+  if (
+    value === 'tg-spoiler' ||
+    value === 'tg-expandable-blockquote' ||
+    (value !== null && SAFE_LANGUAGE_CLASS.test(value))
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function renderSafeMessageNode(node: Node, key: string): ReactNode {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return null;
+  }
+
+  const element = node as Element;
+  const tagName = element.tagName.toLowerCase();
+  const children = [...element.childNodes].map((child, index) =>
+    renderSafeMessageNode(child, `${key}.${index}`),
+  );
+  if (!SAFE_MESSAGE_TAGS.has(tagName)) {
+    return createElement(Fragment, { key }, children);
+  }
+
+  const properties: Record<string, unknown> = { key };
+  if (tagName === 'a') {
+    const href = safeMessageHref(element.getAttribute('href'));
+    if (href === null) {
+      return createElement(Fragment, { key }, children);
+    }
+    properties.href = href;
+    properties.rel = 'nofollow noopener noreferrer';
+  }
+  const className = safeMessageClass(element);
+  if (className !== undefined) {
+    properties.className = className;
+  }
+  if (className === 'tg-spoiler') {
+    properties.tabIndex = 0;
+    properties.title = '聚焦或悬停以显示剧透内容';
+  }
+  return createElement(tagName, properties, children);
+}
+
+function SafeMessageContent({ html, text }: { html: string | null; text: string | null }) {
+  if (html === null) {
+    return <p>{text || '这条消息没有文字内容。'}</p>;
+  }
+
+  const document = new DOMParser().parseFromString(html, 'text/html');
+  return (
+    <div className="rendered-message">
+      {[...document.body.childNodes].map((node, index) =>
+        renderSafeMessageNode(node, String(index)),
+      )}
+    </div>
+  );
 }
 
 function Login({ onComplete }: { onComplete(): Promise<void> }) {
@@ -430,9 +554,259 @@ function SecurityPanel({
   );
 }
 
+function OperationsPanel({
+  blockedTasks,
+  channels,
+  loading,
+  onChannelToggle,
+  onRerender,
+  onTaskAction,
+}: {
+  blockedTasks: BlockedTask[];
+  channels: ConfiguredChannel[];
+  loading: boolean;
+  onChannelToggle(channel: ConfiguredChannel): Promise<void>;
+  onRerender(): Promise<RerenderResult>;
+  onTaskAction(task: BlockedTask, action: 'retry' | 'skip', reason: string): Promise<void>;
+}) {
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [reasons, setReasons] = useState<Record<string, string>>({});
+  const [rerenderResult, setRerenderResult] = useState<RerenderResult | null>(null);
+
+  async function run(actionKey: string, operation: () => Promise<string>) {
+    setBusyAction(actionKey);
+    setError(null);
+    setNotice(null);
+    try {
+      setNotice(await operation());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '操作失败');
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function actOnTask(task: BlockedTask, action: 'retry' | 'skip') {
+    const reason = reasons[task.id]?.trim() ?? '';
+    if (!reason) {
+      setError('重试或跳过前必须填写操作原因。');
+      return;
+    }
+
+    await run(`task:${task.id}:${action}`, async () => {
+      await onTaskAction(task, action, reason);
+      setReasons((current) => {
+        const next = { ...current };
+        delete next[task.id];
+        return next;
+      });
+      return action === 'retry'
+        ? `Update ${task.telegramUpdateId} 已重新进入处理队列。`
+        : `Update ${task.telegramUpdateId} 已由 Owner 显式跳过。`;
+    });
+  }
+
+  async function toggleChannel(channel: ConfiguredChannel) {
+    await run(`channel:${channel.telegramChatId}`, async () => {
+      await onChannelToggle(channel);
+      return `${channel.title} 已${channel.enabled ? '停用' : '启用'}。历史归档没有被删除。`;
+    });
+  }
+
+  async function rerender() {
+    await run('rerender', async () => {
+      const result = await onRerender();
+      setRerenderResult(result);
+      return result.updated > 0
+        ? `已用 renderer v${result.currentVersion} 更新 ${result.updated} 条过期修订。`
+        : `所有修订都已是 renderer v${result.currentVersion}。`;
+    });
+  }
+
+  return (
+    <section className="operations" aria-labelledby="operations-title">
+      <div className="operations__heading">
+        <div>
+          <p className="kicker">OPERATIONS</p>
+          <h2 id="operations-title">运维台</h2>
+          <p>处理阻塞任务、控制采集频道，以及更新过期的内容渲染。</p>
+        </div>
+        <span className={`badge ${blockedTasks.length === 0 ? 'badge--good' : 'badge--warning'}`}>
+          {loading ? '读取中…' : `${blockedTasks.length} 个阻塞任务`}
+        </span>
+      </div>
+
+      {error ? (
+        <p className="operation-feedback operation-feedback--error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      {notice ? (
+        <p className="operation-feedback operation-feedback--success" role="status">
+          {notice}
+        </p>
+      ) : null}
+
+      <div className="operations__grid">
+        <section className="operation-card operation-card--tasks" aria-labelledby="blocked-title">
+          <div className="operation-card__heading">
+            <div>
+              <p className="kicker">QUEUE</p>
+              <h3 id="blocked-title">阻塞任务</h3>
+            </div>
+            <span>{blockedTasks.length}</span>
+          </div>
+          <p className="operation-help">
+            系统不会自动跳过失败任务。每次重试或跳过都会记录 Owner 和原因。
+          </p>
+
+          <div className="task-stack">
+            {blockedTasks.map((task) => {
+              const reason = reasons[task.id] ?? '';
+              const taskBusy = busyAction !== null;
+              return (
+                <article className="blocked-task" key={task.id}>
+                  <header>
+                    <div>
+                      <strong>{task.channelTitle}</strong>
+                      <span>
+                        Update {task.telegramUpdateId} · 已尝试 {task.attemptCount} 次
+                      </span>
+                    </div>
+                    <time dateTime={task.blockedAt}>{formatDate(task.blockedAt)}</time>
+                  </header>
+                  {task.lastError ? <pre>{task.lastError}</pre> : null}
+                  <label>
+                    <span>操作原因（必填，将写入审计记录）</span>
+                    <input
+                      disabled={taskBusy}
+                      maxLength={500}
+                      onChange={(event) =>
+                        setReasons((current) => ({
+                          ...current,
+                          [task.id]: event.target.value,
+                        }))
+                      }
+                      placeholder="例如：已修复解析器，重新处理"
+                      value={reason}
+                    />
+                  </label>
+                  <div className="blocked-task__actions">
+                    <button
+                      className="button button--primary"
+                      disabled={taskBusy || reason.trim().length === 0}
+                      onClick={() => actOnTask(task, 'retry')}
+                      type="button"
+                    >
+                      {busyAction === `task:${task.id}:retry` ? '正在重试…' : '重试任务'}
+                    </button>
+                    <button
+                      className="button button--danger"
+                      disabled={taskBusy || reason.trim().length === 0}
+                      onClick={() => actOnTask(task, 'skip')}
+                      type="button"
+                    >
+                      {busyAction === `task:${task.id}:skip` ? '正在跳过…' : '显式跳过'}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+            {!loading && blockedTasks.length === 0 ? (
+              <p className="empty-state empty-state--good">队列畅通，没有等待 Owner 处理的任务。</p>
+            ) : null}
+          </div>
+        </section>
+
+        <div className="operations__side">
+          <section className="operation-card" aria-labelledby="configured-channels-title">
+            <div className="operation-card__heading">
+              <div>
+                <p className="kicker">COLLECTOR</p>
+                <h3 id="configured-channels-title">采集频道</h3>
+              </div>
+              <span>{channels.filter((channel) => channel.enabled).length} 启用</span>
+            </div>
+            <div className="channel-switches">
+              {channels.map((channel) => {
+                const channelBusy = busyAction === `channel:${channel.telegramChatId}`;
+                return (
+                  <div className="channel-switch" key={channel.telegramChatId}>
+                    <div className="channel-switch__copy">
+                      <strong>{channel.title}</strong>
+                      <span className="channel-switch__identity">
+                        {channel.username ? `@${channel.username}` : channel.telegramChatId}
+                      </span>
+                      {!channel.enabled && channel.disabledAt ? (
+                        <small className="channel-switch__disabled">
+                          停用于 {formatDate(channel.disabledAt)}
+                        </small>
+                      ) : null}
+                    </div>
+                    <button
+                      aria-label={`${channel.enabled ? '停用' : '启用'} ${channel.title}`}
+                      className={`toggle ${channel.enabled ? 'is-enabled' : ''}`}
+                      disabled={busyAction !== null}
+                      onClick={() => toggleChannel(channel)}
+                      type="button"
+                    >
+                      <span aria-hidden="true" />
+                      {channelBusy ? '更新中' : channel.enabled ? '启用' : '停用'}
+                    </button>
+                  </div>
+                );
+              })}
+              {!loading && channels.length === 0 ? (
+                <p className="empty-state">还没有配置 Telegram 频道。</p>
+              ) : null}
+            </div>
+            <p className="operation-help">停用只会停止后续采集，不会删除已经归档的消息。</p>
+          </section>
+
+          <section className="operation-card rerender-card" aria-labelledby="rerender-title">
+            <div className="operation-card__heading">
+              <div>
+                <p className="kicker">RENDERER</p>
+                <h3 id="rerender-title">内容重渲染</h3>
+              </div>
+              {rerenderResult ? <span>v{rerenderResult.currentVersion}</span> : null}
+            </div>
+            <p className="operation-help">
+              仅处理 renderer 版本落后的修订，每次最多一批；已经是当前版本的内容不会改写。
+            </p>
+            <button
+              className="button button--quiet"
+              disabled={busyAction !== null}
+              onClick={rerender}
+              type="button"
+            >
+              {busyAction === 'rerender'
+                ? '正在重渲染…'
+                : rerenderResult?.hasMore
+                  ? '继续处理下一批'
+                  : '重渲染过期内容'}
+            </button>
+            {rerenderResult ? (
+              <p className="rerender-result">
+                本批更新 {rerenderResult.updated} 条
+                {rerenderResult.hasMore ? '，仍有下一批待处理。' : '，已处理完毕。'}
+              </p>
+            ) : null}
+          </section>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Promise<void> }) {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [configuredChannels, setConfiguredChannels] = useState<ConfiguredChannel[]>([]);
+  const [blockedTasks, setBlockedTasks] = useState<BlockedTask[]>([]);
+  const [operationsLoading, setOperationsLoading] = useState(true);
   const [selectedChannel, setSelectedChannel] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
@@ -446,10 +820,18 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     Promise.all([
       fetchJson<AdminStatus>('/api/v1/admin/status', { signal: controller.signal }),
       fetchJson<{ items: Channel[] }>('/api/v1/channels', { signal: controller.signal }),
+      fetchJson<{ items: BlockedTask[] }>('/api/v1/admin/tasks/blocked', {
+        signal: controller.signal,
+      }),
+      fetchJson<{ items: ConfiguredChannel[] }>('/api/v1/admin/channels', {
+        signal: controller.signal,
+      }),
     ])
-      .then(([nextStatus, channelResult]) => {
+      .then(([nextStatus, channelResult, taskResult, configuredChannelResult]) => {
         setStatus(nextStatus);
         setChannels(channelResult.items);
+        setBlockedTasks(taskResult.items);
+        setConfiguredChannels(configuredChannelResult.items);
         setSelectedChannel(channelResult.items[0]?.id ?? null);
       })
       .catch((reason: unknown) => {
@@ -457,6 +839,11 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           return;
         }
         setError(reason instanceof Error ? reason.message : '无法加载管理状态');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setOperationsLoading(false);
+        }
       });
 
     return () => controller.abort();
@@ -506,6 +893,76 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     } finally {
       setRawLoading(false);
     }
+  }
+
+  async function actOnTask(task: BlockedTask, action: 'retry' | 'skip', reason: string) {
+    await fetchJson<{ success: true }>(`/api/v1/admin/tasks/${task.id}/${action}`, {
+      body: JSON.stringify({ reason }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    setBlockedTasks((current) => current.filter((candidate) => candidate.id !== task.id));
+    setStatus((current) =>
+      current
+        ? {
+            ...current,
+            counts: {
+              ...current.counts,
+              blockedTasks: Math.max(0, current.counts.blockedTasks - 1),
+              pendingTasks:
+                action === 'retry' ? current.counts.pendingTasks + 1 : current.counts.pendingTasks,
+              skippedTasks:
+                action === 'skip' ? current.counts.skippedTasks + 1 : current.counts.skippedTasks,
+            },
+          }
+        : current,
+    );
+  }
+
+  async function toggleConfiguredChannel(channel: ConfiguredChannel) {
+    const action = channel.enabled ? 'disable' : 'enable';
+    const updated = await fetchJson<ConfiguredChannel>(
+      `/api/v1/admin/channels/${encodeURIComponent(channel.telegramChatId)}/${action}`,
+      { method: 'POST' },
+    );
+    setConfiguredChannels((current) =>
+      current.map((candidate) =>
+        candidate.telegramChatId === updated.telegramChatId ? updated : candidate,
+      ),
+    );
+    setStatus((current) =>
+      current
+        ? {
+            ...current,
+            counts: {
+              ...current.counts,
+              activeChannels: Math.max(
+                0,
+                current.counts.activeChannels + (updated.enabled ? 1 : -1),
+              ),
+            },
+          }
+        : current,
+    );
+  }
+
+  async function rerenderOutdated() {
+    const result = await fetchJson<RerenderResult>('/api/v1/admin/rerender', { method: 'POST' });
+    setStatus((current) =>
+      current
+        ? {
+            ...current,
+            counts: {
+              ...current.counts,
+              staleRendererRevisions: Math.max(
+                0,
+                current.counts.staleRendererRevisions - result.updated,
+              ),
+            },
+          }
+        : current,
+    );
+    return result;
   }
 
   async function signOut() {
@@ -575,6 +1032,8 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               ['待处理', status?.counts.pendingTasks ?? '—'],
               ['重试中', status?.counts.retryingTasks ?? '—'],
               ['已阻塞', status?.counts.blockedTasks ?? '—'],
+              ['已跳过', status?.counts.skippedTasks ?? '—'],
+              ['待重渲染', status?.counts.staleRendererRevisions ?? '—'],
               ['Checkpoint', status?.lastCheckpoint ? formatDate(status.lastCheckpoint) : '—'],
             ].map(([label, value]) => (
               <div className="stat" key={label}>
@@ -632,7 +1091,10 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               {selectedMessage ? (
                 <>
                   <div className="message-copy">
-                    <p>{selectedMessage.content.text || '这条消息没有文字内容。'}</p>
+                    <SafeMessageContent
+                      html={selectedMessage.content.html}
+                      text={selectedMessage.content.text}
+                    />
                     <dl>
                       <div>
                         <dt>发布时间</dt>
@@ -671,6 +1133,15 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               )}
             </section>
           </div>
+
+          <OperationsPanel
+            blockedTasks={blockedTasks}
+            channels={configuredChannels}
+            loading={operationsLoading}
+            onChannelToggle={toggleConfiguredChannel}
+            onRerender={rerenderOutdated}
+            onTaskAction={actOnTask}
+          />
 
           {status ? (
             <SecurityPanel

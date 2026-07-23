@@ -115,6 +115,41 @@ export const authTwoFactors = pgTable(
   ],
 );
 
+export const authApiKeys = pgTable(
+  'auth_api_keys',
+  {
+    id: text('id').primaryKey(),
+    configId: text('config_id').notNull().default('default'),
+    name: text('name'),
+    start: text('start'),
+    prefix: text('prefix'),
+    key: text('key').notNull(),
+    referenceId: text('reference_id')
+      .notNull()
+      .references(() => authUsers.id, { onDelete: 'cascade' }),
+    refillInterval: integer('refill_interval'),
+    refillAmount: integer('refill_amount'),
+    lastRefillAt: timestamp('last_refill_at', { withTimezone: true }),
+    enabled: boolean('enabled').notNull().default(true),
+    rateLimitEnabled: boolean('rate_limit_enabled').notNull().default(true),
+    rateLimitTimeWindow: integer('rate_limit_time_window'),
+    rateLimitMax: integer('rate_limit_max'),
+    requestCount: integer('request_count').notNull().default(0),
+    remaining: integer('remaining'),
+    lastRequest: timestamp('last_request', { withTimezone: true }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+    permissions: text('permissions'),
+    metadata: text('metadata'),
+  },
+  (table) => [
+    uniqueIndex('auth_api_keys_key_unique').on(table.key),
+    index('auth_api_keys_config_id_idx').on(table.configId),
+    index('auth_api_keys_reference_id_idx').on(table.referenceId),
+  ],
+);
+
 export const owners = pgTable(
   'owners',
   {
@@ -143,13 +178,25 @@ export const telegramChannels = pgTable(
   (table) => [uniqueIndex('telegram_channels_chat_id_unique').on(table.telegramChatId)],
 );
 
-export const telegramChannelAllowlist = pgTable('telegram_channel_allowlist', {
-  telegramChatId: bigint('telegram_chat_id', { mode: 'bigint' }).primaryKey(),
-  title: text('title').notNull(),
-  username: varchar('username', { length: 64 }),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const telegramChannelAllowlist = pgTable(
+  'telegram_channel_allowlist',
+  {
+    telegramChatId: bigint('telegram_chat_id', { mode: 'bigint' }).primaryKey(),
+    title: text('title').notNull(),
+    username: varchar('username', { length: 64 }),
+    enabled: boolean('enabled').notNull().default(true),
+    disabledAt: timestamp('disabled_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check(
+      'telegram_channel_allowlist_enabled_check',
+      sql`(${table.enabled} and ${table.disabledAt} is null)
+        or (not ${table.enabled} and ${table.disabledAt} is not null)`,
+    ),
+  ],
+);
 
 export const telegramPollingState = pgTable(
   'telegram_polling_state',
@@ -182,6 +229,8 @@ export const telegramIngestTasks = pgTable(
     availableAt: timestamp('available_at', { withTimezone: true }).notNull().defaultNow(),
     processedAt: timestamp('processed_at', { withTimezone: true }),
     blockedAt: timestamp('blocked_at', { withTimezone: true }),
+    skippedAt: timestamp('skipped_at', { withTimezone: true }),
+    skipReason: text('skip_reason'),
     lastError: text('last_error'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -190,10 +239,52 @@ export const telegramIngestTasks = pgTable(
     uniqueIndex('telegram_ingest_tasks_update_id_unique').on(table.telegramUpdateId),
     index('telegram_ingest_tasks_channel_head_idx')
       .on(table.telegramChatId, table.telegramUpdateId)
-      .where(sql`${table.processedAt} is null`),
+      .where(sql`${table.processedAt} is null and ${table.skippedAt} is null`),
     index('telegram_ingest_tasks_runnable_idx')
       .on(table.availableAt, table.telegramUpdateId)
-      .where(sql`${table.processedAt} is null and ${table.blockedAt} is null`),
+      .where(
+        sql`${table.processedAt} is null and ${table.skippedAt} is null and ${table.blockedAt} is null`,
+      ),
+    check(
+      'telegram_ingest_tasks_terminal_check',
+      sql`not (${table.processedAt} is not null and ${table.skippedAt} is not null)`,
+    ),
+    check(
+      'telegram_ingest_tasks_skip_reason_check',
+      sql`(${table.skippedAt} is null and ${table.skipReason} is null)
+        or (${table.skippedAt} is not null and length(${table.skipReason}) between 1 and 500)`,
+    ),
+  ],
+);
+
+export const operationAuditEvents = pgTable(
+  'operation_audit_events',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    actorType: varchar('actor_type', { length: 32 })
+      .$type<'owner_session' | 'service_token'>()
+      .notNull(),
+    actorId: text('actor_id').notNull(),
+    action: varchar('action', { length: 64 })
+      .$type<
+        'channel.disable' | 'channel.enable' | 'content.rerender' | 'task.retry' | 'task.skip'
+      >()
+      .notNull(),
+    targetType: varchar('target_type', { length: 32 })
+      .$type<'channel' | 'renderer' | 'task'>()
+      .notNull(),
+    targetId: text('target_id').notNull(),
+    reason: text('reason'),
+    details: jsonb('details').$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('operation_audit_events_actor_idx').on(table.actorType, table.actorId, table.createdAt),
+    index('operation_audit_events_target_idx').on(
+      table.targetType,
+      table.targetId,
+      table.createdAt,
+    ),
   ],
 );
 
@@ -246,6 +337,8 @@ export const messageRevisions = pgTable(
       .notNull(),
     text: text('text'),
     entities: jsonb('entities').$type<NormalizedMessageEntity[]>().notNull(),
+    html: text('html'),
+    rendererVersion: integer('renderer_version').notNull().default(0),
     authorSignature: text('author_signature'),
     mediaGroupId: text('media_group_id'),
     editedAt: timestamp('edited_at', { withTimezone: true }),

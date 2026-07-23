@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, lt, or, type SQL } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   messageMedia,
@@ -8,7 +8,14 @@ import {
   telegramUpdates,
 } from '../db/schema.js';
 import type { NormalizedChannelPost } from '../telegram/types.js';
-import type { MessageReader, PublicMedia, PublicMessage } from './types.js';
+import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from './renderer.js';
+import type {
+  MessageListOptions,
+  MessagePage,
+  MessageReader,
+  PublicMedia,
+  PublicMessage,
+} from './types.js';
 
 export interface IngestResult {
   channelId: string;
@@ -49,6 +56,7 @@ function publicMessage(row: MessageRow, media: PublicMedia[]): PublicMessage {
     },
     content: {
       entities: row.entities,
+      html: row.html,
       kind: row.contentKind,
       text: row.text,
     },
@@ -175,7 +183,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     };
   }
 
-  async listMessages(channelId: string): Promise<PublicMessage[] | null> {
+  async listMessages(channelId: string, options: MessageListOptions): Promise<MessagePage | null> {
     const [channel] = await this.database
       .select({ id: telegramChannels.id })
       .from(telegramChannels)
@@ -186,8 +194,35 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       return null;
     }
 
-    const rows = await this.selectMessages(eq(messages.channelId, channelId));
-    return this.attachMedia(rows);
+    const cursor = options.cursor;
+    const cursorWhere = cursor
+      ? or(
+          lt(messages.publishedAt, new Date(cursor.publishedAt)),
+          and(
+            eq(messages.publishedAt, new Date(cursor.publishedAt)),
+            lt(messages.id, cursor.messageId),
+          ),
+        )
+      : undefined;
+    const rows = await this.selectMessages(
+      and(eq(messages.channelId, channelId), cursorWhere),
+      options.limit + 1,
+    );
+    const hasMore = rows.length > options.limit;
+    const pageRows = rows.slice(0, options.limit);
+    const items = await this.attachMedia(pageRows);
+    const last = pageRows.at(-1);
+    return {
+      items,
+      nextCursor:
+        hasMore && last
+          ? {
+              channelId: last.channelId,
+              messageId: last.messageId,
+              publishedAt: last.publishedAt.toISOString(),
+            }
+          : null,
+    };
   }
 
   async listChannels() {
@@ -241,8 +276,13 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
         contentKind: post.message.contentKind,
         editedAt: post.message.editedAt,
         entities: post.message.entities,
+        html:
+          post.message.text === null
+            ? null
+            : renderTelegramMessage(post.message.text, post.message.entities),
         mediaGroupId: post.message.mediaGroupId,
         messageId,
+        rendererVersion: CURRENT_RENDERER_VERSION,
         revisionNumber,
         telegramUpdateId: post.telegramUpdateId,
         text: post.message.text,
@@ -272,7 +312,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     }
   }
 
-  private selectMessages(where: ReturnType<typeof eq>) {
+  private selectMessages(where: SQL | undefined, limit = 50) {
     return this.database
       .select({
         authorSignature: messageRevisions.authorSignature,
@@ -281,6 +321,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
         channelUsername: telegramChannels.username,
         contentKind: messageRevisions.contentKind,
         entities: messageRevisions.entities,
+        html: messageRevisions.html,
         mediaGroupId: messageRevisions.mediaGroupId,
         messageId: messages.id,
         publishedAt: messages.publishedAt,
@@ -300,7 +341,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       )
       .where(where)
       .orderBy(desc(messages.publishedAt), desc(messages.id))
-      .limit(50);
+      .limit(limit);
   }
 
   private async attachMedia(rows: MessageRow[]): Promise<PublicMessage[]> {

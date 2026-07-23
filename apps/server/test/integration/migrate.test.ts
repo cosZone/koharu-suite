@@ -6,6 +6,8 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { asc, count, eq, sql } from 'drizzle-orm';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PostgresAdminOperations } from '../../src/admin/operations.js';
+import { PostgresAdminRepository } from '../../src/admin/repository.js';
 import { createApp } from '../../src/app.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -13,12 +15,14 @@ import {
   messageMedia,
   messageRevisions,
   messages,
+  operationAuditEvents,
   telegramChannelAllowlist,
   telegramChannels,
   telegramIngestTasks,
   telegramPollingState,
   telegramUpdates,
 } from '../../src/db/schema.js';
+import { CURRENT_RENDERER_VERSION } from '../../src/messages/renderer.js';
 import { PostgresMessageRepository } from '../../src/messages/repository.js';
 import type { TelegramApi } from '../../src/telegram/api.js';
 import { TelegramChannelService } from '../../src/telegram/channel-service.js';
@@ -32,6 +36,13 @@ import { channelPostFixture, editedChannelPostFixture } from '../fixtures/telegr
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const ALLOWED_CHANNEL_ID = -1_001_234_567_890n;
+const OWNER_PRINCIPAL = {
+  actorId: 'integration-owner',
+  actorType: 'owner_session' as const,
+  email: 'owner@example.com',
+  permissions: null,
+  twoFactorEnabled: true,
+};
 
 describe('database migrations', () => {
   let container: StartedPostgreSqlContainer | undefined;
@@ -53,7 +64,7 @@ describe('database migrations', () => {
       return;
     }
     await connection.db.execute(
-      sql`truncate table ${telegramChannelAllowlist}, ${telegramChannels}, ${telegramPollingState} cascade`,
+      sql`truncate table ${operationAuditEvents}, ${telegramChannelAllowlist}, ${telegramChannels}, ${telegramPollingState} cascade`,
     );
   }, 30_000);
 
@@ -250,6 +261,201 @@ describe('database migrations', () => {
     const [unchanged] = await connection.db.select().from(telegramPollingState);
     expect(unchanged).toMatchObject({ botId: 123_456n, nextUpdateId: 2_004n });
   });
+
+  it('recovers or skips blocked tasks explicitly and disables only future collection', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+
+    const database = connection.db;
+    await database.insert(telegramChannelAllowlist).values({
+      telegramChatId: ALLOWED_CHANNEL_ID,
+      title: 'Koharu Test Channel',
+      username: 'koharu_test',
+    });
+    const inbox = new TelegramInboxRepository(database);
+    await inbox.bindBot(123_456n);
+    const archivedPost = normalizeChannelPost(
+      channelPostFixture({ updateId: 3_001 }),
+      ALLOWED_CHANNEL_ID,
+    );
+    if (!archivedPost) {
+      throw new Error('Archive fixture did not normalize');
+    }
+    const repository = new PostgresMessageRepository(database);
+    const archived = await repository.ingest(archivedPost);
+    await inbox.checkpointBatch(123_456n, [channelPostFixture({ updateId: 3_001 })]);
+
+    const [task] = await database.select({ id: telegramIngestTasks.id }).from(telegramIngestTasks);
+    if (!task) {
+      throw new Error('Inbox did not create a task');
+    }
+    await database
+      .update(telegramIngestTasks)
+      .set({
+        attemptCount: 10,
+        blockedAt: new Date(),
+        lastError: 'fixture poison error',
+      })
+      .where(eq(telegramIngestTasks.id, task.id));
+
+    const operations = new PostgresAdminOperations(database);
+    await expect(operations.listBlockedTasks()).resolves.toMatchObject([
+      {
+        attemptCount: 10,
+        id: task.id,
+        lastError: 'fixture poison error',
+      },
+    ]);
+    await operations.retryTask(task.id, 'fixed the parser', OWNER_PRINCIPAL);
+    const [retried] = await database
+      .select()
+      .from(telegramIngestTasks)
+      .where(eq(telegramIngestTasks.id, task.id));
+    expect(retried).toMatchObject({
+      attemptCount: 0,
+      blockedAt: null,
+      lastError: 'fixture poison error',
+      skippedAt: null,
+    });
+    await expect(operations.retryTask(task.id, 'duplicate retry', OWNER_PRINCIPAL)).rejects.toThrow(
+      'no longer blocked',
+    );
+
+    await database
+      .update(telegramIngestTasks)
+      .set({ attemptCount: 10, blockedAt: new Date() })
+      .where(eq(telegramIngestTasks.id, task.id));
+    await operations.skipTask(task.id, 'known unsupported update', OWNER_PRINCIPAL);
+    const [skipped] = await database
+      .select()
+      .from(telegramIngestTasks)
+      .where(eq(telegramIngestTasks.id, task.id));
+    expect(skipped).toMatchObject({
+      attemptCount: 10,
+      lastError: 'fixture poison error',
+      skipReason: 'known unsupported update',
+    });
+    expect(skipped?.skippedAt).toBeInstanceOf(Date);
+    await expect(operations.skipTask(task.id, 'duplicate skip', OWNER_PRINCIPAL)).rejects.toThrow(
+      'no longer blocked',
+    );
+
+    await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, false, OWNER_PRINCIPAL);
+    await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, false, OWNER_PRINCIPAL);
+    await expect(new PostgresAdminRepository(database).getStatus()).resolves.toMatchObject({
+      counts: {
+        activeChannels: 0,
+        configuredChannels: 1,
+      },
+    });
+    await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 43, updateId: 3_002 })]);
+    const [disabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
+    expect(disabledTaskCount?.value).toBe(1);
+    await expect(repository.getMessage(archived.messageId)).resolves.toMatchObject({
+      id: archived.messageId,
+    });
+
+    await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, true, OWNER_PRINCIPAL);
+    await expect(new PostgresAdminRepository(database).getStatus()).resolves.toMatchObject({
+      counts: {
+        activeChannels: 1,
+        configuredChannels: 1,
+      },
+    });
+    await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 44, updateId: 3_003 })]);
+    const [enabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
+    expect(enabledTaskCount?.value).toBe(2);
+
+    const audits = await database
+      .select({
+        action: operationAuditEvents.action,
+        reason: operationAuditEvents.reason,
+      })
+      .from(operationAuditEvents)
+      .orderBy(asc(operationAuditEvents.createdAt));
+    expect(audits).toEqual([
+      { action: 'task.retry', reason: 'fixed the parser' },
+      { action: 'task.skip', reason: 'known unsupported update' },
+      { action: 'channel.disable', reason: null },
+      { action: 'channel.enable', reason: null },
+    ]);
+  }, 30_000);
+
+  it('rerenders only stale derived HTML and cursor-pages without duplication', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+
+    const repository = new PostgresMessageRepository(connection.db);
+    for (const fixture of [
+      channelPostFixture({
+        date: 1_751_300_000,
+        messageId: 42,
+        text: 'First message',
+        updateId: 4_001,
+      }),
+      channelPostFixture({
+        date: 1_751_300_100,
+        messageId: 43,
+        text: 'Second message',
+        updateId: 4_002,
+      }),
+      channelPostFixture({
+        date: 1_751_300_100,
+        messageId: 44,
+        text: 'Third message',
+        updateId: 4_003,
+      }),
+    ]) {
+      const post = normalizeChannelPost(fixture, ALLOWED_CHANNEL_ID);
+      if (!post) {
+        throw new Error('Pagination fixture did not normalize');
+      }
+      await repository.ingest(post);
+    }
+
+    const [channel] = await connection.db
+      .select({ id: telegramChannels.id })
+      .from(telegramChannels);
+    if (!channel) {
+      throw new Error('Channel was not created');
+    }
+    const firstPage = await repository.listMessages(channel.id, { limit: 2 });
+    expect(firstPage?.items).toHaveLength(2);
+    expect(firstPage?.nextCursor).not.toBeNull();
+    const secondPage = await repository.listMessages(channel.id, {
+      ...(firstPage?.nextCursor ? { cursor: firstPage.nextCursor } : {}),
+      limit: 2,
+    });
+    expect(secondPage?.items).toHaveLength(1);
+    expect(secondPage?.nextCursor).toBeNull();
+    expect(
+      new Set([
+        ...(firstPage?.items.map((item) => item.id) ?? []),
+        ...(secondPage?.items.map((item) => item.id) ?? []),
+      ]).size,
+    ).toBe(3);
+
+    await connection.db.update(messageRevisions).set({ html: null, rendererVersion: 0 });
+    const operations = new PostgresAdminOperations(connection.db);
+    await expect(operations.rerenderOutdated(OWNER_PRINCIPAL)).resolves.toEqual({
+      currentVersion: CURRENT_RENDERER_VERSION,
+      hasMore: false,
+      updated: 3,
+    });
+    const revisions = await connection.db
+      .select({
+        html: messageRevisions.html,
+        rendererVersion: messageRevisions.rendererVersion,
+      })
+      .from(messageRevisions);
+    expect(revisions).toHaveLength(3);
+    for (const revision of revisions) {
+      expect(revision.rendererVersion).toBe(CURRENT_RENDERER_VERSION);
+      expect(revision.html).toContain('<strong>');
+    }
+  }, 30_000);
 
   it('keeps immutable revisions for every edit and supports first-known edits', async () => {
     if (!connection) {
@@ -518,6 +724,8 @@ describe('database migrations', () => {
     await expect(service.bootstrapLegacy(-1_001_234_567_899n)).resolves.toBeNull();
     await expect(service.list()).resolves.toEqual([
       {
+        disabledAt: null,
+        enabled: true,
         telegramChatId: ALLOWED_CHANNEL_ID,
         title: 'Verified Public Channel',
         username: 'verified_public',

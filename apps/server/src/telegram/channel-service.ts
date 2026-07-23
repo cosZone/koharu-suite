@@ -6,6 +6,8 @@ import { telegramIdAsNumber } from './api.js';
 import { TELEGRAM_BOT_BIND_ADVISORY_LOCK } from './constants.js';
 
 export interface ConfiguredChannel {
+  disabledAt: Date | null;
+  enabled: boolean;
   telegramChatId: bigint;
   title: string;
   username: string | null;
@@ -75,6 +77,8 @@ export class TelegramChannelService {
           },
         })
         .returning({
+          disabledAt: telegramChannelAllowlist.disabledAt,
+          enabled: telegramChannelAllowlist.enabled,
           telegramChatId: telegramChannelAllowlist.telegramChatId,
           title: telegramChannelAllowlist.title,
           username: telegramChannelAllowlist.username,
@@ -103,6 +107,8 @@ export class TelegramChannelService {
   async list(): Promise<ConfiguredChannel[]> {
     const rows = await this.database
       .select({
+        disabledAt: telegramChannelAllowlist.disabledAt,
+        enabled: telegramChannelAllowlist.enabled,
         telegramChatId: telegramChannelAllowlist.telegramChatId,
         title: telegramChannelAllowlist.title,
         username: telegramChannelAllowlist.username,

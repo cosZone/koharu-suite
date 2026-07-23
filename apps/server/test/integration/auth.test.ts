@@ -10,11 +10,13 @@ import {
   PostgresOwnerRepository,
 } from '../../src/auth/owner-service.js';
 import { BetterAuthRuntime } from '../../src/auth/runtime-auth.js';
+import { ServiceTokenService } from '../../src/auth/service-token.js';
 import type { AuthConfig } from '../../src/config.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
   authAccounts,
+  authApiKeys,
   authSessions,
   authTwoFactors,
   authUsers,
@@ -164,6 +166,58 @@ describe('owner authentication', () => {
       }),
     );
     expect(counts).toEqual([1, 1, 1]);
+  }, 30_000);
+
+  it('stores only hashed scoped service tokens and rejects them after revocation', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+
+    const service = new ServiceTokenService(connection.db, AUTH_CONFIG);
+    const created = await service.create({
+      expiresIn: 30 * 24 * 60 * 60,
+      name: 'integration deploy',
+      scopes: ['admin:read'],
+    });
+    expect(created.key).toMatch(/^khs_/);
+    expect(created.permissions).toEqual({ admin: ['read'] });
+
+    const [stored] = await connection.db
+      .select({
+        enabled: authApiKeys.enabled,
+        key: authApiKeys.key,
+        permissions: authApiKeys.permissions,
+      })
+      .from(authApiKeys)
+      .where(eq(authApiKeys.id, created.id));
+    expect(stored).toMatchObject({
+      enabled: true,
+      permissions: JSON.stringify({ admin: ['read'] }),
+    });
+    expect(stored?.key).not.toBe(created.key);
+    expect(stored?.key).not.toContain(created.key);
+
+    const runtime = new BetterAuthRuntime(connection.db, AUTH_CONFIG);
+    const headers = new Headers({ Authorization: `Bearer ${created.key}` });
+    await expect(runtime.authorize(headers, 'admin:read')).resolves.toMatchObject({
+      allowed: true,
+      principal: {
+        actorId: created.id,
+        actorType: 'service_token',
+      },
+    });
+    await expect(runtime.authorize(headers, 'ingestion:write')).resolves.toMatchObject({
+      allowed: false,
+      principal: {
+        actorId: created.id,
+      },
+    });
+
+    await service.revoke(created.id);
+    await expect(runtime.authorize(headers, 'admin:read')).resolves.toEqual({
+      allowed: false,
+      principal: null,
+    });
   }, 30_000);
 
   it('keeps sign-up closed, protects admin routes, and revokes sessions on password reset', async () => {

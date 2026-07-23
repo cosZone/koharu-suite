@@ -1,9 +1,11 @@
+import { apiKey } from '@better-auth/api-key';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { twoFactor } from 'better-auth/plugins';
 import type { AuthConfig } from '../config.js';
 import {
   authAccounts,
+  authApiKeys,
   authSessions,
   authTwoFactors,
   authUsers,
@@ -12,6 +14,7 @@ import {
 
 const authSchema = {
   account: authAccounts,
+  apikey: authApiKeys,
   session: authSessions,
   twoFactor: authTwoFactors,
   user: authUsers,
@@ -47,6 +50,24 @@ export function createAuth(
       ...(options.sendResetPassword ? { sendResetPassword: options.sendResetPassword } : {}),
     },
     plugins: [
+      apiKey({
+        defaultPrefix: 'khs_',
+        keyExpiration: {
+          defaultExpiresIn: null,
+          maxExpiresIn: 3_650,
+          minExpiresIn: 1,
+        },
+        maximumNameLength: 64,
+        permissions: {
+          defaultPermissions: {},
+        },
+        rateLimit: {
+          enabled: true,
+          maxRequests: 600,
+          timeWindow: 60_000,
+        },
+        requireName: true,
+      }),
       twoFactor({
         issuer: 'koharu-suite',
         trustDeviceMaxAge: 30 * 24 * 60 * 60,

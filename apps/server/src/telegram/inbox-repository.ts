@@ -1,4 +1,4 @@
-import { eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Update } from 'grammy/types';
 import postgres from 'postgres';
 import type { Database } from '../db/client.js';
@@ -96,7 +96,12 @@ export class TelegramInboxRepository {
           : await transaction
               .select({ telegramChatId: telegramChannelAllowlist.telegramChatId })
               .from(telegramChannelAllowlist)
-              .where(inArray(telegramChannelAllowlist.telegramChatId, chatIds));
+              .where(
+                and(
+                  inArray(telegramChannelAllowlist.telegramChatId, chatIds),
+                  eq(telegramChannelAllowlist.enabled, true),
+                ),
+              );
       const allowedIds = new Set(allowed.map((channel) => channel.telegramChatId));
       const accepted = candidates.filter((candidate) => allowedIds.has(candidate.chatId));
 
