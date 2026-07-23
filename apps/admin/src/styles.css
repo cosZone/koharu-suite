@@ -1,0 +1,162 @@
+:root {
+  --ink: #2a211a;
+  --ink-muted: #685d53;
+  --paper: #f5ecdc;
+  --paper-light: #fffaf0;
+  --persimmon: #ad5638;
+  --moss: #527052;
+  --line: rgba(85, 60, 42, 0.16);
+  color: var(--ink);
+  background: var(--paper);
+  font-family: "Avenir Next", Avenir, "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+main {
+  position: relative;
+  display: grid;
+  overflow: hidden;
+  min-height: 100vh;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 18% 12%, rgba(205, 125, 78, 0.2), transparent 34%),
+    radial-gradient(circle at 82% 88%, rgba(82, 112, 82, 0.18), transparent 36%),
+    linear-gradient(145deg, var(--paper-light), var(--paper));
+  place-items: center;
+}
+
+main::before {
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    transparent 47px,
+    rgba(91, 68, 49, 0.035) 48px
+  );
+  content: "";
+  mask-image: linear-gradient(to bottom, black, transparent 82%);
+  pointer-events: none;
+}
+
+.shell {
+  position: relative;
+  width: min(680px, 100%);
+  padding: clamp(32px, 8vw, 72px);
+  border: 1px solid var(--line);
+  border-radius: 6px 28px 6px 28px;
+  background: rgba(255, 250, 240, 0.84);
+  box-shadow: 0 24px 80px rgba(88, 65, 44, 0.1);
+  animation: reveal-shell 650ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  backdrop-filter: blur(14px);
+}
+
+.shell::after {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 12px;
+  height: 12px;
+  border: 1px solid color-mix(in srgb, var(--persimmon) 65%, transparent);
+  border-radius: 50%;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--persimmon) 10%, transparent);
+  content: "";
+}
+
+.eyebrow {
+  margin: 0 0 20px;
+  color: var(--persimmon);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  animation: reveal-copy 500ms 180ms both;
+}
+
+h1 {
+  max-width: 10ch;
+  margin: 0;
+  font-family: "Iowan Old Style", Baskerville, "Noto Serif SC", "Songti SC", serif;
+  font-size: clamp(3rem, 10vw, 6rem);
+  font-weight: 500;
+  letter-spacing: -0.055em;
+  line-height: 0.92;
+  animation: reveal-copy 600ms 240ms both;
+}
+
+.lede {
+  max-width: 48ch;
+  margin: 32px 0;
+  color: var(--ink-muted);
+  font-size: 1rem;
+  line-height: 1.75;
+  animation: reveal-copy 600ms 320ms both;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: #eee6da;
+  color: #62574e;
+  font-size: 0.875rem;
+  animation: reveal-copy 600ms 400ms both;
+}
+
+.status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #b7a89a;
+}
+
+.status--online {
+  background: #e3eee2;
+  color: var(--moss);
+}
+
+.status--online .status__dot {
+  background: #5b8d58;
+}
+
+.status--offline {
+  background: #f2e1dc;
+  color: #8d4e41;
+}
+
+.status--offline .status__dot {
+  background: #bc6552;
+}
+
+@keyframes reveal-shell {
+  from {
+    opacity: 0;
+    transform: translateY(18px) rotate(-0.4deg);
+  }
+}
+
+@keyframes reveal-copy {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shell,
+  .shell > * {
+    animation: none;
+  }
+}

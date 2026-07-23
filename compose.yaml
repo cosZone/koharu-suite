@@ -1,0 +1,45 @@
+name: koharu-suite
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-koharu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
+      POSTGRES_USER: ${POSTGRES_USER:-koharu}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  server:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-koharu}:${POSTGRES_PASSWORD:-koharu}@db:5432/${POSTGRES_DB:-koharu}
+      PORT: 3000
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000/healthz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    init: true
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres-data:
