@@ -5,7 +5,6 @@ import {
   messageRevisions,
   messages,
   telegramChannelAllowlist,
-  telegramChannels,
   telegramIngestTasks,
   telegramPollingState,
   telegramUpdates,
@@ -34,11 +33,7 @@ export interface AdminReader {
 
 async function countRows(
   database: Database,
-  table:
-    | typeof messages
-    | typeof telegramChannelAllowlist
-    | typeof telegramChannels
-    | typeof telegramUpdates,
+  table: typeof messages | typeof telegramChannelAllowlist | typeof telegramUpdates,
 ): Promise<number> {
   const [result] = await database.select({ value: count() }).from(table);
   return result?.value ?? 0;
@@ -60,7 +55,10 @@ export class PostgresAdminRepository implements AdminReader {
       staleRendererRevisions,
       pollingState,
     ] = await Promise.all([
-      countRows(this.database, telegramChannels),
+      this.database
+        .select({ value: count() })
+        .from(telegramChannelAllowlist)
+        .where(eq(telegramChannelAllowlist.enabled, true)),
       countRows(this.database, telegramChannelAllowlist),
       countRows(this.database, messages),
       countRows(this.database, telegramUpdates),
@@ -105,7 +103,7 @@ export class PostgresAdminRepository implements AdminReader {
     const checkpoint = pollingState[0];
     return {
       counts: {
-        activeChannels,
+        activeChannels: activeChannels[0]?.value ?? 0,
         blockedTasks,
         configuredChannels,
         messages: messageCount,

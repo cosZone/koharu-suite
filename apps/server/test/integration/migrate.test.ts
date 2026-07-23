@@ -7,6 +7,7 @@ import { asc, count, eq, sql } from 'drizzle-orm';
 import postgres from 'postgres';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresAdminOperations } from '../../src/admin/operations.js';
+import { PostgresAdminRepository } from '../../src/admin/repository.js';
 import { createApp } from '../../src/app.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -342,6 +343,12 @@ describe('database migrations', () => {
 
     await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, false, OWNER_PRINCIPAL);
     await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, false, OWNER_PRINCIPAL);
+    await expect(new PostgresAdminRepository(database).getStatus()).resolves.toMatchObject({
+      counts: {
+        activeChannels: 0,
+        configuredChannels: 1,
+      },
+    });
     await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 43, updateId: 3_002 })]);
     const [disabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
     expect(disabledTaskCount?.value).toBe(1);
@@ -350,6 +357,12 @@ describe('database migrations', () => {
     });
 
     await operations.setChannelEnabled(ALLOWED_CHANNEL_ID, true, OWNER_PRINCIPAL);
+    await expect(new PostgresAdminRepository(database).getStatus()).resolves.toMatchObject({
+      counts: {
+        activeChannels: 1,
+        configuredChannels: 1,
+      },
+    });
     await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 44, updateId: 3_003 })]);
     const [enabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
     expect(enabledTaskCount?.value).toBe(2);

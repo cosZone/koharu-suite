@@ -577,6 +577,60 @@ input:focus {
   white-space: pre-wrap;
 }
 
+.rendered-message {
+  font-family: "Iowan Old Style", Baskerville, "Noto Serif SC", serif;
+  font-size: 1.12rem;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.rendered-message a {
+  color: var(--persimmon-dark);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+.rendered-message blockquote {
+  padding-left: 16px;
+  margin: 12px 0;
+  border-left: 3px solid var(--paper-deep);
+  color: var(--ink-soft);
+}
+
+.rendered-message code {
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  background: var(--paper-deep);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.86em;
+}
+
+.rendered-message pre {
+  padding: 14px;
+  overflow: auto;
+  border-radius: 6px;
+  background: #27231f;
+  color: #f1e4cf;
+  white-space: pre;
+}
+
+.rendered-message pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.rendered-message .tg-spoiler {
+  border-radius: 3px;
+  background: var(--ink);
+  color: transparent;
+}
+
+.rendered-message .tg-spoiler:hover,
+.rendered-message .tg-spoiler:focus {
+  color: var(--paper-light);
+}
+
 .message-copy dl {
   display: grid;
   gap: 12px;
