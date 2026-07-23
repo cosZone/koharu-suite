@@ -1,4 +1,4 @@
-import { and, count, eq, gt, isNotNull, isNull } from 'drizzle-orm';
+import { and, count, eq, gt, isNotNull, isNull, lt } from 'drizzle-orm';
 import type { Update } from 'grammy/types';
 import type { Database } from '../db/client.js';
 import {
@@ -10,6 +10,7 @@ import {
   telegramPollingState,
   telegramUpdates,
 } from '../db/schema.js';
+import { CURRENT_RENDERER_VERSION } from '../messages/renderer.js';
 
 export interface AdminStatusSnapshot {
   counts: {
@@ -19,6 +20,8 @@ export interface AdminStatusSnapshot {
     messages: number;
     pendingTasks: number;
     retryingTasks: number;
+    skippedTasks: number;
+    staleRendererRevisions: number;
     updates: number;
   };
   lastCheckpoint: string | null;
@@ -53,6 +56,8 @@ export class PostgresAdminRepository implements AdminReader {
       pendingTasks,
       retryingTasks,
       blockedTasks,
+      skippedTasks,
+      staleRendererRevisions,
       pollingState,
     ] = await Promise.all([
       countRows(this.database, telegramChannels),
@@ -63,6 +68,7 @@ export class PostgresAdminRepository implements AdminReader {
         and(
           isNull(telegramIngestTasks.processedAt),
           isNull(telegramIngestTasks.blockedAt),
+          isNull(telegramIngestTasks.skippedAt),
           eq(telegramIngestTasks.attemptCount, 0),
         ),
       ),
@@ -70,10 +76,22 @@ export class PostgresAdminRepository implements AdminReader {
         and(
           isNull(telegramIngestTasks.processedAt),
           isNull(telegramIngestTasks.blockedAt),
+          isNull(telegramIngestTasks.skippedAt),
           gt(telegramIngestTasks.attemptCount, 0),
         ),
       ),
-      this.taskCount(isNotNull(telegramIngestTasks.blockedAt)),
+      this.taskCount(
+        and(
+          isNotNull(telegramIngestTasks.blockedAt),
+          isNull(telegramIngestTasks.processedAt),
+          isNull(telegramIngestTasks.skippedAt),
+        ),
+      ),
+      this.taskCount(isNotNull(telegramIngestTasks.skippedAt)),
+      this.database
+        .select({ value: count() })
+        .from(messageRevisions)
+        .where(lt(messageRevisions.rendererVersion, CURRENT_RENDERER_VERSION)),
       this.database
         .select({
           nextUpdateId: telegramPollingState.nextUpdateId,
@@ -93,6 +111,8 @@ export class PostgresAdminRepository implements AdminReader {
         messages: messageCount,
         pendingTasks,
         retryingTasks,
+        skippedTasks,
+        staleRendererRevisions: staleRendererRevisions[0]?.value ?? 0,
         updates,
       },
       lastCheckpoint:

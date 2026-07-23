@@ -1,3 +1,4 @@
+import type { MessageCursor } from '../http/cursor.js';
 import type { NormalizedMediaKind, NormalizedMessageEntity } from '../telegram/types.js';
 
 export interface PublicChannel {
@@ -21,6 +22,7 @@ export interface PublicMessage {
   channel: PublicChannel;
   content: {
     entities: NormalizedMessageEntity[];
+    html: string | null;
     kind: 'caption' | 'none' | 'text';
     text: string | null;
   };
@@ -32,8 +34,18 @@ export interface PublicMessage {
   sourceUrl: string | null;
 }
 
+export interface MessagePage {
+  items: PublicMessage[];
+  nextCursor: MessageCursor | null;
+}
+
+export interface MessageListOptions {
+  cursor?: MessageCursor;
+  limit: number;
+}
+
 export interface MessageReader {
   getMessage(id: string): Promise<PublicMessage | null>;
   listChannels(): Promise<PublicChannel[]>;
-  listMessages(channelId: string): Promise<PublicMessage[] | null>;
+  listMessages(channelId: string, options: MessageListOptions): Promise<MessagePage | null>;
 }

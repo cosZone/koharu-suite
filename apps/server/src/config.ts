@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseCorsOriginAllowlist } from './http/public-policy.js';
 
 const portSchema = z.coerce.number().int().min(1).max(65_535);
 const databaseUrlSchema = z.url({ protocol: /^postgres(?:ql)?$/ });
@@ -21,6 +22,15 @@ const telegramEnvironmentSchema = z.object({
 const authEnvironmentSchema = z.object({
   BETTER_AUTH_SECRET: z.string().trim().min(32),
   BETTER_AUTH_URL: z.string().trim().min(1),
+});
+const publicApiEnvironmentSchema = z.object({
+  PUBLIC_CORS_ORIGINS: z.string().optional(),
+  PUBLIC_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(120),
+  PUBLIC_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(1).max(3_600).default(60),
+  TRUST_PROXY: z
+    .enum(['false', 'true'])
+    .default('false')
+    .transform((value) => value === 'true'),
 });
 const postgresEnvironmentSchema = z.object({
   POSTGRES_DB: z.string().min(1),
@@ -66,6 +76,13 @@ export interface AuthConfig {
   trustedOrigin: string;
 }
 
+export interface PublicApiConfig {
+  corsOrigins: ReadonlySet<string>;
+  rateLimitMax: number;
+  rateLimitWindowMs: number;
+  trustProxy: boolean;
+}
+
 function parseAuthBaseUrl(value: string): string {
   const url = new URL(value);
   const isLocalHttp =
@@ -96,6 +113,18 @@ export function resolveAuthConfig(environment: NodeJS.ProcessEnv = process.env):
     baseUrl,
     secret: parsed.BETTER_AUTH_SECRET,
     trustedOrigin: baseUrl,
+  };
+}
+
+export function resolvePublicApiConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): PublicApiConfig {
+  const parsed = publicApiEnvironmentSchema.parse(environment);
+  return {
+    corsOrigins: parseCorsOriginAllowlist(parsed.PUBLIC_CORS_ORIGINS),
+    rateLimitMax: parsed.PUBLIC_RATE_LIMIT_MAX,
+    rateLimitWindowMs: parsed.PUBLIC_RATE_LIMIT_WINDOW_SECONDS * 1_000,
+    trustProxy: parsed.TRUST_PROXY,
   };
 }
 

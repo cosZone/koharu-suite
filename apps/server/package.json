@@ -32,6 +32,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@better-auth/api-key": "catalog:",
     "@hono/node-server": "catalog:",
     "better-auth": "catalog:",
     "drizzle-orm": "catalog:",

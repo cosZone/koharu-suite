@@ -3,6 +3,7 @@ import {
   resolveAuthConfig,
   resolveDatabaseUrl,
   resolvePort,
+  resolvePublicApiConfig,
   resolveTelegramConfig,
 } from '../src/config.js';
 
@@ -150,5 +151,46 @@ describe('configuration', () => {
         BETTER_AUTH_URL: 'https://user:password@suite.example.com',
       }),
     ).toThrow();
+  });
+
+  it('uses conservative public API defaults', () => {
+    const config = resolvePublicApiConfig({});
+
+    expect(config).toEqual({
+      corsOrigins: new Set(),
+      rateLimitMax: 120,
+      rateLimitWindowMs: 60_000,
+      trustProxy: false,
+    });
+  });
+
+  it('parses exact public origins, rate-limit bounds, and explicit proxy trust', () => {
+    const config = resolvePublicApiConfig({
+      PUBLIC_CORS_ORIGINS: 'https://blog.example.com, http://localhost:4321',
+      PUBLIC_RATE_LIMIT_MAX: '250',
+      PUBLIC_RATE_LIMIT_WINDOW_SECONDS: '30',
+      TRUST_PROXY: 'true',
+    });
+
+    expect(config).toEqual({
+      corsOrigins: new Set(['https://blog.example.com', 'http://localhost:4321']),
+      rateLimitMax: 250,
+      rateLimitWindowMs: 30_000,
+      trustProxy: true,
+    });
+  });
+
+  it.each([
+    { PUBLIC_CORS_ORIGINS: '*' },
+    { PUBLIC_CORS_ORIGINS: 'https://*.example.com' },
+    { PUBLIC_CORS_ORIGINS: 'https://blog.example.com/' },
+    { PUBLIC_CORS_ORIGINS: 'https://blog.example.com/path' },
+    { PUBLIC_RATE_LIMIT_MAX: '0' },
+    { PUBLIC_RATE_LIMIT_MAX: '10001' },
+    { PUBLIC_RATE_LIMIT_WINDOW_SECONDS: '0' },
+    { PUBLIC_RATE_LIMIT_WINDOW_SECONDS: '3601' },
+    { TRUST_PROXY: '1' },
+  ])('rejects unsafe public API configuration: %j', (environment) => {
+    expect(() => resolvePublicApiConfig(environment)).toThrow();
   });
 });

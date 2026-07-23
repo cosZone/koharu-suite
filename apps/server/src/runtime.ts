@@ -1,10 +1,10 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PostgresAdminOperations } from './admin/operations.js';
 import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
-import { PostgresOwnerRepository } from './auth/owner-service.js';
 import { BetterAuthRuntime } from './auth/runtime-auth.js';
-import type { AuthConfig } from './config.js';
+import type { AuthConfig, PublicApiConfig } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { closeServer, startServer } from './server.js';
@@ -19,6 +19,7 @@ export interface ApplicationRuntimeConfig {
   auth: AuthConfig;
   databaseUrl: string;
   port: number;
+  publicApi: PublicApiConfig;
   telegramBotToken: string;
   telegramLegacyChannelId: bigint | undefined;
   telegramWorkerConcurrency: number;
@@ -69,6 +70,7 @@ export class ApplicationRuntime {
 export function startApplication(config: ApplicationRuntimeConfig): ApplicationRuntime {
   const mainConnection = createDatabaseConnection(config.databaseUrl);
   const repository = new PostgresMessageRepository(mainConnection.db);
+  const operations = new PostgresAdminOperations(mainConnection.db);
   const api = new GrammyTelegramApi(config.telegramBotToken);
   const inbox = new ReservedTelegramInboxRepository(config.databaseUrl, mainConnection.db);
   const poller = new TelegramPoller({
@@ -88,7 +90,8 @@ export function startApplication(config: ApplicationRuntimeConfig): ApplicationR
     auth: new BetterAuthRuntime(mainConnection.db, config.auth),
     collectorState: () => 'running',
     messages: repository,
-    owners: new PostgresOwnerRepository(mainConnection.db),
+    operations,
+    publicApi: config.publicApi,
   });
   const server = startServer(app, config.port);
   const ingestion = new TelegramIngestionRuntime(poller, workers);

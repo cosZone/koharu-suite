@@ -2,6 +2,7 @@ import {
   resolveAuthConfig,
   resolveDatabaseUrl,
   resolvePort,
+  resolvePublicApiConfig,
   resolveTelegramConfig,
 } from './config.js';
 import { loadEnvironmentFile } from './env.js';
@@ -16,6 +17,7 @@ const application = startApplication({
   auth,
   databaseUrl,
   port: resolvePort(),
+  publicApi: resolvePublicApiConfig(),
   telegramBotToken: telegram.botToken,
   telegramLegacyChannelId: telegram.legacyChannelId,
   telegramWorkerConcurrency: telegram.workerConcurrency,

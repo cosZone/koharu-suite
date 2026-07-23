@@ -1,8 +1,13 @@
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import type { AuthConfig } from '../config.js';
 import type { Database } from '../db/client.js';
-import { authSessions } from '../db/schema.js';
+import { authSessions, owners } from '../db/schema.js';
 import { createAuth, type KoharuAuth } from './auth.js';
+import {
+  type ServiceTokenPermissions,
+  type ServiceTokenScope,
+  serviceTokenHasPermission,
+} from './service-token.js';
 
 const PASSWORD_CHANGE_PATH = '/api/auth/change-password';
 const TOTP_DISABLE_PATH = '/api/auth/two-factor/disable';
@@ -19,7 +24,21 @@ export interface AuthSession {
   user: AuthenticatedUser;
 }
 
+export interface AdminPrincipal {
+  actorId: string;
+  actorType: 'owner_session' | 'service_token';
+  email: string | null;
+  permissions: ServiceTokenPermissions | null;
+  twoFactorEnabled: boolean | null;
+}
+
+export interface AdminAuthorization {
+  allowed: boolean;
+  principal: AdminPrincipal | null;
+}
+
 export interface RuntimeAuth {
+  authorize(headers: Headers, scope: ServiceTokenScope): Promise<AdminAuthorization>;
   getSession(headers: Headers): Promise<AuthSession | null>;
   handle(request: Request): Promise<Response>;
 }
@@ -32,6 +51,81 @@ export class BetterAuthRuntime implements RuntimeAuth {
     config: AuthConfig,
   ) {
     this.auth = createAuth(database, config);
+  }
+
+  async authorize(headers: Headers, scope: ServiceTokenScope): Promise<AdminAuthorization> {
+    const authorization = headers.get('Authorization');
+    if (authorization !== null) {
+      const match = /^Bearer ([^\s]+)$/.exec(authorization);
+      if (!match?.[1]) {
+        return { allowed: false, principal: null };
+      }
+
+      const verified = await this.auth.api
+        .verifyApiKey({
+          body: {
+            key: match[1],
+          },
+        })
+        .catch(() => null);
+      if (!verified?.valid || !verified.key) {
+        return { allowed: false, principal: null };
+      }
+
+      const [owner] = await this.database
+        .select({ userId: owners.userId })
+        .from(owners)
+        .where(and(eq(owners.singleton, 1), eq(owners.userId, verified.key.referenceId)))
+        .limit(1);
+      if (!owner) {
+        return { allowed: false, principal: null };
+      }
+
+      const permissions = (verified.key.permissions ?? {}) as ServiceTokenPermissions;
+      return {
+        allowed: serviceTokenHasPermission(permissions, scope),
+        principal: {
+          actorId: verified.key.id,
+          actorType: 'service_token',
+          email: null,
+          permissions,
+          twoFactorEnabled: null,
+        },
+      };
+    }
+
+    const session = await this.getSession(headers);
+    if (!session) {
+      return { allowed: false, principal: null };
+    }
+    const [owner] = await this.database
+      .select({ userId: owners.userId })
+      .from(owners)
+      .where(and(eq(owners.singleton, 1), eq(owners.userId, session.user.id)))
+      .limit(1);
+    if (!owner) {
+      return {
+        allowed: false,
+        principal: {
+          actorId: session.user.id,
+          actorType: 'owner_session',
+          email: session.user.email,
+          permissions: null,
+          twoFactorEnabled: session.user.twoFactorEnabled,
+        },
+      };
+    }
+
+    return {
+      allowed: true,
+      principal: {
+        actorId: session.user.id,
+        actorType: 'owner_session',
+        email: session.user.email,
+        permissions: null,
+        twoFactorEnabled: session.user.twoFactorEnabled,
+      },
+    };
   }
 
   async getSession(headers: Headers): Promise<AuthSession | null> {
