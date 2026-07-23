@@ -1,8 +1,6 @@
 # koharu-suite
 
-[中文](#中文) · [English](#english)
-
-## 中文
+[English](./README.en.md)
 
 `koharu-suite` 是 [astro-koharu](https://github.com/cosZone/astro-koharu) 的可选伴生后台，计划提供
 Telegram 多频道归档、动态内容、统一管理与静态发布能力。
@@ -62,18 +60,6 @@ pnpm test:integration
 pnpm build
 pnpm exec kodama --help
 ```
-
-## English
-
-`koharu-suite` is an optional content backend and publishing companion for
-[astro-koharu](https://github.com/cosZone/astro-koharu). It is planned to provide multi-channel Telegram
-archiving, live content, unified administration, and static publishing workflows.
-
-The static astro-koharu experience remains the default. The suite is connected only when its dynamic
-capabilities are needed.
-
-The initial workspace foundation includes a Hono server, a React/Vite admin shell, the `kodama` CLI,
-Drizzle migrations, PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 ## License
 
