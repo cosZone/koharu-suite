@@ -8,10 +8,15 @@ const telegramChannelIdSchema = z
   .trim()
   .regex(/^-\d+$/, 'must be a negative Telegram channel ID')
   .transform((value) => BigInt(value))
+  .refine((value) => value < 0n, 'must be a negative Telegram channel ID')
   .refine((value) => value >= telegramIdLowerBound, 'is outside Telegram safe integer range');
 const telegramEnvironmentSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().trim().min(1),
-  TELEGRAM_CHANNEL_ID: telegramChannelIdSchema,
+  TELEGRAM_CHANNEL_ID: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    telegramChannelIdSchema.optional(),
+  ),
+  TELEGRAM_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
 });
 const authEnvironmentSchema = z.object({
   BETTER_AUTH_SECRET: z.string().trim().min(32),
@@ -51,7 +56,8 @@ export function resolveDatabaseUrl(
 
 export interface TelegramConfig {
   botToken: string;
-  channelId: bigint;
+  legacyChannelId: bigint | undefined;
+  workerConcurrency: number;
 }
 
 export interface AuthConfig {
@@ -100,6 +106,11 @@ export function resolveTelegramConfig(
 
   return {
     botToken: parsed.TELEGRAM_BOT_TOKEN,
-    channelId: parsed.TELEGRAM_CHANNEL_ID,
+    legacyChannelId: parsed.TELEGRAM_CHANNEL_ID,
+    workerConcurrency: parsed.TELEGRAM_WORKER_CONCURRENCY,
   };
+}
+
+export function parseTelegramChannelId(value: string): bigint {
+  return telegramChannelIdSchema.parse(value);
 }

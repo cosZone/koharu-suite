@@ -21,6 +21,7 @@ export interface MessageWriter {
 }
 
 type MessageRow = Awaited<ReturnType<PostgresMessageRepository['selectMessages']>>[number];
+type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 
 function sourceUrl(username: string | null, telegramMessageId: bigint): string | null {
   return username ? `https://t.me/${username}/${telegramMessageId}` : null;
@@ -64,57 +65,70 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
   constructor(private readonly database: Database) {}
 
   async ingest(post: NormalizedChannelPost): Promise<IngestResult> {
-    return this.database.transaction(async (transaction) => {
-      const now = new Date();
-      const [channel] = await transaction
-        .insert(telegramChannels)
-        .values({
-          telegramChatId: post.channel.telegramChatId,
+    return this.database.transaction((transaction) => this.ingestInTransaction(transaction, post));
+  }
+
+  async ingestInTransaction(
+    transaction: DatabaseTransaction,
+    post: NormalizedChannelPost,
+  ): Promise<IngestResult> {
+    const now = new Date();
+    const [channel] = await transaction
+      .insert(telegramChannels)
+      .values({
+        telegramChatId: post.channel.telegramChatId,
+        title: post.channel.title,
+        username: post.channel.username,
+      })
+      .onConflictDoUpdate({
+        target: telegramChannels.telegramChatId,
+        set: {
           title: post.channel.title,
+          updatedAt: now,
           username: post.channel.username,
-        })
-        .onConflictDoUpdate({
-          target: telegramChannels.telegramChatId,
-          set: {
-            title: post.channel.title,
-            updatedAt: now,
-            username: post.channel.username,
-          },
-        })
-        .returning({ id: telegramChannels.id });
+        },
+      })
+      .returning({ id: telegramChannels.id });
 
-      if (!channel) {
-        throw new Error('Failed to resolve Telegram channel');
+    if (!channel) {
+      throw new Error('Failed to resolve Telegram channel');
+    }
+
+    const [insertedUpdate] = await transaction
+      .insert(telegramUpdates)
+      .values({
+        channelId: channel.id,
+        rawJson: post.rawUpdate,
+        telegramUpdateId: post.telegramUpdateId,
+        updateType: post.updateType,
+      })
+      .onConflictDoNothing({ target: telegramUpdates.telegramUpdateId })
+      .returning({ telegramUpdateId: telegramUpdates.telegramUpdateId });
+
+    if (!insertedUpdate) {
+      const existing = await this.selectIdentity(
+        transaction,
+        channel.id,
+        post.message.telegramMessageId,
+      );
+      if (!existing) {
+        throw new Error('Telegram update exists without its normalized message');
       }
 
-      const [insertedUpdate] = await transaction
-        .insert(telegramUpdates)
-        .values({
-          channelId: channel.id,
-          rawJson: post.rawUpdate,
-          telegramUpdateId: post.telegramUpdateId,
-          updateType: 'channel_post',
-        })
-        .onConflictDoNothing({ target: telegramUpdates.telegramUpdateId })
-        .returning({ telegramUpdateId: telegramUpdates.telegramUpdateId });
+      return {
+        channelId: channel.id,
+        messageId: existing.id,
+        replayed: true,
+      };
+    }
 
-      if (!insertedUpdate) {
-        const existing = await this.selectIdentity(
-          transaction,
-          channel.id,
-          post.message.telegramMessageId,
-        );
-        if (!existing) {
-          throw new Error('Telegram update exists without its normalized message');
-        }
-
-        return {
-          channelId: channel.id,
-          messageId: existing.id,
-          replayed: true,
-        };
-      }
-
+    const existing = await this.selectIdentity(
+      transaction,
+      channel.id,
+      post.message.telegramMessageId,
+      true,
+    );
+    if (!existing) {
       const [insertedMessage] = await transaction
         .insert(messages)
         .values({
@@ -122,70 +136,43 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
           publishedAt: post.message.publishedAt,
           telegramMessageId: post.message.telegramMessageId,
         })
-        .onConflictDoNothing({
-          target: [messages.channelId, messages.telegramMessageId],
-        })
         .returning({ id: messages.id });
 
       if (!insertedMessage) {
-        const existing = await this.selectIdentity(
-          transaction,
-          channel.id,
-          post.message.telegramMessageId,
-        );
-        if (!existing) {
-          throw new Error('Failed to resolve normalized Telegram message');
-        }
-
-        return {
-          channelId: channel.id,
-          messageId: existing.id,
-          replayed: true,
-        };
+        throw new Error('Failed to create normalized Telegram message');
       }
 
-      const [revision] = await transaction
-        .insert(messageRevisions)
-        .values({
-          authorSignature: post.message.authorSignature,
-          contentKind: post.message.contentKind,
-          entities: post.message.entities,
-          mediaGroupId: post.message.mediaGroupId,
-          messageId: insertedMessage.id,
-          revisionNumber: 1,
-          telegramUpdateId: post.telegramUpdateId,
-          text: post.message.text,
-        })
-        .returning({ id: messageRevisions.id });
-
-      if (!revision) {
-        throw new Error('Failed to create initial message revision');
-      }
-
-      if (post.media.length > 0) {
-        await transaction.insert(messageMedia).values(
-          post.media.map((media, position) => ({
-            duration: media.duration,
-            fileName: media.fileName,
-            fileSize: media.fileSize,
-            height: media.height,
-            kind: media.kind,
-            mimeType: media.mimeType,
-            position,
-            revisionId: revision.id,
-            telegramFileId: media.fileId,
-            telegramFileUniqueId: media.fileUniqueId,
-            width: media.width,
-          })),
-        );
-      }
-
+      await this.insertRevision(transaction, insertedMessage.id, 1, post);
       return {
         channelId: channel.id,
         messageId: insertedMessage.id,
         replayed: false,
       };
-    });
+    }
+
+    if (post.updateType === 'channel_post') {
+      return {
+        channelId: channel.id,
+        messageId: existing.id,
+        replayed: true,
+      };
+    }
+
+    const revisionNumber = existing.currentRevisionNumber + 1;
+    await this.insertRevision(transaction, existing.id, revisionNumber, post);
+    await transaction
+      .update(messages)
+      .set({
+        currentRevisionNumber: revisionNumber,
+        updatedAt: now,
+      })
+      .where(eq(messages.id, existing.id));
+
+    return {
+      channelId: channel.id,
+      messageId: existing.id,
+      replayed: false,
+    };
   }
 
   async listMessages(channelId: string): Promise<PublicMessage[] | null> {
@@ -221,19 +208,68 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
   }
 
   private async selectIdentity(
-    transaction: Parameters<Parameters<Database['transaction']>[0]>[0],
+    transaction: DatabaseTransaction,
     channelId: string,
     telegramMessageId: bigint,
+    lock = false,
   ) {
-    const [message] = await transaction
-      .select({ id: messages.id })
+    const query = transaction
+      .select({
+        currentRevisionNumber: messages.currentRevisionNumber,
+        id: messages.id,
+      })
       .from(messages)
       .where(
         and(eq(messages.channelId, channelId), eq(messages.telegramMessageId, telegramMessageId)),
       )
       .limit(1);
+    const [message] = lock ? await query.for('update') : await query;
 
     return message;
+  }
+
+  private async insertRevision(
+    transaction: DatabaseTransaction,
+    messageId: string,
+    revisionNumber: number,
+    post: NormalizedChannelPost,
+  ): Promise<void> {
+    const [revision] = await transaction
+      .insert(messageRevisions)
+      .values({
+        authorSignature: post.message.authorSignature,
+        contentKind: post.message.contentKind,
+        editedAt: post.message.editedAt,
+        entities: post.message.entities,
+        mediaGroupId: post.message.mediaGroupId,
+        messageId,
+        revisionNumber,
+        telegramUpdateId: post.telegramUpdateId,
+        text: post.message.text,
+      })
+      .returning({ id: messageRevisions.id });
+
+    if (!revision) {
+      throw new Error('Failed to create message revision');
+    }
+
+    if (post.media.length > 0) {
+      await transaction.insert(messageMedia).values(
+        post.media.map((media, position) => ({
+          duration: media.duration,
+          fileName: media.fileName,
+          fileSize: media.fileSize,
+          height: media.height,
+          kind: media.kind,
+          mimeType: media.mimeType,
+          position,
+          revisionId: revision.id,
+          telegramFileId: media.fileId,
+          telegramFileUniqueId: media.fileUniqueId,
+          width: media.width,
+        })),
+      );
+    }
   }
 
   private selectMessages(where: ReturnType<typeof eq>) {

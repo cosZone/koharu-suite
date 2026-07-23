@@ -34,6 +34,7 @@ export interface NormalizedChannelPost {
   message: {
     authorSignature: string | null;
     contentKind: 'caption' | 'none' | 'text';
+    editedAt: Date | null;
     entities: NormalizedMessageEntity[];
     mediaGroupId: string | null;
     publishedAt: Date;
@@ -43,4 +44,5 @@ export interface NormalizedChannelPost {
   media: NormalizedMedia[];
   rawUpdate: Update;
   telegramUpdateId: bigint;
+  updateType: 'channel_post' | 'edited_channel_post';
 }

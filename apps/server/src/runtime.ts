@@ -8,35 +8,36 @@ import type { AuthConfig } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { closeServer, startServer } from './server.js';
-import { TelegramCollector } from './telegram/collector.js';
-import { GrammyTelegramPolling } from './telegram/polling.js';
+import { GrammyTelegramApi } from './telegram/api.js';
+import { TelegramChannelService } from './telegram/channel-service.js';
+import { ReservedTelegramInboxRepository } from './telegram/inbox-repository.js';
+import { type RuntimeIngestion, TelegramIngestionRuntime } from './telegram/ingestion.js';
+import { TelegramPoller } from './telegram/polling.js';
+import { TelegramWorkerPool } from './telegram/worker.js';
 
 export interface ApplicationRuntimeConfig {
   auth: AuthConfig;
   databaseUrl: string;
   port: number;
   telegramBotToken: string;
-  telegramChannelId: bigint;
+  telegramLegacyChannelId: bigint | undefined;
+  telegramWorkerConcurrency: number;
 }
 
 const defaultAdminAssetsRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../admin/dist');
-
-export interface RuntimeCollector {
-  readonly done: Promise<void>;
-  stop(): Promise<void>;
-}
 
 export class ApplicationRuntime {
   private stopPromise: Promise<void> | undefined;
 
   constructor(
-    private readonly collector: RuntimeCollector,
+    private readonly ingestion: RuntimeIngestion,
     private readonly closeHttp: () => Promise<void>,
-    private readonly closeDatabase: () => Promise<void>,
+    private readonly closePollingDatabase: () => Promise<void>,
+    private readonly closeMainDatabase: () => Promise<void>,
   ) {}
 
   get done(): Promise<void> {
-    return this.collector.done;
+    return this.ingestion.done;
   }
 
   stop(): Promise<void> {
@@ -54,9 +55,10 @@ export class ApplicationRuntime {
       }
     };
 
-    await run(() => this.collector.stop());
+    await run(() => this.ingestion.stop());
     await run(this.closeHttp);
-    await run(this.closeDatabase);
+    await run(this.closePollingDatabase);
+    await run(this.closeMainDatabase);
 
     if (firstError) {
       throw firstError;
@@ -65,24 +67,36 @@ export class ApplicationRuntime {
 }
 
 export function startApplication(config: ApplicationRuntimeConfig): ApplicationRuntime {
-  const connection = createDatabaseConnection(config.databaseUrl);
-  const repository = new PostgresMessageRepository(connection.db);
-  const collector = new TelegramCollector({
-    allowedChannelId: config.telegramChannelId,
-    polling: new GrammyTelegramPolling(config.telegramBotToken),
-    writer: repository,
+  const mainConnection = createDatabaseConnection(config.databaseUrl);
+  const repository = new PostgresMessageRepository(mainConnection.db);
+  const api = new GrammyTelegramApi(config.telegramBotToken);
+  const inbox = new ReservedTelegramInboxRepository(config.databaseUrl, mainConnection.db);
+  const poller = new TelegramPoller({
+    api,
+    channels: new TelegramChannelService(mainConnection.db, api),
+    inbox,
+    legacyChannelId: config.telegramLegacyChannelId,
   });
+  const workers = new TelegramWorkerPool(
+    mainConnection.db,
+    repository,
+    config.telegramWorkerConcurrency,
+  );
   const app = createApp({
-    admin: new PostgresAdminRepository(connection.db),
+    admin: new PostgresAdminRepository(mainConnection.db),
     adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
-    auth: new BetterAuthRuntime(connection.db, config.auth),
+    auth: new BetterAuthRuntime(mainConnection.db, config.auth),
     collectorState: () => 'running',
     messages: repository,
-    owners: new PostgresOwnerRepository(connection.db),
+    owners: new PostgresOwnerRepository(mainConnection.db),
   });
   const server = startServer(app, config.port);
+  const ingestion = new TelegramIngestionRuntime(poller, workers);
 
-  collector.start();
-
-  return new ApplicationRuntime(collector, () => closeServer(server), connection.close);
+  return new ApplicationRuntime(
+    ingestion,
+    () => closeServer(server),
+    () => inbox.close(),
+    mainConnection.close,
+  );
 }

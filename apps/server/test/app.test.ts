@@ -126,8 +126,19 @@ describe('owner admin endpoints', () => {
     const rawUpdate = channelPostFixture();
     const app = createApp({
       admin: {
-        getCounts: async () => ({ channels: 1, messages: 2, updates: 3 }),
         getRawUpdate: async (messageId) => (messageId === MESSAGE_ID ? rawUpdate : null),
+        getStatus: async () => ({
+          counts: {
+            activeChannels: 1,
+            blockedTasks: 0,
+            configuredChannels: 2,
+            messages: 2,
+            pendingTasks: 4,
+            retryingTasks: 1,
+            updates: 3,
+          },
+          lastCheckpoint: '2026-07-24T12:00:00.000Z',
+        }),
       },
       auth: ownerAuth,
       collectorState: () => 'running',
@@ -138,7 +149,16 @@ describe('owner admin endpoints', () => {
     expect(status.status).toBe(200);
     await expect(status.json()).resolves.toEqual({
       collector: 'running',
-      counts: { channels: 1, messages: 2, updates: 3 },
+      counts: {
+        activeChannels: 1,
+        blockedTasks: 0,
+        configuredChannels: 2,
+        messages: 2,
+        pendingTasks: 4,
+        retryingTasks: 1,
+        updates: 3,
+      },
+      lastCheckpoint: '2026-07-24T12:00:00.000Z',
       owner: {
         email: 'owner@example.com',
         twoFactorEnabled: true,

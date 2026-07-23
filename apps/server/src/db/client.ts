@@ -9,8 +9,11 @@ export interface DatabaseConnection {
   db: Database;
 }
 
-export function createDatabaseConnection(databaseUrl: string): DatabaseConnection {
-  const client = postgres(databaseUrl);
+export function createDatabaseConnection(
+  databaseUrl: string,
+  options: { max?: number } = {},
+): DatabaseConnection {
+  const client = postgres(databaseUrl, options);
 
   return {
     db: drizzle(client, { schema }),

@@ -17,7 +17,8 @@ const application = startApplication({
   databaseUrl,
   port: resolvePort(),
   telegramBotToken: telegram.botToken,
-  telegramChannelId: telegram.channelId,
+  telegramLegacyChannelId: telegram.legacyChannelId,
+  telegramWorkerConcurrency: telegram.workerConcurrency,
 });
 registerProcessLifecycle(application, {
   secrets: [auth.secret, databaseUrl, telegram.botToken],

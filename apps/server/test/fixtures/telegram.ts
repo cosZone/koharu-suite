@@ -6,6 +6,7 @@ export interface ChannelPostFixtureOptions {
   messageId?: number;
   text?: string;
   updateId?: number;
+  username?: string;
 }
 
 export function channelPostFixture(options: ChannelPostFixtureOptions = {}): Update {
@@ -17,7 +18,7 @@ export function channelPostFixture(options: ChannelPostFixtureOptions = {}): Upd
         id: options.channelId ?? -1_001_234_567_890,
         title: 'Koharu Test Channel',
         type: 'channel',
-        username: 'koharu_test',
+        username: options.username ?? 'koharu_test',
       },
       date: options.date ?? 1_751_300_000,
       entities: [
@@ -47,5 +48,22 @@ export function channelPostFixture(options: ChannelPostFixtureOptions = {}): Upd
       ],
       text: options.text ?? 'Koharu first channel post',
     },
+  };
+}
+
+export function editedChannelPostFixture(
+  options: ChannelPostFixtureOptions & { editDate?: number } = {},
+): Update {
+  const original = channelPostFixture(options);
+  if (!original.channel_post) {
+    throw new Error('Channel fixture is missing its post');
+  }
+
+  return {
+    edited_channel_post: {
+      ...original.channel_post,
+      edit_date: options.editDate ?? 1_751_300_200,
+    },
+    update_id: options.updateId ?? 1_002,
   };
 }
