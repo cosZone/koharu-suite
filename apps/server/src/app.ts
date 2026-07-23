@@ -324,6 +324,12 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     if ('response' in authorization) {
       return authorization.response;
     }
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(
+        apiError('owner_session_required', 'An owner session is required to reveal raw evidence'),
+        403,
+      );
+    }
     const parsedMessageId = uuidSchema.safeParse(context.req.param('id'));
     if (!parsedMessageId.success) {
       return context.json(apiError('invalid_message_id', 'id must be a suite message UUID'), 400);

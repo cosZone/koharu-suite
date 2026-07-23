@@ -319,6 +319,38 @@ export const telegramUpdates = pgTable(
   (table) => [index('telegram_updates_channel_received_idx').on(table.channelId, table.receivedAt)],
 );
 
+export const importRuns = pgTable(
+  'import_runs',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    sourceKind: varchar('source_kind', { length: 32 }).$type<'telegram_desktop_json'>().notNull(),
+    sourceFileSha256: text('source_file_sha256').notNull(),
+    parserVersion: integer('parser_version').notNull(),
+    status: varchar('status', { length: 16 })
+      .$type<'completed' | 'interrupted' | 'partial' | 'running'>()
+      .notNull(),
+    selectedChannels: jsonb('selected_channels').$type<string[]>().notNull(),
+    report: jsonb('report').$type<Record<string, unknown>>().notNull().default({}),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('import_runs_source_file_idx').on(table.sourceFileSha256, table.startedAt),
+    check('import_runs_source_kind_check', sql`${table.sourceKind} = 'telegram_desktop_json'`),
+    check('import_runs_parser_version_check', sql`${table.parserVersion} > 0`),
+    check(
+      'import_runs_status_check',
+      sql`${table.status} in ('running', 'completed', 'partial', 'interrupted')`,
+    ),
+    check(
+      'import_runs_completed_at_check',
+      sql`(${table.status} = 'running' and ${table.completedAt} is null)
+        or (${table.status} <> 'running' and ${table.completedAt} is not null)`,
+    ),
+  ],
+);
+
 export const messages = pgTable(
   'messages',
   {
@@ -345,9 +377,10 @@ export const messageRevisions = pgTable(
     messageId: uuid('message_id')
       .notNull()
       .references(() => messages.id, { onDelete: 'cascade' }),
-    telegramUpdateId: bigint('telegram_update_id', { mode: 'bigint' })
-      .notNull()
-      .references(() => telegramUpdates.telegramUpdateId, { onDelete: 'restrict' }),
+    telegramUpdateId: bigint('telegram_update_id', { mode: 'bigint' }).references(
+      () => telegramUpdates.telegramUpdateId,
+      { onDelete: 'restrict' },
+    ),
     revisionNumber: integer('revision_number').notNull(),
     contentKind: varchar('content_kind', { length: 16 })
       .$type<'caption' | 'none' | 'text'>()
@@ -381,8 +414,16 @@ export const messageMedia = pgTable(
     kind: varchar('kind', { length: 32 })
       .$type<'animation' | 'audio' | 'document' | 'photo' | 'video' | 'voice'>()
       .notNull(),
-    telegramFileId: text('telegram_file_id').notNull(),
-    telegramFileUniqueId: text('telegram_file_unique_id').notNull(),
+    sourceKind: varchar('source_kind', { length: 32 })
+      .$type<'telegram_bot_update' | 'telegram_desktop_json'>()
+      .default('telegram_bot_update')
+      .notNull(),
+    sourcePath: text('source_path'),
+    sourceMediaType: text('source_media_type'),
+    availabilityReason: text('availability_reason'),
+    sourceMetadata: jsonb('source_metadata').$type<Record<string, unknown>>().notNull().default({}),
+    telegramFileId: text('telegram_file_id'),
+    telegramFileUniqueId: text('telegram_file_unique_id'),
     mimeType: text('mime_type'),
     fileName: text('file_name'),
     fileSize: bigint('file_size', { mode: 'bigint' }),
@@ -394,5 +435,77 @@ export const messageMedia = pgTable(
   (table) => [
     uniqueIndex('message_media_revision_position_unique').on(table.revisionId, table.position),
     index('message_media_revision_idx').on(table.revisionId),
+    check(
+      'message_media_source_check',
+      sql`(${table.sourceKind} = 'telegram_bot_update'
+          and ${table.telegramFileId} is not null
+          and ${table.telegramFileUniqueId} is not null
+          and ${table.sourcePath} is null)
+        or (${table.sourceKind} = 'telegram_desktop_json'
+          and ${table.telegramFileId} is null
+          and ${table.telegramFileUniqueId} is null)`,
+    ),
+  ],
+);
+
+export const messageSourceObservations = pgTable(
+  'message_source_observations',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    sourceKind: varchar('source_kind', { length: 32 })
+      .$type<'telegram_bot_update' | 'telegram_desktop_json'>()
+      .notNull(),
+    sourceKey: text('source_key').notNull(),
+    channelId: uuid('channel_id')
+      .notNull()
+      .references(() => telegramChannels.id, { onDelete: 'cascade' }),
+    messageId: uuid('message_id')
+      .notNull()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    revisionId: uuid('revision_id').references(() => messageRevisions.id, {
+      onDelete: 'set null',
+    }),
+    importRunId: uuid('import_run_id').references(() => importRuns.id, {
+      onDelete: 'restrict',
+    }),
+    telegramUpdateId: bigint('telegram_update_id', { mode: 'bigint' }).references(
+      () => telegramUpdates.telegramUpdateId,
+      { onDelete: 'restrict' },
+    ),
+    telegramMessageId: bigint('telegram_message_id', { mode: 'bigint' }).notNull(),
+    contentFingerprint: text('content_fingerprint').notNull(),
+    contentFingerprintVersion: integer('content_fingerprint_version').notNull(),
+    resolution: varchar('resolution', { length: 16 })
+      .$type<'conflict' | 'created' | 'matched' | 'stale'>()
+      .notNull(),
+    observedAt: timestamp('observed_at', { withTimezone: true }),
+    sourceMetadata: jsonb('source_metadata').$type<Record<string, unknown>>().notNull().default({}),
+    rawJson: jsonb('raw_json').$type<unknown>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('message_source_observations_source_key_unique').on(
+      table.sourceKind,
+      table.sourceKey,
+    ),
+    index('message_source_observations_message_idx').on(table.messageId, table.createdAt),
+    index('message_source_observations_revision_idx').on(table.revisionId),
+    index('message_source_observations_import_run_idx').on(table.importRunId),
+    check(
+      'message_source_observations_source_check',
+      sql`(${table.sourceKind} = 'telegram_bot_update'
+          and ${table.telegramUpdateId} is not null
+          and ${table.importRunId} is null)
+        or (${table.sourceKind} = 'telegram_desktop_json'
+          and ${table.telegramUpdateId} is null)`,
+    ),
+    check(
+      'message_source_observations_resolution_check',
+      sql`${table.resolution} in ('created', 'matched', 'stale', 'conflict')`,
+    ),
+    check(
+      'message_source_observations_fingerprint_version_check',
+      sql`${table.contentFingerprintVersion} >= 0`,
+    ),
   ],
 );

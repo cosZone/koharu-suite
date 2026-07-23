@@ -1,0 +1,54 @@
+{
+  "personal_information": {
+    "user_id": 123,
+    "first_name": "Must not be imported"
+  },
+  "chats": {
+    "list": [
+      {
+        "name": "Koharu Archive",
+        "type": "public_channel",
+        "id": 1234567890,
+        "messages": [
+          {
+            "id": 10,
+            "type": "message",
+            "date": "2025-01-02T03:04:05+00:00",
+            "date_unixtime": "1735787045",
+            "text": "selected"
+          }
+        ]
+      },
+      {
+        "name": "Private conversation",
+        "type": "personal_chat",
+        "id": 9,
+        "messages": [
+          {
+            "id": 20,
+            "type": "message",
+            "date_unixtime": "1735787045",
+            "text": "private"
+          }
+        ]
+      }
+    ]
+  },
+  "left_chats": {
+    "list": [
+      {
+        "name": "Old public archive",
+        "type": "public_channel",
+        "id": 987654321,
+        "messages": [
+          {
+            "id": 30,
+            "type": "message",
+            "date_unixtime": "1735787045",
+            "text": "left"
+          }
+        ]
+      }
+    ]
+  }
+}
