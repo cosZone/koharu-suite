@@ -15,6 +15,13 @@
       "when": 1784826412864,
       "tag": "0001_fancy_carmella_unuscione",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784830658183,
+      "tag": "0002_majestic_tinkerer",
+      "breakpoints": true
     }
   ]
 }

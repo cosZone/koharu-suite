@@ -1,4 +1,10 @@
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
+import { PostgresOwnerRepository } from './auth/owner-service.js';
+import { BetterAuthRuntime } from './auth/runtime-auth.js';
+import type { AuthConfig } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { closeServer, startServer } from './server.js';
@@ -6,11 +12,14 @@ import { TelegramCollector } from './telegram/collector.js';
 import { GrammyTelegramPolling } from './telegram/polling.js';
 
 export interface ApplicationRuntimeConfig {
+  auth: AuthConfig;
   databaseUrl: string;
   port: number;
   telegramBotToken: string;
   telegramChannelId: bigint;
 }
+
+const defaultAdminAssetsRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../admin/dist');
 
 export interface RuntimeCollector {
   readonly done: Promise<void>;
@@ -58,13 +67,20 @@ export class ApplicationRuntime {
 export function startApplication(config: ApplicationRuntimeConfig): ApplicationRuntime {
   const connection = createDatabaseConnection(config.databaseUrl);
   const repository = new PostgresMessageRepository(connection.db);
-  const app = createApp({ messages: repository });
-  const server = startServer(app, config.port);
   const collector = new TelegramCollector({
     allowedChannelId: config.telegramChannelId,
     polling: new GrammyTelegramPolling(config.telegramBotToken),
     writer: repository,
   });
+  const app = createApp({
+    admin: new PostgresAdminRepository(connection.db),
+    adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
+    auth: new BetterAuthRuntime(connection.db, config.auth),
+    collectorState: () => 'running',
+    messages: repository,
+    owners: new PostgresOwnerRepository(connection.db),
+  });
+  const server = startServer(app, config.port);
 
   collector.start();
 

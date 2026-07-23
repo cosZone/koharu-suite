@@ -33,6 +33,7 @@
   },
   "dependencies": {
     "@hono/node-server": "catalog:",
+    "better-auth": "catalog:",
     "drizzle-orm": "catalog:",
     "grammy": "catalog:",
     "hono": "catalog:",

@@ -1,6 +1,11 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
+import type { RuntimeAuth } from '../src/auth/runtime-auth.js';
 import type { MessageReader, PublicMessage } from '../src/messages/types.js';
+import { channelPostFixture } from './fixtures/telegram.js';
 
 const CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
 const MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b33';
@@ -86,5 +91,102 @@ describe('public message endpoints', () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code },
     });
+  });
+});
+
+describe('owner admin endpoints', () => {
+  const ownerAuth: RuntimeAuth = {
+    getSession: async () => ({
+      user: {
+        email: 'owner@example.com',
+        id: 'owner-user-id',
+        twoFactorEnabled: true,
+      },
+    }),
+    handle: async () => new Response(null, { status: 204 }),
+  };
+
+  it('returns no-store 401 and 403 responses at the owner boundary', async () => {
+    const anonymous = await createApp().request('/api/v1/admin/status');
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers.get('cache-control')).toBe('private, no-store');
+    expect(anonymous.headers.get('vary')).toBe('Cookie');
+
+    const forbidden = await createApp({
+      auth: ownerAuth,
+      owners: { isOwner: async () => false },
+    }).request('/api/v1/admin/status');
+    expect(forbidden.status).toBe(403);
+    await expect(forbidden.json()).resolves.toMatchObject({
+      error: { code: 'owner_required' },
+    });
+  });
+
+  it('serves owner status and reveals raw only through the explicit no-store endpoint', async () => {
+    const rawUpdate = channelPostFixture();
+    const app = createApp({
+      admin: {
+        getCounts: async () => ({ channels: 1, messages: 2, updates: 3 }),
+        getRawUpdate: async (messageId) => (messageId === MESSAGE_ID ? rawUpdate : null),
+      },
+      auth: ownerAuth,
+      collectorState: () => 'running',
+      owners: { isOwner: async () => true },
+    });
+
+    const status = await app.request('/api/v1/admin/status');
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toEqual({
+      collector: 'running',
+      counts: { channels: 1, messages: 2, updates: 3 },
+      owner: {
+        email: 'owner@example.com',
+        twoFactorEnabled: true,
+      },
+      version: '0.1.0',
+    });
+
+    const invalid = await app.request('/api/v1/admin/messages/not-a-uuid/raw');
+    expect(invalid.status).toBe(400);
+    expect(invalid.headers.get('cache-control')).toBe('private, no-store');
+
+    const missing = await app.request(
+      '/api/v1/admin/messages/019bf895-0e70-7881-83b3-471b8dbb1b34/raw',
+    );
+    expect(missing.status).toBe(404);
+
+    const revealed = await app.request(`/api/v1/admin/messages/${MESSAGE_ID}/raw`);
+    expect(revealed.status).toBe(200);
+    expect(revealed.headers.get('cache-control')).toBe('private, no-store');
+    expect(revealed.headers.get('vary')).toBe('Cookie');
+    await expect(revealed.json()).resolves.toEqual({ update: rawUpdate });
+  });
+});
+
+describe('production Admin assets', () => {
+  it('redirects /admin and serves the built index and hashed assets', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'koharu-admin-'));
+    await mkdir(join(root, 'assets'));
+    await writeFile(join(root, 'index.html'), '<!doctype html><title>Owner Desk</title>');
+    await writeFile(join(root, 'assets', 'app-hash.js'), 'console.log("owner desk");');
+
+    try {
+      const app = createApp({ adminAssetsRoot: root });
+      const redirect = await app.request('/admin');
+      expect(redirect.status).toBe(308);
+      expect(redirect.headers.get('location')).toBe('/admin/');
+
+      const index = await app.request('/admin/');
+      expect(index.status).toBe(200);
+      expect(index.headers.get('cache-control')).toBe('no-cache');
+      await expect(index.text()).resolves.toContain('<title>Owner Desk</title>');
+
+      const asset = await app.request('/admin/assets/app-hash.js');
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+      await expect(asset.text()).resolves.toContain('owner desk');
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 });
