@@ -234,7 +234,6 @@ describe('owner authentication', () => {
     const app = createApp({
       admin: new PostgresAdminRepository(connection.db),
       auth: new BetterAuthRuntime(connection.db, AUTH_CONFIG),
-      collectorState: () => 'running',
       owners: ownerRepository,
     });
 
@@ -303,7 +302,10 @@ describe('owner authentication', () => {
     expect(ownerStatus.status).toBe(200);
     expect(ownerStatus.headers.get('cache-control')).toBe('private, no-store');
     await expect(ownerStatus.json()).resolves.toMatchObject({
-      collector: 'running',
+      collector: {
+        state: 'stopped',
+        version: null,
+      },
       owner: {
         email: owner.email,
         twoFactorEnabled: false,

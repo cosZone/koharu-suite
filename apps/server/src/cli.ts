@@ -17,6 +17,7 @@ import {
   resolvePort,
   resolvePublicApiConfig,
   resolveTelegramConfig,
+  resolveWorkerInstanceId,
 } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
@@ -29,10 +30,11 @@ import {
 } from './ops/doctor.js';
 import { PostgresDoctorDiagnostics, TelegramDoctorDiagnostics } from './ops/doctor-runtime.js';
 import { registerProcessLifecycle } from './process-lifecycle.js';
-import { startApplication } from './runtime.js';
+import { createWorkerRuntime, startServerRuntime } from './runtime.js';
 import { GrammyTelegramApi } from './telegram/api.js';
 import { TelegramChannelService } from './telegram/channel-service.js';
 import { VERSION } from './version.js';
+import { PostgresWorkerRuntimeRepository } from './worker-runtime-repository.js';
 
 const HELP = `kodama ${VERSION}
 
@@ -40,12 +42,14 @@ Usage:
   kodama <command> [options]
 
 Commands:
-  serve       Start the HTTP API and Telegram collector
+  serve       Start the HTTP API
+  worker      Start the Telegram collector
   migrate     Apply pending database migrations
   owner       Create or reset the singleton owner
   token       Create, list, or revoke scoped service tokens
   channel     Add, list, enable, or disable Telegram channels
   doctor      Run read-only deployment diagnostics
+  health      Run a container-local health check
   help        Show this help
 
 Options:
@@ -79,7 +83,11 @@ Channel commands:
 Doctor command:
   kodama doctor
 
-serve requires BETTER_AUTH_SECRET, BETTER_AUTH_URL, and TELEGRAM_BOT_TOKEN.
+Health command:
+  kodama health worker
+
+serve requires BETTER_AUTH_SECRET and BETTER_AUTH_URL.
+worker requires TELEGRAM_BOT_TOKEN and HOSTNAME.
 TELEGRAM_CHANNEL_ID is an optional one-time bootstrap when the allowlist is empty.
 `;
 
@@ -169,18 +177,31 @@ async function main(): Promise<void> {
   if (command === 'serve') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
     const auth = resolveAuthConfig();
-    const telegram = resolveTelegramConfig();
-    const application = startApplication({
+    const runtime = startServerRuntime({
       auth,
       databaseUrl,
       port: resolvePort(options.port),
       publicApi: resolvePublicApiConfig(),
-      telegramBotToken: telegram.botToken,
-      telegramLegacyChannelId: telegram.legacyChannelId,
-      telegramWorkerConcurrency: telegram.workerConcurrency,
     });
-    registerProcessLifecycle(application, {
-      secrets: [auth.secret, databaseUrl, telegram.botToken],
+    registerProcessLifecycle(runtime, {
+      secrets: [auth.secret, databaseUrl],
+    });
+    return;
+  }
+
+  if (command === 'worker') {
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const telegram = resolveTelegramConfig();
+    const runtime = createWorkerRuntime({
+      ...telegram,
+      databaseUrl,
+      instanceId: resolveWorkerInstanceId(),
+    });
+    registerProcessLifecycle(runtime, {
+      secrets: [databaseUrl, telegram.botToken],
+    });
+    void runtime.start().catch(() => {
+      // The lifecycle reporter owns sanitized process diagnostics.
     });
     return;
   }
@@ -314,7 +335,9 @@ async function main(): Promise<void> {
         const telegram = resolveTelegramConfig();
         const service = new TelegramChannelService(
           connection.db,
-          new GrammyTelegramApi(telegram.botToken),
+          new GrammyTelegramApi(telegram.botToken, {
+            ...(telegram.apiRoot ? { apiRoot: telegram.apiRoot } : {}),
+          }),
         );
         if (telegramChatId === null) {
           throw new Error('channel add requires --telegram-id');
@@ -373,7 +396,9 @@ async function main(): Promise<void> {
     const telegram = resolveTelegramConfig();
     const connection = createDatabaseConnection(databaseUrl, { max: 2 });
     try {
-      const telegramApi = new GrammyTelegramApi(telegram.botToken);
+      const telegramApi = new GrammyTelegramApi(telegram.botToken, {
+        ...(telegram.apiRoot ? { apiRoot: telegram.apiRoot } : {}),
+      });
       const report = await runDoctor({
         database: new PostgresDoctorDiagnostics(connection.db),
         sensitiveValues: [...sensitiveEnvironmentValues(), databaseUrl, telegram.botToken],
@@ -389,6 +414,29 @@ async function main(): Promise<void> {
       if (doctorHasFailures(report)) {
         process.exitCode = 1;
       }
+    } finally {
+      await connection.close();
+    }
+    return;
+  }
+
+  if (command === 'health') {
+    if (subcommand !== 'worker') {
+      throw new Error('health command must be worker');
+    }
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const instanceId = resolveWorkerInstanceId();
+    const connection = createDatabaseConnection(databaseUrl, { max: 1 });
+    try {
+      const health = await new PostgresWorkerRuntimeRepository(connection.db).getHealthyInstance(
+        instanceId,
+      );
+      if (!health) {
+        throw new Error(`Worker ${instanceId} does not have a fresh running heartbeat`);
+      }
+      process.stdout.write(
+        `Worker ${health.instanceId} is healthy (${health.version}, ${health.heartbeatAt}).\n`,
+      );
     } finally {
       await connection.close();
     }

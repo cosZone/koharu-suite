@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices"],
+  "dependencyDashboard": true,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Keep major upgrades isolated and owner-approved",
+      "dependencyDashboardApproval": true,
+      "matchUpdateTypes": ["major"],
+      "prPriority": -10
+    },
+    {
+      "description": "Group weekly minor upgrades without automerge",
+      "groupName": "minor dependencies",
+      "matchUpdateTypes": ["minor"]
+    },
+    {
+      "automerge": true,
+      "automergeType": "pr",
+      "description": "Group and automerge patch upgrades after required CI passes",
+      "groupName": "patch dependencies",
+      "ignoreTests": false,
+      "matchUpdateTypes": ["patch"],
+      "platformAutomerge": false
+    }
+  ],
+  "schedule": ["before 6am on monday"],
+  "timezone": "Asia/Shanghai"
+}

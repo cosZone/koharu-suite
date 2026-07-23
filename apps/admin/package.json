@@ -12,10 +12,12 @@
     "build": "tsc --noEmit && vite build",
     "dev": "vite",
     "preview": "vite preview",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "better-auth": "catalog:",
+    "@koharu-suite/ui": "workspace:*",
     "react": "catalog:",
     "react-dom": "catalog:"
   },
@@ -25,6 +27,7 @@
     "@types/react-dom": "catalog:",
     "@vitejs/plugin-react": "catalog:",
     "typescript": "catalog:",
-    "vite": "catalog:"
+    "vite": "catalog:",
+    "vitest": "catalog:"
   }
 }

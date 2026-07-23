@@ -212,6 +212,23 @@ export const telegramPollingState = pgTable(
   ],
 );
 
+export const workerRuntime = pgTable(
+  'worker_runtime',
+  {
+    singletonKey: text('singleton_key').primaryKey().default('telegram'),
+    instanceId: text('instance_id').notNull(),
+    state: varchar('state', { length: 16 }).$type<'running' | 'starting' | 'stopping'>().notNull(),
+    version: text('version').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }).notNull(),
+    lastTelegramSuccessAt: timestamp('last_telegram_success_at', { withTimezone: true }),
+  },
+  (table) => [
+    check('worker_runtime_singleton_key_check', sql`${table.singletonKey} = 'telegram'`),
+    check('worker_runtime_state_check', sql`${table.state} in ('starting', 'running', 'stopping')`),
+  ],
+);
+
 export const telegramIngestTasks = pgTable(
   'telegram_ingest_tasks',
   {

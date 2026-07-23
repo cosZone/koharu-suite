@@ -2,7 +2,6 @@ import { GrammyError } from 'grammy';
 import type { TelegramApi } from './api.js';
 import type { TelegramChannelService } from './channel-service.js';
 export interface TelegramInbox {
-  acquirePollerLock(): Promise<void>;
   assertPollerLock(): Promise<void>;
   bindBot(botId: bigint): Promise<bigint | null>;
   checkpointBatch(
@@ -22,6 +21,7 @@ export interface TelegramPollerOptions {
   channels: Pick<TelegramChannelService, 'bootstrapLegacy'>;
   inbox: TelegramInbox;
   legacyChannelId: bigint | undefined;
+  onTelegramSuccess?: () => Promise<void>;
   retryDelay?: (attempt: number, signal: AbortSignal) => Promise<void>;
 }
 
@@ -52,7 +52,10 @@ function defaultRetryDelay(attempt: number, signal: AbortSignal): Promise<void> 
 
 export class TelegramPoller {
   private readonly abortController = new AbortController();
+  private botId: bigint | undefined;
+  private initialized = false;
   private lifetime: Promise<void> | undefined;
+  private offset: bigint | null = null;
   private stopPromise: Promise<void> | undefined;
 
   constructor(private readonly options: TelegramPollerOptions) {}
@@ -61,9 +64,37 @@ export class TelegramPoller {
     return this.lifetime ?? Promise.resolve();
   }
 
+  async authenticate(): Promise<void> {
+    if (this.botId !== undefined || this.initialized || this.lifetime) {
+      throw new Error('Telegram poller can only authenticate once');
+    }
+    const signal = this.abortController.signal;
+    const bot = await this.requestWithRetry(() => this.options.api.getMe(signal), signal);
+    if (!bot || signal.aborted) {
+      throw new Error('Telegram poller stopped during initialization');
+    }
+    await this.options.inbox.assertPollerLock();
+    this.botId = BigInt(bot.id);
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized || this.lifetime) {
+      throw new Error('Telegram poller can only be initialized once');
+    }
+    if (this.botId === undefined) {
+      throw new Error('Telegram poller must authenticate before it is initialized');
+    }
+    this.offset = await this.options.inbox.bindBot(this.botId);
+    await this.options.channels.bootstrapLegacy(this.options.legacyChannelId);
+    this.initialized = true;
+  }
+
   start(): Promise<void> {
     if (this.lifetime) {
       throw new Error('Telegram poller can only be started once');
+    }
+    if (!this.initialized) {
+      throw new Error('Telegram poller must be initialized before it is started');
     }
     this.lifetime = this.run();
     return this.lifetime;
@@ -76,22 +107,17 @@ export class TelegramPoller {
 
   private async run(): Promise<void> {
     const signal = this.abortController.signal;
-    const bot = await this.requestWithRetry(() => this.options.api.getMe(signal), signal);
-    if (!bot) {
-      return;
+    if (this.botId === undefined) {
+      throw new Error('Telegram poller does not have an initialized Bot identity');
     }
-    const botId = BigInt(bot.id);
-    await this.options.inbox.acquirePollerLock();
-    await this.options.inbox.assertPollerLock();
-    let offset = await this.options.inbox.bindBot(botId);
-    await this.options.channels.bootstrapLegacy(this.options.legacyChannelId);
+    const botId = this.botId;
 
     while (!signal.aborted) {
       await this.options.inbox.assertPollerLock();
       const request =
-        offset === null
+        this.offset === null
           ? TELEGRAM_POLLING_OPTIONS
-          : { ...TELEGRAM_POLLING_OPTIONS, offset: Number(offset) };
+          : { ...TELEGRAM_POLLING_OPTIONS, offset: Number(this.offset) };
       const updates = await this.requestWithRetry(
         () => this.options.api.getUpdates(request, signal),
         signal,
@@ -99,8 +125,9 @@ export class TelegramPoller {
       if (!updates || signal.aborted) {
         return;
       }
+      await this.options.onTelegramSuccess?.();
       await this.options.inbox.assertPollerLock();
-      offset = await this.options.inbox.checkpointBatch(botId, updates);
+      this.offset = await this.options.inbox.checkpointBatch(botId, updates);
     }
   }
 

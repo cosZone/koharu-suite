@@ -1,0 +1,67 @@
+services:
+  telegram-fixture:
+    image: node:22-bookworm-slim
+    command:
+      - node
+      - /fixture/server.mjs
+    environment:
+      FIXTURE_PORT: 8080
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:8080/healthz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    init: true
+    volumes:
+      - ./scripts/telegram-fixture:/fixture:ro
+
+  setup-channel:
+    image: ${KOHARU_IMAGE:-koharu-suite:local}
+    command:
+      - node
+      - dist/cli.js
+      - channel
+      - add
+      - --telegram-id=-1002234260754
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      telegram-fixture:
+        condition: service_healthy
+    environment:
+      KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: "true"
+      KOHARU_TEST_TELEGRAM_API_ROOT: http://telegram-fixture:8080
+      NODE_ENV: test
+      POSTGRES_DB: ${POSTGRES_DB:-koharu}
+      POSTGRES_HOST: db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-koharu}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-123456789:fixture-token-not-valid-outside-smoke}
+    restart: "no"
+
+  server:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    depends_on:
+      setup-channel:
+        condition: service_completed_successfully
+    environment:
+      KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: "true"
+      KOHARU_TEST_TELEGRAM_API_ROOT: http://telegram-fixture:8080
+      NODE_ENV: test
+      POSTGRES_DB: ${POSTGRES_DB:-koharu}
+      POSTGRES_HOST: db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-koharu}
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-koharu}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-123456789:fixture-token-not-valid-outside-smoke}
+      TELEGRAM_CHANNEL_ID: ""
+      TELEGRAM_WORKER_CONCURRENCY: 2
