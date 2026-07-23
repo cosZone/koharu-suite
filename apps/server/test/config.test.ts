@@ -42,16 +42,42 @@ describe('configuration', () => {
       }),
     ).toEqual({
       botToken: '123456:test-token',
-      channelId: -1_001_234_567_890n,
+      legacyChannelId: -1_001_234_567_890n,
+      workerConcurrency: 4,
     });
   });
 
-  it('rejects missing secrets, non-channel IDs, and unsafe Telegram IDs', () => {
+  it('allows no legacy channel and parses bounded worker concurrency', () => {
+    expect(
+      resolveTelegramConfig({
+        TELEGRAM_BOT_TOKEN: 'token',
+        TELEGRAM_WORKER_CONCURRENCY: '16',
+      }),
+    ).toEqual({
+      botToken: 'token',
+      legacyChannelId: undefined,
+      workerConcurrency: 16,
+    });
+    expect(() =>
+      resolveTelegramConfig({
+        TELEGRAM_BOT_TOKEN: 'token',
+        TELEGRAM_WORKER_CONCURRENCY: '17',
+      }),
+    ).toThrow();
+  });
+
+  it('rejects missing token, non-channel IDs, and unsafe Telegram IDs', () => {
     expect(() => resolveTelegramConfig({})).toThrow();
     expect(() =>
       resolveTelegramConfig({
         TELEGRAM_BOT_TOKEN: 'token',
         TELEGRAM_CHANNEL_ID: '1234',
+      }),
+    ).toThrow();
+    expect(() =>
+      resolveTelegramConfig({
+        TELEGRAM_BOT_TOKEN: 'token',
+        TELEGRAM_CHANNEL_ID: '-0',
       }),
     ).toThrow();
     expect(() =>

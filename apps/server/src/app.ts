@@ -42,8 +42,19 @@ const unavailableMessageReader: MessageReader = {
   listMessages: async () => null,
 };
 const unavailableAdminReader: AdminReader = {
-  getCounts: async () => ({ channels: 0, messages: 0, updates: 0 }),
   getRawUpdate: async () => null,
+  getStatus: async () => ({
+    counts: {
+      activeChannels: 0,
+      blockedTasks: 0,
+      configuredChannels: 0,
+      messages: 0,
+      pendingTasks: 0,
+      retryingTasks: 0,
+      updates: 0,
+    },
+    lastCheckpoint: null,
+  }),
 };
 const unavailableAuth: RuntimeAuth = {
   getSession: async () => null,
@@ -123,9 +134,10 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
         return context.json(apiError('owner_required', 'The session user is not the owner'), 403);
       }
 
+      const status = await resolved.admin.getStatus();
       return context.json({
         collector: resolved.collectorState(),
-        counts: await resolved.admin.getCounts(),
+        ...status,
         owner: {
           email: session.user.email,
           twoFactorEnabled: session.user.twoFactorEnabled,

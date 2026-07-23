@@ -14,10 +14,11 @@ Core principles:
   posts;
 - build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
 
-[G1.3 #6](https://github.com/cosZone/koharu-suite/issues/6) introduces the first owner control surface:
+[G1.4 #8](https://github.com/cosZone/koharu-suite/issues/8) adds reliable multi-channel ingestion to the
+first owner control surface:
 
-- `apps/server`: Hono API, sequential Telegram long polling, a Drizzle repository, Better Auth, and the
-  `kodama` CLI;
+- `apps/server`: Hono API, a durable Telegram inbox and cursor, channel-ordered workers, a Drizzle repository,
+  Better Auth, and the `kodama` CLI;
 - `apps/admin`: a React and Vite Owner Desk for authentication, archive status, message browsing, explicit raw
   reveal, and TOTP;
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
@@ -28,8 +29,8 @@ See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the compl
 
 Node.js 22.20+, pnpm 10.28.2, and Docker are required.
 
-Create a bot with [@BotFather](https://t.me/BotFather), make it an administrator of one public channel, then
-prepare the local environment:
+Create one bot with [@BotFather](https://t.me/BotFather), make it an administrator of every target public
+channel, then prepare the local environment:
 
 ```bash
 corepack enable
@@ -40,7 +41,7 @@ openssl rand -base64 32
 
 - put the generated value in `BETTER_AUTH_SECRET`; never reuse the example value;
 - keep `BETTER_AUTH_URL=http://localhost:3000` for local development;
-- set the real `TELEGRAM_BOT_TOKEN` and the channel's negative numeric Telegram ID;
+- set the real `TELEGRAM_BOT_TOKEN`; `TELEGRAM_CHANNEL_ID` is only an optional one-time legacy bootstrap;
 - Git ignores `.env`; never put a token, auth secret, password, cookie, or recovery code in a commit, Issue,
   pull request, or log.
 
@@ -50,6 +51,7 @@ Initialize the database and singleton owner:
 docker compose up -d db
 pnpm build
 pnpm exec kodama migrate
+pnpm exec kodama channel add --telegram-id -1001234567890
 pnpm exec kodama owner create --email you@example.com
 pnpm dev
 ```
@@ -77,10 +79,23 @@ offer a “remember me” switch.
 
 ## Telegram and the public API
 
-Telegram updates form one bot-wide stream. The current version persists only the configured channel, but
-advancing the polling offset also acknowledges updates that the same bot received from other channels. Do not
-run another `getUpdates` consumer with the same bot. G1.4 will use one collector for every channel in the
-database allowlist.
+Telegram updates form one bot-wide stream. Run exactly one suite poller and make the same bot an administrator
+of every target public channel; do not run another `getUpdates` consumer for that bot. The database allowlist is
+default-deny, and raw payloads from unknown channels are not persisted:
+
+```bash
+pnpm exec kodama channel add --telegram-id -1001234567890
+pnpm exec kodama channel list
+```
+
+The poller stores allowed updates and its next cursor in one PostgreSQL transaction. Four workers run by
+default: different channels can progress concurrently, while each channel remains strictly ordered by update
+ID. Every `edited_channel_post` creates an immutable revision; a first-known edit starts at revision 1. A failed
+task retries exponentially ten times, then blocks only its channel. The initial version never skips it
+automatically; owner retry and skip controls are planned for a later Goal.
+
+Telegram retains unfetched updates for at most roughly 24 hours. If the service remains offline beyond that
+upstream window, the Bot API cannot restore updates Telegram has already removed.
 
 After publishing a message, discover the suite channel ID before reading its messages:
 
@@ -103,12 +118,14 @@ high-entropy `BETTER_AUTH_SECRET`.
 docker compose up -d db
 docker compose build server
 docker compose run --rm server node dist/cli.js migrate
+docker compose run --rm server node dist/cli.js channel add --telegram-id -1001234567890
 docker compose run --rm server node dist/cli.js owner create --email you@example.com
 docker compose up -d server
 ```
 
-Compose uses PostgreSQL 18. Run migrations and create the owner before starting the collector. Production Admin
-is available at `http://localhost:3000/admin/`, or at `/admin/` under the configured HTTPS origin.
+Compose uses PostgreSQL 18. Run migrations, configure channels, and create the owner before starting the
+collector. Production Admin is available at `http://localhost:3000/admin/`, or at `/admin/` under the configured
+HTTPS origin.
 
 ## Commands
 

@@ -127,9 +127,7 @@ function largestPhoto(photos: PhotoSize[]): PhotoSize | undefined {
   }, undefined);
 }
 
-function normalizeMedia(update: Update & { channel_post: NonNullable<Update['channel_post']> }) {
-  const message = update.channel_post;
-
+function normalizeMedia(message: NonNullable<Update['channel_post']>) {
   if (message.animation) {
     return [normalizeAnimation(message.animation)];
   }
@@ -162,8 +160,25 @@ export function normalizeChannelPost(
   update: Update,
   allowedTelegramChannelId: bigint,
 ): NormalizedChannelPost | null {
-  const message = update.channel_post;
-  if (message?.chat.type !== 'channel') {
+  if (!update.channel_post) {
+    return null;
+  }
+
+  return normalizeChannelUpdate(update, allowedTelegramChannelId);
+}
+
+export function normalizeChannelUpdate(
+  update: Update,
+  allowedTelegramChannelId: bigint,
+): NormalizedChannelPost | null {
+  const updateType =
+    update.channel_post !== undefined
+      ? 'channel_post'
+      : update.edited_channel_post !== undefined
+        ? 'edited_channel_post'
+        : null;
+  const message = update.channel_post ?? update.edited_channel_post;
+  if (!updateType || message?.chat.type !== 'channel') {
     return null;
   }
 
@@ -186,14 +201,16 @@ export function normalizeChannelPost(
     message: {
       authorSignature: message.author_signature ?? null,
       contentKind,
+      editedAt: message.edit_date === undefined ? null : new Date(message.edit_date * 1_000),
       entities: (entities ?? []).map(normalizeEntity),
       mediaGroupId: message.media_group_id ?? null,
       publishedAt: new Date(message.date * 1_000),
       telegramMessageId: BigInt(message.message_id),
       text,
     },
-    media: normalizeMedia(update as Update & { channel_post: typeof message }),
+    media: normalizeMedia(message),
     rawUpdate: update,
     telegramUpdateId: BigInt(update.update_id),
+    updateType,
   };
 }

@@ -143,6 +143,60 @@ export const telegramChannels = pgTable(
   (table) => [uniqueIndex('telegram_channels_chat_id_unique').on(table.telegramChatId)],
 );
 
+export const telegramChannelAllowlist = pgTable('telegram_channel_allowlist', {
+  telegramChatId: bigint('telegram_chat_id', { mode: 'bigint' }).primaryKey(),
+  title: text('title').notNull(),
+  username: varchar('username', { length: 64 }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const telegramPollingState = pgTable(
+  'telegram_polling_state',
+  {
+    singleton: integer('singleton').primaryKey().default(1),
+    botId: bigint('bot_id', { mode: 'bigint' }).notNull(),
+    nextUpdateId: bigint('next_update_id', { mode: 'bigint' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check('telegram_polling_state_singleton_check', sql`${table.singleton} = 1`),
+    uniqueIndex('telegram_polling_state_bot_id_unique').on(table.botId),
+  ],
+);
+
+export const telegramIngestTasks = pgTable(
+  'telegram_ingest_tasks',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    botId: bigint('bot_id', { mode: 'bigint' }).notNull(),
+    telegramUpdateId: bigint('telegram_update_id', { mode: 'bigint' }).notNull(),
+    telegramChatId: bigint('telegram_chat_id', { mode: 'bigint' })
+      .notNull()
+      .references(() => telegramChannelAllowlist.telegramChatId, { onDelete: 'restrict' }),
+    updateType: varchar('update_type', { length: 32 })
+      .$type<'channel_post' | 'edited_channel_post'>()
+      .notNull(),
+    rawJson: jsonb('raw_json').$type<Update>(),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    availableAt: timestamp('available_at', { withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp('processed_at', { withTimezone: true }),
+    blockedAt: timestamp('blocked_at', { withTimezone: true }),
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('telegram_ingest_tasks_update_id_unique').on(table.telegramUpdateId),
+    index('telegram_ingest_tasks_channel_head_idx')
+      .on(table.telegramChatId, table.telegramUpdateId)
+      .where(sql`${table.processedAt} is null`),
+    index('telegram_ingest_tasks_runnable_idx')
+      .on(table.availableAt, table.telegramUpdateId)
+      .where(sql`${table.processedAt} is null and ${table.blockedAt} is null`),
+  ],
+);
+
 export const telegramUpdates = pgTable(
   'telegram_updates',
   {
@@ -194,6 +248,7 @@ export const messageRevisions = pgTable(
     entities: jsonb('entities').$type<NormalizedMessageEntity[]>().notNull(),
     authorSignature: text('author_signature'),
     mediaGroupId: text('media_group_id'),
+    editedAt: timestamp('edited_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [

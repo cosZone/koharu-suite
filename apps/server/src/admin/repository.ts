@@ -1,27 +1,41 @@
-import { and, count, eq } from 'drizzle-orm';
+import { and, count, eq, gt, isNotNull, isNull } from 'drizzle-orm';
 import type { Update } from 'grammy/types';
 import type { Database } from '../db/client.js';
-import { messageRevisions, messages, telegramChannels, telegramUpdates } from '../db/schema.js';
+import {
+  messageRevisions,
+  messages,
+  telegramChannelAllowlist,
+  telegramChannels,
+  telegramIngestTasks,
+  telegramPollingState,
+  telegramUpdates,
+} from '../db/schema.js';
 
-export interface AdminCounts {
-  channels: number;
-  messages: number;
-  updates: number;
+export interface AdminStatusSnapshot {
+  counts: {
+    activeChannels: number;
+    blockedTasks: number;
+    configuredChannels: number;
+    messages: number;
+    pendingTasks: number;
+    retryingTasks: number;
+    updates: number;
+  };
+  lastCheckpoint: string | null;
 }
 
 export interface AdminReader {
-  getCounts(): Promise<AdminCounts>;
   getRawUpdate(messageId: string): Promise<Update | null>;
+  getStatus(): Promise<AdminStatusSnapshot>;
 }
 
-async function tableCount(database: Database, table: typeof messages): Promise<number>;
-async function tableCount(
+async function countRows(
   database: Database,
-  table: typeof telegramChannels | typeof telegramUpdates,
-): Promise<number>;
-async function tableCount(
-  database: Database,
-  table: typeof messages | typeof telegramChannels | typeof telegramUpdates,
+  table:
+    | typeof messages
+    | typeof telegramChannelAllowlist
+    | typeof telegramChannels
+    | typeof telegramUpdates,
 ): Promise<number> {
   const [result] = await database.select({ value: count() }).from(table);
   return result?.value ?? 0;
@@ -30,17 +44,61 @@ async function tableCount(
 export class PostgresAdminRepository implements AdminReader {
   constructor(private readonly database: Database) {}
 
-  async getCounts(): Promise<AdminCounts> {
-    const [channels, messageCount, updates] = await Promise.all([
-      tableCount(this.database, telegramChannels),
-      tableCount(this.database, messages),
-      tableCount(this.database, telegramUpdates),
+  async getStatus(): Promise<AdminStatusSnapshot> {
+    const [
+      activeChannels,
+      configuredChannels,
+      messageCount,
+      updates,
+      pendingTasks,
+      retryingTasks,
+      blockedTasks,
+      pollingState,
+    ] = await Promise.all([
+      countRows(this.database, telegramChannels),
+      countRows(this.database, telegramChannelAllowlist),
+      countRows(this.database, messages),
+      countRows(this.database, telegramUpdates),
+      this.taskCount(
+        and(
+          isNull(telegramIngestTasks.processedAt),
+          isNull(telegramIngestTasks.blockedAt),
+          eq(telegramIngestTasks.attemptCount, 0),
+        ),
+      ),
+      this.taskCount(
+        and(
+          isNull(telegramIngestTasks.processedAt),
+          isNull(telegramIngestTasks.blockedAt),
+          gt(telegramIngestTasks.attemptCount, 0),
+        ),
+      ),
+      this.taskCount(isNotNull(telegramIngestTasks.blockedAt)),
+      this.database
+        .select({
+          nextUpdateId: telegramPollingState.nextUpdateId,
+          updatedAt: telegramPollingState.updatedAt,
+        })
+        .from(telegramPollingState)
+        .where(eq(telegramPollingState.singleton, 1))
+        .limit(1),
     ]);
 
+    const checkpoint = pollingState[0];
     return {
-      channels,
-      messages: messageCount,
-      updates,
+      counts: {
+        activeChannels,
+        blockedTasks,
+        configuredChannels,
+        messages: messageCount,
+        pendingTasks,
+        retryingTasks,
+        updates,
+      },
+      lastCheckpoint:
+        checkpoint?.nextUpdateId === null || checkpoint === undefined
+          ? null
+          : checkpoint.updatedAt.toISOString(),
     };
   }
 
@@ -63,5 +121,13 @@ export class PostgresAdminRepository implements AdminReader {
       .limit(1);
 
     return row?.update ?? null;
+  }
+
+  private async taskCount(where: ReturnType<typeof and> | ReturnType<typeof isNotNull>) {
+    const [result] = await this.database
+      .select({ value: count() })
+      .from(telegramIngestTasks)
+      .where(where);
+    return result?.value ?? 0;
   }
 }

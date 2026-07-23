@@ -36,10 +36,15 @@ interface Message {
 interface AdminStatus {
   collector: 'running' | 'stopped';
   counts: {
-    channels: number;
+    activeChannels: number;
+    blockedTasks: number;
+    configuredChannels: number;
     messages: number;
+    pendingTasks: number;
+    retryingTasks: number;
     updates: number;
   };
+  lastCheckpoint: string | null;
   owner: {
     email: string;
     twoFactorEnabled: boolean;
@@ -563,9 +568,14 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
         <section className="workspace">
           <section className="stats" aria-label="归档统计">
             {[
-              ['频道', status?.counts.channels ?? '—'],
+              ['配置频道', status?.counts.configuredChannels ?? '—'],
+              ['活跃频道', status?.counts.activeChannels ?? '—'],
               ['消息', status?.counts.messages ?? '—'],
               ['Updates', status?.counts.updates ?? '—'],
+              ['待处理', status?.counts.pendingTasks ?? '—'],
+              ['重试中', status?.counts.retryingTasks ?? '—'],
+              ['已阻塞', status?.counts.blockedTasks ?? '—'],
+              ['Checkpoint', status?.lastCheckpoint ? formatDate(status.lastCheckpoint) : '—'],
             ].map(([label, value]) => (
               <div className="stat" key={label}>
                 <span>{label}</span>
