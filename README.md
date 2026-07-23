@@ -28,6 +28,10 @@ Telegram 多频道归档、动态内容、统一管理与静态发布能力。
 `.env` 中的占位值替换为真实 Bot token 和该频道的负数 Telegram channel ID。`.env` 已被 Git
 忽略；不要把真实 token 写进提交、Issue、PR 或日志。
 
+Telegram update 是 Bot 级全局流。G1.2 只会把配置频道写入数据库，但 polling 推进 offset 时也会
+确认同一个 Bot 收到的其他频道 update；不要用同一个 Bot 同时运行另一个 `getUpdates` consumer。
+G1.4 将由单一 collector 统一处理数据库 allowlist 中的多个频道。
+
 ```bash
 corepack enable
 pnpm install

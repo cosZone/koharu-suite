@@ -30,6 +30,11 @@ Create a bot with [@BotFather](https://t.me/BotFather), make it an administrator
 and replace the placeholders in `.env` with the real bot token and the channel's negative numeric Telegram
 ID. Git ignores `.env`; never put the real token in a commit, Issue, pull request, or log.
 
+Telegram updates form one bot-wide stream. G1.2 persists only the configured channel, but advancing the
+polling offset also acknowledges updates that the same bot received from other channels. Do not run another
+`getUpdates` consumer with the same bot. G1.4 will use one collector for every channel in the database
+allowlist.
+
 ```bash
 corepack enable
 pnpm install
