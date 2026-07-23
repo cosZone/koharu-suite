@@ -8,6 +8,13 @@
       "when": 1784822700064,
       "tag": "0000_green_sleepwalker",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784826412864,
+      "tag": "0001_fancy_carmella_unuscione",
+      "breakpoints": true
     }
   ]
 }

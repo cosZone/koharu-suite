@@ -2,6 +2,17 @@ import { z } from 'zod';
 
 const portSchema = z.coerce.number().int().min(1).max(65_535);
 const databaseUrlSchema = z.url({ protocol: /^postgres(?:ql)?$/ });
+const telegramIdLowerBound = -((1n << 52n) - 1n);
+const telegramChannelIdSchema = z
+  .string()
+  .trim()
+  .regex(/^-\d+$/, 'must be a negative Telegram channel ID')
+  .transform((value) => BigInt(value))
+  .refine((value) => value >= telegramIdLowerBound, 'is outside Telegram safe integer range');
+const telegramEnvironmentSchema = z.object({
+  TELEGRAM_BOT_TOKEN: z.string().trim().min(1),
+  TELEGRAM_CHANNEL_ID: telegramChannelIdSchema,
+});
 const postgresEnvironmentSchema = z.object({
   POSTGRES_DB: z.string().min(1),
   POSTGRES_HOST: z.string().min(1),
@@ -32,4 +43,20 @@ export function resolveDatabaseUrl(
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
   return databaseUrlSchema.parse(value ?? databaseUrlFromEnvironment(environment));
+}
+
+export interface TelegramConfig {
+  botToken: string;
+  channelId: bigint;
+}
+
+export function resolveTelegramConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): TelegramConfig {
+  const parsed = telegramEnvironmentSchema.parse(environment);
+
+  return {
+    botToken: parsed.TELEGRAM_BOT_TOKEN,
+    channelId: parsed.TELEGRAM_CHANNEL_ID,
+  };
 }

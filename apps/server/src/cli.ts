@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util';
-import { resolveDatabaseUrl, resolvePort } from './config.js';
+import { resolveDatabaseUrl, resolvePort, resolveTelegramConfig } from './config.js';
 import { runMigrations } from './db/migrate.js';
 import { loadEnvironmentFile } from './env.js';
-import { registerGracefulShutdown, startServer } from './server.js';
+import { registerProcessLifecycle } from './process-lifecycle.js';
+import { startApplication } from './runtime.js';
 import { VERSION } from './version.js';
 
 const HELP = `kodama ${VERSION}
@@ -13,7 +14,7 @@ Usage:
   kodama <command> [options]
 
 Commands:
-  serve       Start the koharu-suite HTTP server
+  serve       Start the HTTP API and Telegram collector
   migrate     Apply pending database migrations
   help        Show this help
 
@@ -22,6 +23,8 @@ Options:
   -v, --version               Show the version
   -p, --port <port>           Server port (default: PORT or 3000)
       --database-url <url>    PostgreSQL URL (default: DATABASE_URL)
+
+serve also requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID.
 `;
 
 interface CliOptions {
@@ -69,7 +72,17 @@ async function main(): Promise<void> {
   loadEnvironmentFile();
 
   if (command === 'serve') {
-    registerGracefulShutdown(startServer(resolvePort(options.port)));
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const telegram = resolveTelegramConfig();
+    const application = startApplication({
+      databaseUrl,
+      port: resolvePort(options.port),
+      telegramBotToken: telegram.botToken,
+      telegramChannelId: telegram.channelId,
+    });
+    registerProcessLifecycle(application, {
+      secrets: [databaseUrl, telegram.botToken],
+    });
     return;
   }
 
