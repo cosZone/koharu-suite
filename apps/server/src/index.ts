@@ -1,17 +1,24 @@
-import { resolveDatabaseUrl, resolvePort, resolveTelegramConfig } from './config.js';
+import {
+  resolveAuthConfig,
+  resolveDatabaseUrl,
+  resolvePort,
+  resolveTelegramConfig,
+} from './config.js';
 import { loadEnvironmentFile } from './env.js';
 import { registerProcessLifecycle } from './process-lifecycle.js';
 import { startApplication } from './runtime.js';
 
 loadEnvironmentFile();
 const databaseUrl = resolveDatabaseUrl();
+const auth = resolveAuthConfig();
 const telegram = resolveTelegramConfig();
 const application = startApplication({
+  auth,
   databaseUrl,
   port: resolvePort(),
   telegramBotToken: telegram.botToken,
   telegramChannelId: telegram.channelId,
 });
 registerProcessLifecycle(application, {
-  secrets: [databaseUrl, telegram.botToken],
+  secrets: [auth.secret, databaseUrl, telegram.botToken],
 });

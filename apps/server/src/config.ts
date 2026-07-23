@@ -13,6 +13,10 @@ const telegramEnvironmentSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().trim().min(1),
   TELEGRAM_CHANNEL_ID: telegramChannelIdSchema,
 });
+const authEnvironmentSchema = z.object({
+  BETTER_AUTH_SECRET: z.string().trim().min(32),
+  BETTER_AUTH_URL: z.string().trim().min(1),
+});
 const postgresEnvironmentSchema = z.object({
   POSTGRES_DB: z.string().min(1),
   POSTGRES_HOST: z.string().min(1),
@@ -48,6 +52,45 @@ export function resolveDatabaseUrl(
 export interface TelegramConfig {
   botToken: string;
   channelId: bigint;
+}
+
+export interface AuthConfig {
+  baseUrl: string;
+  secret: string;
+  trustedOrigin: string;
+}
+
+function parseAuthBaseUrl(value: string): string {
+  const url = new URL(value);
+  const isLocalHttp =
+    url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+
+  if (url.protocol !== 'https:' && !isLocalHttp) {
+    throw new Error('BETTER_AUTH_URL must use HTTPS, except for localhost development');
+  }
+
+  if (
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    (url.pathname !== '/' && url.pathname !== '')
+  ) {
+    throw new Error('BETTER_AUTH_URL must be a canonical origin without credentials or a path');
+  }
+
+  return url.origin;
+}
+
+export function resolveAuthConfig(environment: NodeJS.ProcessEnv = process.env): AuthConfig {
+  const parsed = authEnvironmentSchema.parse(environment);
+  const baseUrl = parseAuthBaseUrl(parsed.BETTER_AUTH_URL);
+
+  return {
+    baseUrl,
+    secret: parsed.BETTER_AUTH_SECRET,
+    trustedOrigin: baseUrl,
+  };
 }
 
 export function resolveTelegramConfig(

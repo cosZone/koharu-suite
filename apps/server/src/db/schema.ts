@@ -1,5 +1,8 @@
+import { sql } from 'drizzle-orm';
 import {
   bigint,
+  boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -19,6 +22,113 @@ export const appMetadata = pgTable('app_metadata', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const authUsers = pgTable(
+  'auth_users',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    email: text('email').notNull(),
+    emailVerified: boolean('email_verified').notNull().default(false),
+    image: text('image'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+    twoFactorEnabled: boolean('two_factor_enabled').notNull().default(false),
+  },
+  (table) => [uniqueIndex('auth_users_email_unique').on(table.email)],
+);
+
+export const authSessions = pgTable(
+  'auth_sessions',
+  {
+    id: text('id').primaryKey(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    token: text('token').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+    ipAddress: text('ip_address'),
+    userAgent: text('user_agent'),
+    userId: text('user_id')
+      .notNull()
+      .references(() => authUsers.id, { onDelete: 'cascade' }),
+  },
+  (table) => [
+    uniqueIndex('auth_sessions_token_unique').on(table.token),
+    index('auth_sessions_user_id_idx').on(table.userId),
+  ],
+);
+
+export const authAccounts = pgTable(
+  'auth_accounts',
+  {
+    id: text('id').primaryKey(),
+    accountId: text('account_id').notNull(),
+    providerId: text('provider_id').notNull(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => authUsers.id, { onDelete: 'cascade' }),
+    accessToken: text('access_token'),
+    refreshToken: text('refresh_token'),
+    idToken: text('id_token'),
+    accessTokenExpiresAt: timestamp('access_token_expires_at', { withTimezone: true }),
+    refreshTokenExpiresAt: timestamp('refresh_token_expires_at', { withTimezone: true }),
+    scope: text('scope'),
+    password: text('password'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    uniqueIndex('auth_accounts_provider_account_unique').on(table.providerId, table.accountId),
+    index('auth_accounts_user_id_idx').on(table.userId),
+  ],
+);
+
+export const authVerifications = pgTable(
+  'auth_verifications',
+  {
+    id: text('id').primaryKey(),
+    identifier: text('identifier').notNull(),
+    value: text('value').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull(),
+  },
+  (table) => [index('auth_verifications_identifier_idx').on(table.identifier)],
+);
+
+export const authTwoFactors = pgTable(
+  'auth_two_factors',
+  {
+    id: text('id').primaryKey(),
+    secret: text('secret').notNull(),
+    backupCodes: text('backup_codes').notNull(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => authUsers.id, { onDelete: 'cascade' }),
+    verified: boolean('verified').notNull().default(true),
+    failedVerificationCount: integer('failed_verification_count').notNull().default(0),
+    lockedUntil: timestamp('locked_until', { withTimezone: true }),
+  },
+  (table) => [
+    index('auth_two_factors_secret_idx').on(table.secret),
+    uniqueIndex('auth_two_factors_user_id_unique').on(table.userId),
+  ],
+);
+
+export const owners = pgTable(
+  'owners',
+  {
+    singleton: integer('singleton').primaryKey().default(1),
+    userId: text('user_id')
+      .notNull()
+      .references(() => authUsers.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check('owners_singleton_check', sql`${table.singleton} = 1`),
+    uniqueIndex('owners_user_id_unique').on(table.userId),
+  ],
+);
 
 export const telegramChannels = pgTable(
   'telegram_channels',

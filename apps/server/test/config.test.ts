@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDatabaseUrl, resolvePort, resolveTelegramConfig } from '../src/config.js';
+import {
+  resolveAuthConfig,
+  resolveDatabaseUrl,
+  resolvePort,
+  resolveTelegramConfig,
+} from '../src/config.js';
 
 describe('configuration', () => {
   it('accepts a valid port', () => {
@@ -72,5 +77,52 @@ describe('configuration', () => {
 
     expect(configurationError).toBeDefined();
     expect(String(configurationError)).not.toContain(token);
+  });
+
+  it('normalizes an HTTPS or localhost Better Auth origin', () => {
+    expect(
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'test-secret-with-at-least-32-characters',
+        BETTER_AUTH_URL: 'https://suite.example.com/',
+      }),
+    ).toEqual({
+      baseUrl: 'https://suite.example.com',
+      secret: 'test-secret-with-at-least-32-characters',
+      trustedOrigin: 'https://suite.example.com',
+    });
+
+    expect(
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'test-secret-with-at-least-32-characters',
+        BETTER_AUTH_URL: 'http://127.0.0.1:3000',
+      }).baseUrl,
+    ).toBe('http://127.0.0.1:3000');
+  });
+
+  it('rejects weak secrets, insecure remote origins, paths, and credentials', () => {
+    expect(() =>
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'short',
+        BETTER_AUTH_URL: 'https://suite.example.com',
+      }),
+    ).toThrow();
+    expect(() =>
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'test-secret-with-at-least-32-characters',
+        BETTER_AUTH_URL: 'http://suite.example.com',
+      }),
+    ).toThrow();
+    expect(() =>
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'test-secret-with-at-least-32-characters',
+        BETTER_AUTH_URL: 'https://suite.example.com/admin',
+      }),
+    ).toThrow();
+    expect(() =>
+      resolveAuthConfig({
+        BETTER_AUTH_SECRET: 'test-secret-with-at-least-32-characters',
+        BETTER_AUTH_URL: 'https://user:password@suite.example.com',
+      }),
+    ).toThrow();
   });
 });
