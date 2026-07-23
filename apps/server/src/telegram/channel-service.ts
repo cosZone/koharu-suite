@@ -1,8 +1,9 @@
-import { asc, count, eq } from 'drizzle-orm';
+import { asc, count, eq, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { telegramChannelAllowlist } from '../db/schema.js';
+import { telegramChannelAllowlist, telegramPollingState } from '../db/schema.js';
 import type { TelegramApi } from './api.js';
 import { telegramIdAsNumber } from './api.js';
+import { TELEGRAM_BOT_BIND_ADVISORY_LOCK } from './constants.js';
 
 export interface ConfiguredChannel {
   telegramChatId: bigint;
@@ -38,28 +39,48 @@ export class TelegramChannelService {
       throw new Error('Telegram Bot must be an administrator of the channel');
     }
 
-    const now = new Date();
-    const [channel] = await this.database
-      .insert(telegramChannelAllowlist)
-      .values({
-        telegramChatId,
-        title: chat.title,
-        username: chat.username,
-      })
-      .onConflictDoUpdate({
-        target: telegramChannelAllowlist.telegramChatId,
-        set: {
-          title: chat.title,
-          updatedAt: now,
-          username: chat.username,
-        },
-      })
-      .returning({
-        telegramChatId: telegramChannelAllowlist.telegramChatId,
-        title: telegramChannelAllowlist.title,
-        username: telegramChannelAllowlist.username,
-      });
+    const channel = await this.database.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(${TELEGRAM_BOT_BIND_ADVISORY_LOCK})`,
+      );
+      const botId = BigInt(bot.id);
+      await transaction
+        .insert(telegramPollingState)
+        .values({ botId })
+        .onConflictDoNothing({ target: telegramPollingState.singleton });
+      const [state] = await transaction
+        .select({ botId: telegramPollingState.botId })
+        .from(telegramPollingState)
+        .where(eq(telegramPollingState.singleton, 1))
+        .limit(1)
+        .for('update');
+      if (!state || state.botId !== botId) {
+        throw new Error('This database is already bound to a different Telegram Bot');
+      }
 
+      const now = new Date();
+      const [configured] = await transaction
+        .insert(telegramChannelAllowlist)
+        .values({
+          telegramChatId,
+          title: chat.title,
+          username: chat.username,
+        })
+        .onConflictDoUpdate({
+          target: telegramChannelAllowlist.telegramChatId,
+          set: {
+            title: chat.title,
+            updatedAt: now,
+            username: chat.username,
+          },
+        })
+        .returning({
+          telegramChatId: telegramChannelAllowlist.telegramChatId,
+          title: telegramChannelAllowlist.title,
+          username: telegramChannelAllowlist.username,
+        });
+      return configured;
+    });
     if (!channel) {
       throw new Error('Failed to configure Telegram channel');
     }

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { asc, count, eq, sql } from 'drizzle-orm';
 import postgres from 'postgres';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -22,7 +22,10 @@ import {
 import { PostgresMessageRepository } from '../../src/messages/repository.js';
 import type { TelegramApi } from '../../src/telegram/api.js';
 import { TelegramChannelService } from '../../src/telegram/channel-service.js';
-import { TelegramInboxRepository } from '../../src/telegram/inbox-repository.js';
+import {
+  ReservedTelegramInboxRepository,
+  TelegramInboxRepository,
+} from '../../src/telegram/inbox-repository.js';
 import { normalizeChannelPost, normalizeChannelUpdate } from '../../src/telegram/normalize.js';
 import { TelegramWorkerPool } from '../../src/telegram/worker.js';
 import { channelPostFixture, editedChannelPostFixture } from '../fixtures/telegram.js';
@@ -43,7 +46,7 @@ describe('database migrations', () => {
   afterAll(async () => {
     await connection?.close();
     await container?.stop();
-  });
+  }, 30_000);
 
   beforeEach(async () => {
     if (!connection) {
@@ -52,7 +55,7 @@ describe('database migrations', () => {
     await connection.db.execute(
       sql`truncate table ${telegramChannelAllowlist}, ${telegramChannels}, ${telegramPollingState} cascade`,
     );
-  });
+  }, 30_000);
 
   it('applies the schema repeatedly without changing the result', async () => {
     if (!container) {
@@ -520,6 +523,25 @@ describe('database migrations', () => {
         username: 'verified_public',
       },
     ]);
+    const [boundState] = await connection.db.select().from(telegramPollingState);
+    expect(boundState?.botId).toBe(123_456n);
+
+    const firstBot = await api.getMe();
+    const mismatchedService = new TelegramChannelService(connection.db, {
+      ...api,
+      getMe: async () => ({
+        ...firstBot,
+        id: 654_321,
+        username: 'other_kodama_bot',
+      }),
+    });
+    await expect(mismatchedService.add(-1_001_234_567_899n)).rejects.toThrow(
+      'different Telegram Bot',
+    );
+    const [allowlistCount] = await connection.db
+      .select({ value: count() })
+      .from(telegramChannelAllowlist);
+    expect(allowlistCount?.value).toBe(1);
   });
 
   it('enforces a singleton poller advisory lock per database', async () => {
@@ -527,24 +549,67 @@ describe('database migrations', () => {
       throw new Error('PostgreSQL test container did not start');
     }
 
-    const firstConnection = createDatabaseConnection(container.getConnectionUri(), { max: 1 });
-    const secondConnection = createDatabaseConnection(container.getConnectionUri(), { max: 1 });
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const first = new ReservedTelegramInboxRepository(container.getConnectionUri(), connection.db);
+    const second = new ReservedTelegramInboxRepository(container.getConnectionUri(), connection.db);
     let firstClosed = false;
     try {
-      const first = new TelegramInboxRepository(firstConnection.db);
-      const second = new TelegramInboxRepository(secondConnection.db);
       await expect(first.acquirePollerLock()).resolves.toBeUndefined();
+      await expect(first.assertPollerLock()).resolves.toBeUndefined();
       await expect(second.acquirePollerLock()).rejects.toThrow('already owns this database');
-      await firstConnection.close();
+      await first.close();
       firstClosed = true;
       await expect(second.acquirePollerLock()).resolves.toBeUndefined();
+      await expect(second.assertPollerLock()).resolves.toBeUndefined();
     } finally {
       if (!firstClosed) {
-        await firstConnection.close();
+        await first.close();
       }
-      await secondConnection.close();
+      await second.close();
     }
-  });
+  }, 30_000);
+
+  it('fails closed when the reserved poller backend session is terminated', async () => {
+    if (!container) {
+      throw new Error('PostgreSQL test container did not start');
+    }
+
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const first = new ReservedTelegramInboxRepository(container.getConnectionUri(), connection.db);
+    const second = new ReservedTelegramInboxRepository(container.getConnectionUri(), connection.db);
+    const adminClient = postgres(container.getConnectionUri(), { max: 1 });
+    try {
+      await first.acquirePollerLock();
+      const [lock] = await adminClient<{ pid: number }[]>`
+        select pid
+        from pg_locks
+        where locktype = 'advisory'
+          and granted
+          and objsubid = 1
+          and pid <> pg_backend_pid()
+        limit 1
+      `;
+      expect(lock?.pid).toBeDefined();
+      await adminClient`select pg_terminate_backend(${lock?.pid ?? 0})`;
+
+      await vi.waitFor(
+        async () => {
+          await expect(first.assertPollerLock()).rejects.toThrow('lost advisory lock ownership');
+        },
+        { timeout: 5_000 },
+      );
+      await expect(second.acquirePollerLock()).resolves.toBeUndefined();
+      await expect(second.assertPollerLock()).resolves.toBeUndefined();
+    } finally {
+      await first.close();
+      await second.close();
+      await adminClient.end();
+    }
+  }, 30_000);
 
   it('backfills existing G1.2 channels when upgrading to the G1.4 migration', async () => {
     if (!container) {

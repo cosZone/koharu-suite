@@ -88,6 +88,9 @@ pnpm exec kodama channel add --telegram-id -1001234567890
 pnpm exec kodama channel list
 ```
 
+The first `channel add` (or `serve`) binds the database to that Bot's numeric ID. Every later token must belong
+to the same Bot; changing Bots requires an explicit migration of the existing cursor and inbox.
+
 The poller stores allowed updates and its next cursor in one PostgreSQL transaction. Four workers run by
 default: different channels can progress concurrently, while each channel remains strictly ordered by update
 ID. Every `edited_channel_post` creates an immutable revision; a first-known edit starts at revision 1. A failed

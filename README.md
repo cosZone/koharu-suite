@@ -83,6 +83,9 @@ pnpm exec kodama channel add --telegram-id -1001234567890
 pnpm exec kodama channel list
 ```
 
+第一次 `channel add`（或 `serve`）会把数据库绑定到该 Bot 的 numeric ID；之后只能继续使用同一个
+Bot，换 token 前必须先按迁移流程处理现有 cursor 与 inbox。
+
 poller 会在同一 PostgreSQL transaction 中保存允许的 update 与下一 cursor。默认 4 个 worker
 跨频道并行，但同频道严格按 update ID 处理。每个 `edited_channel_post` 都生成不可变 revision；
 即使首次看见的就是编辑，也会从 revision 1 开始。单条失败指数重试 10 次后只阻塞对应频道，初版

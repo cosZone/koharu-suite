@@ -10,7 +10,7 @@ import { PostgresMessageRepository } from './messages/repository.js';
 import { closeServer, startServer } from './server.js';
 import { GrammyTelegramApi } from './telegram/api.js';
 import { TelegramChannelService } from './telegram/channel-service.js';
-import { TelegramInboxRepository } from './telegram/inbox-repository.js';
+import { ReservedTelegramInboxRepository } from './telegram/inbox-repository.js';
 import { type RuntimeIngestion, TelegramIngestionRuntime } from './telegram/ingestion.js';
 import { TelegramPoller } from './telegram/polling.js';
 import { TelegramWorkerPool } from './telegram/worker.js';
@@ -68,13 +68,13 @@ export class ApplicationRuntime {
 
 export function startApplication(config: ApplicationRuntimeConfig): ApplicationRuntime {
   const mainConnection = createDatabaseConnection(config.databaseUrl);
-  const pollingConnection = createDatabaseConnection(config.databaseUrl, { max: 1 });
   const repository = new PostgresMessageRepository(mainConnection.db);
   const api = new GrammyTelegramApi(config.telegramBotToken);
+  const inbox = new ReservedTelegramInboxRepository(config.databaseUrl, mainConnection.db);
   const poller = new TelegramPoller({
     api,
     channels: new TelegramChannelService(mainConnection.db, api),
-    inbox: new TelegramInboxRepository(pollingConnection.db),
+    inbox,
     legacyChannelId: config.telegramLegacyChannelId,
   });
   const workers = new TelegramWorkerPool(
@@ -96,7 +96,7 @@ export function startApplication(config: ApplicationRuntimeConfig): ApplicationR
   return new ApplicationRuntime(
     ingestion,
     () => closeServer(server),
-    pollingConnection.close,
+    () => inbox.close(),
     mainConnection.close,
   );
 }

@@ -1,13 +1,13 @@
 import { eq, inArray, sql } from 'drizzle-orm';
 import type { Update } from 'grammy/types';
+import postgres from 'postgres';
 import type { Database } from '../db/client.js';
 import {
   telegramChannelAllowlist,
   telegramIngestTasks,
   telegramPollingState,
 } from '../db/schema.js';
-
-const POLLER_ADVISORY_LOCK = 5_832_943_008_958_395;
+import { TELEGRAM_BOT_BIND_ADVISORY_LOCK, TELEGRAM_POLLER_ADVISORY_LOCK } from './constants.js';
 
 function channelUpdate(update: Update) {
   if (update.channel_post !== undefined) {
@@ -28,17 +28,11 @@ function channelUpdate(update: Update) {
 export class TelegramInboxRepository {
   constructor(private readonly database: Database) {}
 
-  async acquirePollerLock(): Promise<void> {
-    const rows = await this.database.execute<{ acquired: boolean }>(
-      sql`select pg_try_advisory_lock(${POLLER_ADVISORY_LOCK}) as acquired`,
-    );
-    if (!rows[0]?.acquired) {
-      throw new Error('Another Telegram poller already owns this database');
-    }
-  }
-
   async bindBot(botId: bigint): Promise<bigint | null> {
     return this.database.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(${TELEGRAM_BOT_BIND_ADVISORY_LOCK})`,
+      );
       await transaction
         .insert(telegramPollingState)
         .values({ botId })
@@ -133,5 +127,81 @@ export class TelegramInboxRepository {
 
       return nextUpdateId;
     });
+  }
+}
+
+export class ReservedTelegramInboxRepository {
+  private readonly client;
+  private readonly delegate: TelegramInboxRepository;
+  private backendPid: number | undefined;
+  private reserved: postgres.ReservedSql | undefined;
+  private sessionLost = false;
+
+  constructor(databaseUrl: string, database: Database) {
+    this.client = postgres(databaseUrl, {
+      max: 1,
+      onclose: () => {
+        this.sessionLost = true;
+      },
+    });
+    this.delegate = new TelegramInboxRepository(database);
+  }
+
+  async acquirePollerLock(): Promise<void> {
+    if (this.reserved) {
+      throw new Error('Telegram poller session was already reserved');
+    }
+
+    this.sessionLost = false;
+    const reserved = await this.client.reserve();
+    try {
+      const [status] = await reserved<{ acquired: boolean; backendPid: number }[]>`
+        select
+          pg_try_advisory_lock(${TELEGRAM_POLLER_ADVISORY_LOCK}) as acquired,
+          pg_backend_pid() as "backendPid"
+      `;
+      if (!status?.acquired) {
+        throw new Error('Another Telegram poller already owns this database');
+      }
+      this.backendPid = status.backendPid;
+    } catch (error) {
+      reserved.release();
+      throw error;
+    }
+    this.reserved = reserved;
+  }
+
+  async assertPollerLock(): Promise<void> {
+    if (!this.reserved || this.backendPid === undefined) {
+      throw new Error('Telegram poller session has not been reserved');
+    }
+    if (this.sessionLost) {
+      throw new Error('Telegram poller database session changed and lost advisory lock ownership');
+    }
+  }
+
+  async bindBot(botId: bigint): Promise<bigint | null> {
+    await this.assertPollerLock();
+    return this.delegate.bindBot(botId);
+  }
+
+  async checkpointBatch(botId: bigint, updates: Update[]): Promise<bigint | null> {
+    await this.assertPollerLock();
+    return this.delegate.checkpointBatch(botId, updates);
+  }
+
+  async close(): Promise<void> {
+    try {
+      if (this.reserved && this.backendPid !== undefined && !this.sessionLost) {
+        await this.reserved`select pg_advisory_unlock(${TELEGRAM_POLLER_ADVISORY_LOCK})`;
+      }
+    } catch {
+      // The pinned backend may already be gone; closing the client is the fail-closed release.
+    }
+    this.backendPid = undefined;
+    this.sessionLost = true;
+    this.reserved?.release();
+    this.reserved = undefined;
+    await this.client.end({ timeout: 1 });
   }
 }

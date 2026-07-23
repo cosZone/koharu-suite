@@ -3,6 +3,7 @@ import type { TelegramApi } from './api.js';
 import type { TelegramChannelService } from './channel-service.js';
 export interface TelegramInbox {
   acquirePollerLock(): Promise<void>;
+  assertPollerLock(): Promise<void>;
   bindBot(botId: bigint): Promise<bigint | null>;
   checkpointBatch(
     botId: bigint,
@@ -81,10 +82,12 @@ export class TelegramPoller {
     }
     const botId = BigInt(bot.id);
     await this.options.inbox.acquirePollerLock();
+    await this.options.inbox.assertPollerLock();
     let offset = await this.options.inbox.bindBot(botId);
     await this.options.channels.bootstrapLegacy(this.options.legacyChannelId);
 
     while (!signal.aborted) {
+      await this.options.inbox.assertPollerLock();
       const request =
         offset === null
           ? TELEGRAM_POLLING_OPTIONS
@@ -96,6 +99,7 @@ export class TelegramPoller {
       if (!updates || signal.aborted) {
         return;
       }
+      await this.options.inbox.assertPollerLock();
       offset = await this.options.inbox.checkpointBatch(botId, updates);
     }
   }

@@ -58,6 +58,7 @@ describe('Telegram long polling', () => {
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
         acquirePollerLock: vi.fn(async () => {}),
+        assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => 900n),
         checkpointBatch,
       },
@@ -98,6 +99,7 @@ describe('Telegram long polling', () => {
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
         acquirePollerLock: vi.fn(async () => {}),
+        assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => null),
         checkpointBatch,
       },
@@ -126,6 +128,7 @@ describe('Telegram long polling', () => {
       channels: { bootstrapLegacy: vi.fn(async () => null) },
       inbox: {
         acquirePollerLock: vi.fn(async () => {}),
+        assertPollerLock: vi.fn(async () => {}),
         bindBot: vi.fn(async () => 900n),
         checkpointBatch: vi.fn(async () => {
           throw databaseError;
