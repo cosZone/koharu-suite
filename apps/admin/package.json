@@ -1,6 +1,6 @@
 {
   "name": "@koharu-suite/admin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Administration interface for koharu-suite.",
   "license": "AGPL-3.0-only",
