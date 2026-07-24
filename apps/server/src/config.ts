@@ -44,6 +44,8 @@ const postgresEnvironmentSchema = z.object({
   POSTGRES_USER: z.string().min(1),
 });
 const MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+const MEDIA_S3_DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+const MEDIA_S3_MAX_BYTES = 5 * 1024 * 1024 * 1024 * 1024;
 const mediaCacheEnvironmentSchema = z.object({
   MEDIA_CACHE_DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
   MEDIA_CACHE_ENABLED: z
@@ -75,6 +77,12 @@ const mediaS3EnvironmentSchema = z.object({
     .default('true')
     .transform((value) => value === 'true'),
   S3_KEY: optionalTrimmedString,
+  S3_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(MEDIA_S3_MAX_BYTES)
+    .default(MEDIA_S3_DEFAULT_MAX_BYTES),
   S3_PREFIX: z.string().trim().default('koharu/media-cache'),
   S3_REGION: z.string().trim().min(1).max(255).default('us-east-1'),
   S3_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
@@ -145,6 +153,7 @@ export type MediaS3Config =
       enabled: true;
       endpoint: string;
       forcePathStyle: boolean;
+      maxBytes: number;
       prefix: string;
       region: string;
       requestTimeoutMs: number;
@@ -248,6 +257,7 @@ export function resolveMediaS3Config(environment: NodeJS.ProcessEnv = process.en
     enabled: true,
     endpoint,
     forcePathStyle: parsed.S3_FORCE_PATH_STYLE,
+    maxBytes: parsed.S3_MAX_BYTES,
     prefix,
     region: parsed.S3_REGION,
     requestTimeoutMs: parsed.S3_REQUEST_TIMEOUT_MS,
