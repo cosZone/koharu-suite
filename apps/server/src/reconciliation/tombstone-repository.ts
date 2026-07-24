@@ -1,6 +1,7 @@
 import { and, eq, isNotNull, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
+  appMetadata,
   messages,
   reconciliationActions,
   reconciliationFindings,
@@ -12,6 +13,8 @@ import type {
   MessageTombstoneResult,
   OwnerMessageTombstoneInput,
 } from './tombstone.js';
+
+export const PUBLIC_READER_COMPATIBILITY_FLOOR_KEY = 'public_reader_compatibility_floor';
 
 export class PostgresMessageTombstoneRepository implements MessageTombstoneRepository {
   constructor(private readonly database: Database) {}
@@ -87,6 +90,27 @@ export class PostgresMessageTombstoneRepository implements MessageTombstoneRepos
         if (!updated) {
           throw new Error('Message tombstone state changed concurrently');
         }
+      }
+      if (input.tombstoned) {
+        await transaction
+          .insert(appMetadata)
+          .values({
+            key: PUBLIC_READER_COMPATIBILITY_FLOOR_KEY,
+            value: {
+              feature: 'message_tombstones',
+              minimumSchemaMigration: 9,
+            },
+          })
+          .onConflictDoUpdate({
+            target: appMetadata.key,
+            set: {
+              updatedAt: sql`clock_timestamp()`,
+              value: {
+                feature: 'message_tombstones',
+                minimumSchemaMigration: 9,
+              },
+            },
+          });
       }
 
       const [action] = await transaction

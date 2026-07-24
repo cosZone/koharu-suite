@@ -40,7 +40,7 @@ import { RECONCILIATION_ADVISORY_LOCK } from './repository.js';
 const MAX_REPAIR_REVISIONS = 500;
 const MAX_REPAIR_MEDIA = 100;
 
-type RepairTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+export type RepairTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 type Finding = typeof reconciliationFindings.$inferSelect;
 
 export class PostgresDeterministicRepairRepository implements DeterministicRepairRepository {
@@ -49,79 +49,90 @@ export class PostgresDeterministicRepairRepository implements DeterministicRepai
   apply(input: ReconciliationRepairInput): Promise<ReconciliationRepairResult> {
     return this.database.transaction(async (transaction) => {
       await transaction.execute(sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`);
-      const [initialFinding] = await transaction
-        .select()
-        .from(reconciliationFindings)
-        .where(eq(reconciliationFindings.id, input.findingId))
-        .limit(1);
-      if (!initialFinding) {
-        throw new Error('Reconciliation finding was not found');
-      }
-      const actionKind = actionForFinding(initialFinding.kind);
-      if (initialFinding.evidenceVersion !== input.expectedEvidenceVersion) {
-        throw new Error('Reconciliation finding evidence version changed');
-      }
-      const message = await lockFindingMessage(transaction, initialFinding);
-      const [finding] = await transaction
-        .select()
-        .from(reconciliationFindings)
-        .where(eq(reconciliationFindings.id, input.findingId))
-        .limit(1)
-        .for('update');
-      if (!finding || !sameFindingEvidence(initialFinding, finding)) {
-        throw new Error('Reconciliation finding evidence changed while acquiring locks');
-      }
-      if (finding.evidenceVersion !== input.expectedEvidenceVersion) {
-        throw new Error('Reconciliation finding evidence version changed');
-      }
-      if (finding.state === 'resolved') {
-        return {
-          actionKind,
-          changed: false,
-          findingId: finding.id,
-          replayed: true,
-          runId: null,
-        };
-      }
-      if (finding.state !== 'open') {
-        throw new Error('Ignored reconciliation findings cannot be repaired');
-      }
+      return this.applyInTransaction(transaction, input);
+    });
+  }
 
-      const startedAt = new Date();
-      const outcome =
-        finding.kind === 'derived_html_drift'
-          ? await this.repairDerivedHtml(transaction, finding, message)
-          : finding.kind === 'current_pointer_invalid'
-            ? await this.repairCurrentPointer(transaction, finding, message)
-            : finding.kind === 'import_lineage_missing'
-              ? await this.restoreImportLineage(transaction, finding, message)
-              : await this.restoreSourceMedia(transaction, finding, message);
-      if (finding.telegramChatId === null) {
-        throw new Error('Repair run requires a channel-scoped finding');
-      }
-      const completedAt = new Date();
-      const report = createReconciliationReport({
-        channelIds: [finding.telegramChatId.toString()],
-        mode: 'apply',
-        startedAt,
-      });
-      addReconciliationFinding(report, {
-        channelId: finding.telegramChatId.toString(),
-        evidenceVersion: finding.evidenceVersion,
-        kind: finding.kind,
-        ...(finding.messageId === null ? {} : { messageId: finding.messageId }),
-        ...(finding.observationId === null ? {} : { observationId: finding.observationId }),
-        sanitizedReason: outcome.changed
-          ? 'Applied a deterministic repair to verified evidence'
-          : 'Resolved the finding because verified evidence is already consistent',
-        severity: finding.severity,
-        stableKey: finding.stableKey,
-        state: 'resolved',
-      });
-      finishReconciliationReport(report, {
-        completedAt,
-        repaired: outcome.changed ? 1 : 0,
-      });
+  async applyInTransaction(
+    transaction: RepairTransaction,
+    input: ReconciliationRepairInput,
+    options: { runId?: string } = {},
+  ): Promise<ReconciliationRepairResult> {
+    const [initialFinding] = await transaction
+      .select()
+      .from(reconciliationFindings)
+      .where(eq(reconciliationFindings.id, input.findingId))
+      .limit(1);
+    if (!initialFinding) {
+      throw new Error('Reconciliation finding was not found');
+    }
+    const actionKind = actionForFinding(initialFinding.kind);
+    if (initialFinding.evidenceVersion !== input.expectedEvidenceVersion) {
+      throw new Error('Reconciliation finding evidence version changed');
+    }
+    const message = await lockFindingMessage(transaction, initialFinding);
+    const [finding] = await transaction
+      .select()
+      .from(reconciliationFindings)
+      .where(eq(reconciliationFindings.id, input.findingId))
+      .limit(1)
+      .for('update');
+    if (!finding || !sameFindingEvidence(initialFinding, finding)) {
+      throw new Error('Reconciliation finding evidence changed while acquiring locks');
+    }
+    if (finding.evidenceVersion !== input.expectedEvidenceVersion) {
+      throw new Error('Reconciliation finding evidence version changed');
+    }
+    if (finding.state === 'resolved') {
+      return {
+        actionKind,
+        changed: false,
+        findingId: finding.id,
+        replayed: true,
+        runId: null,
+      };
+    }
+    if (finding.state !== 'open') {
+      throw new Error('Ignored reconciliation findings cannot be repaired');
+    }
+
+    const startedAt = new Date();
+    const outcome =
+      finding.kind === 'derived_html_drift'
+        ? await this.repairDerivedHtml(transaction, finding, message)
+        : finding.kind === 'current_pointer_invalid'
+          ? await this.repairCurrentPointer(transaction, finding, message)
+          : finding.kind === 'import_lineage_missing'
+            ? await this.restoreImportLineage(transaction, finding, message)
+            : await this.restoreSourceMedia(transaction, finding, message);
+    if (finding.telegramChatId === null) {
+      throw new Error('Repair run requires a channel-scoped finding');
+    }
+    const completedAt = new Date();
+    const report = createReconciliationReport({
+      channelIds: [finding.telegramChatId.toString()],
+      mode: 'apply',
+      startedAt,
+    });
+    addReconciliationFinding(report, {
+      channelId: finding.telegramChatId.toString(),
+      evidenceVersion: finding.evidenceVersion,
+      kind: finding.kind,
+      ...(finding.messageId === null ? {} : { messageId: finding.messageId }),
+      ...(finding.observationId === null ? {} : { observationId: finding.observationId }),
+      sanitizedReason: outcome.changed
+        ? 'Applied a deterministic repair to verified evidence'
+        : 'Resolved the finding because verified evidence is already consistent',
+      severity: finding.severity,
+      stableKey: finding.stableKey,
+      state: 'resolved',
+    });
+    finishReconciliationReport(report, {
+      completedAt,
+      repaired: outcome.changed ? 1 : 0,
+    });
+    let runId = options.runId;
+    if (!runId) {
       const [run] = await transaction
         .insert(reconciliationRuns)
         .values({
@@ -138,42 +149,42 @@ export class PostgresDeterministicRepairRepository implements DeterministicRepai
       if (!run) {
         throw new Error('Failed to create reconciliation apply run');
       }
-      const runId = run.id;
-      await transaction.insert(reconciliationActions).values({
-        actionKind: outcome.changed ? actionKind : 'resolve_already_consistent',
-        afterState: outcome.afterState,
-        beforeState: outcome.beforeState,
-        findingId: finding.id,
-        initiatorId: input.initiatorId,
-        initiatorKind: input.initiatorKind,
-        reason: input.reason,
-        runId,
-      });
-      const [resolved] = await transaction
-        .update(reconciliationFindings)
-        .set({
-          resolvedAt: sql`clock_timestamp()`,
-          state: 'resolved',
-        })
-        .where(
-          and(
-            eq(reconciliationFindings.id, finding.id),
-            eq(reconciliationFindings.evidenceVersion, input.expectedEvidenceVersion),
-            eq(reconciliationFindings.state, 'open'),
-          ),
-        )
-        .returning({ id: reconciliationFindings.id });
-      if (!resolved) {
-        throw new Error('Failed to resolve the repaired reconciliation finding');
-      }
-      return {
-        actionKind,
-        changed: outcome.changed,
-        findingId: finding.id,
-        replayed: false,
-        runId,
-      };
+      runId = run.id;
+    }
+    await transaction.insert(reconciliationActions).values({
+      actionKind: outcome.changed ? actionKind : 'resolve_already_consistent',
+      afterState: outcome.afterState,
+      beforeState: outcome.beforeState,
+      findingId: finding.id,
+      initiatorId: input.initiatorId,
+      initiatorKind: input.initiatorKind,
+      reason: input.reason,
+      runId,
     });
+    const [resolved] = await transaction
+      .update(reconciliationFindings)
+      .set({
+        resolvedAt: sql`clock_timestamp()`,
+        state: 'resolved',
+      })
+      .where(
+        and(
+          eq(reconciliationFindings.id, finding.id),
+          eq(reconciliationFindings.evidenceVersion, input.expectedEvidenceVersion),
+          eq(reconciliationFindings.state, 'open'),
+        ),
+      )
+      .returning({ id: reconciliationFindings.id });
+    if (!resolved) {
+      throw new Error('Failed to resolve the repaired reconciliation finding');
+    }
+    return {
+      actionKind,
+      changed: outcome.changed,
+      findingId: finding.id,
+      replayed: false,
+      runId,
+    };
   }
 
   private async repairDerivedHtml(

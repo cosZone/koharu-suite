@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  appMetadata,
   messageMedia,
   messageRevisions,
   messageSourceObservations,
@@ -14,7 +15,10 @@ import {
 } from '../../src/db/schema.js';
 import { PostgresMessageRepository } from '../../src/messages/repository.js';
 import { MessageTombstoneService } from '../../src/reconciliation/tombstone.js';
-import { PostgresMessageTombstoneRepository } from '../../src/reconciliation/tombstone-repository.js';
+import {
+  PostgresMessageTombstoneRepository,
+  PUBLIC_READER_COMPATIBILITY_FLOOR_KEY,
+} from '../../src/reconciliation/tombstone-repository.js';
 import { normalizeChannelPost } from '../../src/telegram/normalize.js';
 import { channelPostFixture } from '../fixtures/telegram.js';
 
@@ -124,6 +128,14 @@ describe('owner message tombstone', () => {
       .from(messages)
       .where(eq(messages.id, ingested.messageId));
     expect(hidden?.tombstonedAt).toBeInstanceOf(Date);
+    const [compatibilityFloor] = await database
+      .select({ value: appMetadata.value })
+      .from(appMetadata)
+      .where(eq(appMetadata.key, PUBLIC_READER_COMPATIBILITY_FLOOR_KEY));
+    expect(compatibilityFloor?.value).toEqual({
+      feature: 'message_tombstones',
+      minimumSchemaMigration: 9,
+    });
 
     let actions = await database
       .select()

@@ -1,5 +1,5 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
-import { count, eq, sql } from 'drizzle-orm';
+import { and, count, eq, isNull, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
@@ -17,6 +17,8 @@ import {
 } from '../../src/db/schema.js';
 import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from '../../src/messages/renderer.js';
 import { PostgresMessageRepository } from '../../src/messages/repository.js';
+import { ReconciliationApplyService } from '../../src/reconciliation/apply-service.js';
+import { PostgresReconciliationPersistenceRepository } from '../../src/reconciliation/persistence-repository.js';
 import { DeterministicRepairService } from '../../src/reconciliation/repair.js';
 import { PostgresDeterministicRepairRepository } from '../../src/reconciliation/repair-repository.js';
 import { normalizeChannelPost } from '../../src/telegram/normalize.js';
@@ -353,6 +355,60 @@ describe('deterministic reconciliation repair', () => {
       .from(reconciliationActions)
       .where(eq(reconciliationActions.findingId, unsafeFinding));
     expect(unsafeActionCount?.value).toBe(0);
+  });
+
+  it('keeps CLI re-scan, bounded repairs, and one apply audit run in one transaction', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const database = connection.db;
+    const { messageId } = await seedMessage(database, 47n, 1);
+    await database.insert(messageRevisions).values({
+      contentKind: 'text',
+      entities: [],
+      html: '<p>stale batch output</p>',
+      messageId,
+      rendererVersion: 0,
+      revisionNumber: 1,
+      text: 'Batch repair',
+    });
+    const repairRepository = new PostgresDeterministicRepairRepository(database);
+    const apply = new ReconciliationApplyService(
+      database,
+      new PostgresReconciliationPersistenceRepository(database),
+      repairRepository,
+    );
+
+    const report = await apply.apply({
+      channelIds: [CHANNEL_ID],
+      initiatorId: null,
+      initiatorKind: 'local_operator',
+      reason: 'Apply the bounded deterministic repair batch',
+    });
+
+    expect(report).toMatchObject({
+      counts: { repaired: 1, resolved: 1 },
+      mode: 'apply',
+      status: 'partial',
+    });
+    const applyRuns = await database
+      .select()
+      .from(reconciliationRuns)
+      .where(and(eq(reconciliationRuns.mode, 'apply'), isNull(reconciliationRuns.initiatorId)));
+    expect(applyRuns).toHaveLength(1);
+    expect(applyRuns[0]).toMatchObject({
+      initiatorKind: 'local_operator',
+      status: 'partial',
+    });
+    const actions = await database
+      .select()
+      .from(reconciliationActions)
+      .where(eq(reconciliationActions.runId, applyRuns[0]?.id ?? ''));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      actionKind: 'derived_html.rerender',
+      findingId: expect.any(String),
+    });
   });
 });
 

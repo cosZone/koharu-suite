@@ -45,7 +45,6 @@ import { registerProcessLifecycle } from './process-lifecycle.js';
 import { ReconciliationApplyService } from './reconciliation/apply-service.js';
 import { runReconciliationCli } from './reconciliation/cli.js';
 import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
-import { DeterministicRepairService } from './reconciliation/repair.js';
 import { PostgresDeterministicRepairRepository } from './reconciliation/repair-repository.js';
 import { PostgresReconciliationRepository } from './reconciliation/repository.js';
 import { ReconciliationService } from './reconciliation/service.js';
@@ -357,9 +356,7 @@ async function main(): Promise<void> {
         new PostgresReconciliationRepository(connection.db),
       );
       const persistence = new PostgresReconciliationPersistenceRepository(connection.db);
-      const repair = new DeterministicRepairService(
-        new PostgresDeterministicRepairRepository(connection.db),
-      );
+      const repair = new PostgresDeterministicRepairRepository(connection.db);
       const apply = new ReconciliationApplyService(connection.db, persistence, repair);
       process.exitCode = await runReconciliationCli(
         {

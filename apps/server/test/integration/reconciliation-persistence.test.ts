@@ -68,7 +68,9 @@ describe('persisted reconciliation lifecycle', () => {
     if (!connection) {
       throw new Error('Database connection was not created');
     }
+    const oldest = new Date('2026-07-24T09:00:00.000Z');
     const older = new Date('2026-07-24T10:00:00.000Z');
+    const between = new Date('2026-07-24T10:00:00.123Z');
     const newer = new Date('2026-07-24T11:00:00.000Z');
     const insertedFindings = await connection.db
       .insert(reconciliationFindings)
@@ -91,8 +93,37 @@ describe('persisted reconciliation lifecycle', () => {
           severity: 'warning',
           stableKey: 'retention:newer',
         },
+        {
+          evidenceVersion: 1,
+          firstSeenAt: between,
+          kind: 'retention_risk',
+          lastSeenAt: between,
+          sanitizedDetails: { reason: 'between' },
+          severity: 'warning',
+          stableKey: 'retention:between',
+        },
+        {
+          evidenceVersion: 1,
+          firstSeenAt: oldest,
+          kind: 'retention_risk',
+          lastSeenAt: oldest,
+          sanitizedDetails: { reason: 'oldest' },
+          severity: 'warning',
+          stableKey: 'retention:oldest',
+        },
       ])
       .returning({ id: reconciliationFindings.id, stableKey: reconciliationFindings.stableKey });
+    const olderFinding = insertedFindings.find(
+      (finding) => finding.stableKey === 'retention:older',
+    );
+    if (!olderFinding) {
+      throw new Error('Finding precision fixture was not created');
+    }
+    await connection.db.execute(sql`
+      update ${reconciliationFindings}
+      set last_seen_at = '2026-07-24T10:00:00.123456Z'::timestamptz
+      where id = ${olderFinding.id}
+    `);
     const insertedRuns = await connection.db
       .insert(reconciliationRuns)
       .values([
@@ -118,19 +149,39 @@ describe('persisted reconciliation lifecycle', () => {
       .returning({ id: reconciliationRuns.id, startedAt: reconciliationRuns.startedAt });
     const repository = new PostgresReconciliationPersistenceRepository(connection.db);
 
-    const firstFindingsPage = await repository.listFindings({ limit: 1 });
+    const firstFindingsPage = await repository.listFindings({ limit: 2 });
     expect(firstFindingsPage.items.map((finding) => finding.stableKey)).toEqual([
       'retention:newer',
+      'retention:older',
     ]);
-    expect(firstFindingsPage.nextCursor).toBe(
-      insertedFindings.find((finding) => finding.stableKey === 'retention:newer')?.id,
+    expect(firstFindingsPage.nextCursor).toMatch(/^[A-Za-z0-9_-]+$/u);
+    const cursorFinding = insertedFindings.find(
+      (finding) => finding.stableKey === 'retention:older',
     );
+    if (!cursorFinding) {
+      throw new Error('Finding cursor fixture was not created');
+    }
+    await connection.db
+      .update(reconciliationFindings)
+      .set({ lastSeenAt: new Date('2026-07-24T12:00:00.000Z') })
+      .where(eq(reconciliationFindings.id, cursorFinding.id));
     await expect(
-      repository.listFindings({ cursor: firstFindingsPage.nextCursor ?? '', limit: 1 }),
+      repository.listFindings({ cursor: firstFindingsPage.nextCursor ?? '', limit: 2 }),
     ).resolves.toMatchObject({
-      items: [{ stableKey: 'retention:older' }],
+      items: [{ stableKey: 'retention:between' }, { stableKey: 'retention:oldest' }],
       nextCursor: null,
     });
+    const oversizedTimestampCursor = Buffer.from(
+      JSON.stringify({
+        id: olderFinding.id,
+        lastSeenMicros: '999999999999999999999999',
+        v: 1,
+      }),
+      'utf8',
+    ).toString('base64url');
+    await expect(
+      repository.listFindings({ cursor: oversizedTimestampCursor, limit: 2 }),
+    ).rejects.toThrow('Invalid reconciliation cursor');
 
     const firstRunsPage = await repository.listRuns({ limit: 1 });
     expect(firstRunsPage.items[0]?.startedAt).toBe(newer.toISOString());
@@ -229,6 +280,7 @@ describe('persisted reconciliation lifecycle', () => {
     const persistedFindings = await connection.db.select().from(reconciliationFindings);
     expect(persistedFindings).toHaveLength(1);
     expect(persistedFindings[0]).toMatchObject({
+      evidenceVersion: 1,
       firstSeenAt,
       id: firstFinding.id,
       state: 'ignored',
@@ -474,11 +526,45 @@ describe('persisted reconciliation lifecycle', () => {
       initiatorKind: 'local_operator',
       telegramChannelIds: [CHANNEL_A],
     });
-    const [sameEvidence] = await connection.db
-      .select({ state: reconciliationFindings.state })
+    const [recurringEvidence] = await connection.db
+      .select({
+        evidenceVersion: reconciliationFindings.evidenceVersion,
+        state: reconciliationFindings.state,
+      })
       .from(reconciliationFindings)
       .where(eq(reconciliationFindings.kind, 'derived_html_drift'));
-    expect(sameEvidence?.state).toBe('resolved');
+    expect(recurringEvidence).toEqual({ evidenceVersion: 2, state: 'open' });
+    const recurringActions = await connection.db
+      .select({
+        actionKind: reconciliationActions.actionKind,
+        reason: reconciliationActions.reason,
+      })
+      .from(reconciliationActions)
+      .where(eq(reconciliationActions.actionKind, 'reopen_new_evidence'));
+    expect(recurringActions).toEqual([
+      {
+        actionKind: 'reopen_new_evidence',
+        reason: 'Recurring scanner evidence reopened this finding',
+      },
+    ]);
+
+    await repeatedRepository.persistScan({
+      initiatorKind: 'local_operator',
+      telegramChannelIds: [CHANNEL_A],
+    });
+    const [stillOpen] = await connection.db
+      .select({
+        evidenceVersion: reconciliationFindings.evidenceVersion,
+        state: reconciliationFindings.state,
+      })
+      .from(reconciliationFindings)
+      .where(eq(reconciliationFindings.kind, 'derived_html_drift'));
+    expect(stillOpen).toEqual({ evidenceVersion: 2, state: 'open' });
+    const [reopenActionCount] = await connection.db
+      .select({ value: count() })
+      .from(reconciliationActions)
+      .where(eq(reconciliationActions.actionKind, 'reopen_new_evidence'));
+    expect(reopenActionCount?.value).toBe(1);
   });
 
   it('reconstructs a disable window whose enable audit crosses the 500-row page boundary', async () => {
@@ -580,7 +666,7 @@ describe('persisted reconciliation lifecycle', () => {
     ]);
   });
 
-  it('persists a claimed scheduled scan without terminalizing its run', async () => {
+  it('atomically persists a claimed scheduled scan and terminalizes its lease-bound run', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
     }
@@ -612,23 +698,6 @@ describe('persisted reconciliation lifecycle', () => {
       kind: 'disabled_window',
       state: 'open',
     });
-    const [running] = await connection.db
-      .select()
-      .from(reconciliationRuns)
-      .where(eq(reconciliationRuns.id, lease.claimedRunId));
-    expect(running).toMatchObject({
-      completedAt: null,
-      mode: 'scheduled_scan',
-      status: 'running',
-    });
-    expect(running?.report).toMatchObject({ findings: [], status: 'clean' });
-
-    await schedule.complete(lease.leaseOwner, {
-      leaseToken: lease.leaseToken,
-      report,
-      runId: lease.claimedRunId,
-      status: 'partial',
-    });
     const [completed] = await connection.db
       .select()
       .from(reconciliationRuns)
@@ -639,6 +708,14 @@ describe('persisted reconciliation lifecycle', () => {
     });
     expect(completed?.completedAt).toBeInstanceOf(Date);
     expect(completed?.report).toMatchObject({ mode: 'scheduled-scan', status: 'partial' });
+    await expect(schedule.get()).resolves.toMatchObject({
+      claimedRunId: null,
+      lastRunId: lease.claimedRunId,
+      lastStatus: 'partial',
+      leaseExpiresAt: null,
+      leaseOwner: null,
+      leaseToken: null,
+    });
   });
 
   it('rejects unclaimed, mismatched-scope, token-mismatched, and wrong-mode runs', async () => {
@@ -754,6 +831,56 @@ describe('persisted reconciliation lifecycle', () => {
     expect(after).toMatchObject({ completedAt: null, status: 'running' });
   });
 
+  it('holds the schedule fence through atomic commit after nominal lease expiry', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const database = connection.db;
+    const { lease, schedule } = await claimScheduledRun(connection, [CHANNEL_A.toString()], 100);
+    let releaseScan!: () => void;
+    let scanEntered!: () => void;
+    const holdScan = new Promise<void>((resolve) => {
+      releaseScan = resolve;
+    });
+    const enteredScan = new Promise<void>((resolve) => {
+      scanEntered = resolve;
+    });
+    const scanner: ReconciliationSnapshotScanner = {
+      scanSnapshotInTransaction: async (_transaction, _scope, _now, visit) => {
+        scanEntered();
+        await visit(findingCandidate('disabled_window', 'expired-at-commit'));
+        await holdScan;
+        return { scanned: 1 };
+      },
+    };
+    const repository = new PostgresReconciliationPersistenceRepository(database, scanner);
+
+    const scan = repository.scanClaimedRun({
+      runId: lease.claimedRunId,
+      signal: new AbortController().signal,
+      telegramChannelIds: [CHANNEL_A.toString()],
+    });
+    await enteredScan;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const takeover = schedule.claimDue('takeover-worker', 600_000, [CHANNEL_A.toString()]);
+    const takeoverState = await Promise.race([
+      takeover.then(() => 'completed' as const),
+      new Promise<'waiting'>((resolve) => setTimeout(() => resolve('waiting'), 100)),
+    ]);
+    releaseScan();
+    expect(takeoverState).toBe('waiting');
+    await expect(scan).resolves.toMatchObject({ status: 'partial' });
+    await expect(takeover).resolves.toBeNull();
+    const [findingCount] = await database.select({ value: count() }).from(reconciliationFindings);
+    const [run] = await database
+      .select()
+      .from(reconciliationRuns)
+      .where(eq(reconciliationRuns.id, lease.claimedRunId));
+    expect(findingCount?.value).toBe(1);
+    expect(run).toMatchObject({ status: 'partial' });
+    expect(run?.completedAt).toBeInstanceOf(Date);
+  });
+
   it('returns interrupted and rolls back scheduled finding writes when aborted', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
@@ -839,6 +966,7 @@ class AbortingFixtureScanner extends FixtureScanner {
 async function claimScheduledRun(
   connection: DatabaseConnection,
   scope: readonly string[],
+  leaseDurationMs = 600_000,
 ): Promise<{
   lease: ReconciliationScheduleLease;
   schedule: PostgresReconciliationScheduleRepository;
@@ -857,7 +985,7 @@ async function claimScheduledRun(
     intervalSeconds: 60,
     nextRunAt: new Date('2026-07-24T00:00:00.000Z'),
   });
-  const lease = await schedule.claimDue('scheduled-test-worker', 600_000, scope);
+  const lease = await schedule.claimDue('scheduled-test-worker', leaseDurationMs, scope);
   if (!lease) {
     throw new Error('Scheduled fixture run was not claimed');
   }

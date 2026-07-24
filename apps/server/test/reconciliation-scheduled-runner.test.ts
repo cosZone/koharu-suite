@@ -36,15 +36,6 @@ function schedule(
       .fn<ScheduledReconciliationLeaseRepository['claimDue']>()
       .mockResolvedValueOnce(claimed)
       .mockResolvedValue(null),
-    complete: vi.fn<ScheduledReconciliationLeaseRepository['complete']>(async () => ({
-      ...claimed,
-      claimedRunId: null,
-      lastRunId: claimed.claimedRunId,
-      lastStatus: 'completed',
-      leaseExpiresAt: null,
-      leaseOwner: null,
-      leaseToken: null,
-    })),
     release: vi.fn<ScheduledReconciliationLeaseRepository['release']>(
       async (_instanceId, input) => ({
         ...claimed,
@@ -114,7 +105,7 @@ describe('scheduled reconciliation runner', () => {
     expect(scanner.scanClaimedRun).not.toHaveBeenCalled();
   });
 
-  it('claims a due run, invokes only the claimed scan interface, and completes cleanly', async () => {
+  it('claims a due run and trusts the claimed scanner to commit a clean terminal run', async () => {
     const scheduleRepository = schedule();
     const scanner: ClaimedScheduledReconciliationScanner = {
       scanClaimedRun: vi.fn(async () => report('clean')),
@@ -122,7 +113,7 @@ describe('scheduled reconciliation runner', () => {
     const service = runner(scheduleRepository, scanner);
     const lifetime = service.start();
 
-    await vi.waitFor(() => expect(scheduleRepository.complete).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(scanner.scanClaimedRun).toHaveBeenCalledOnce());
     await service.stop();
     await expect(lifetime).resolves.toBeUndefined();
 
@@ -131,18 +122,6 @@ describe('scheduled reconciliation runner', () => {
       signal: expect.any(AbortSignal),
       telegramChannelIds: CHANNEL_IDS,
     });
-    expect(scheduleRepository.complete).toHaveBeenCalledWith(
-      'worker-one',
-      expect.objectContaining({
-        leaseToken: lease().leaseToken,
-        report: expect.objectContaining({
-          mode: 'scheduled-scan',
-          status: 'clean',
-        }),
-        runId: lease().claimedRunId,
-        status: 'completed',
-      }),
-    );
     expect(scheduleRepository.release).not.toHaveBeenCalled();
   });
 
@@ -161,9 +140,12 @@ describe('scheduled reconciliation runner', () => {
     await vi.waitFor(() => expect(scheduleRepository.renew).toHaveBeenCalled());
     expect(scheduleRepository.renew).toHaveBeenCalledWith('worker-one', lease().leaseToken, 100);
     resolveScan(report('clean'));
-    await vi.waitFor(() => expect(scheduleRepository.complete).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(vi.mocked(scheduleRepository.claimDue).mock.calls.length).toBeGreaterThan(1),
+    );
     await service.stop();
     await expect(lifetime).resolves.toBeUndefined();
+    expect(scheduleRepository.release).not.toHaveBeenCalled();
   });
 
   it('cooperatively interrupts the active scan and releases its claim on stop', async () => {
@@ -192,7 +174,6 @@ describe('scheduled reconciliation runner', () => {
         status: 'interrupted',
       }),
     );
-    expect(scheduleRepository.complete).not.toHaveBeenCalled();
   });
 
   it('records a failed run for scan errors and rejects any repaired mutation report', async () => {
@@ -231,7 +212,6 @@ describe('scheduled reconciliation runner', () => {
     await vi.waitFor(() => expect(repairedSchedule.release).toHaveBeenCalledOnce());
     await repaired.stop();
     await expect(repairedLifetime).resolves.toBeUndefined();
-    expect(repairedSchedule.complete).not.toHaveBeenCalled();
     expect(repairedSchedule.release).toHaveBeenCalledWith(
       'worker-one',
       expect.objectContaining({ status: 'failed' }),
@@ -259,7 +239,6 @@ describe('scheduled reconciliation runner', () => {
     const service = runner(scheduleRepository, scanner);
 
     await expect(service.start()).rejects.toBe(leaseLost);
-    expect(scheduleRepository.complete).not.toHaveBeenCalled();
     expect(scheduleRepository.release).toHaveBeenCalledWith(
       'worker-one',
       expect.objectContaining({

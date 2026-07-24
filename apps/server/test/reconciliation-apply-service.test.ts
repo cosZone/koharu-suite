@@ -26,18 +26,24 @@ describe('reconciliation apply service', () => {
     });
     finishReconciliationReport(report);
     const persistence = {
-      persistScan: vi.fn(async () => ({ report, runId: 'scan-run' })),
+      persistScanInLockedTransaction: vi.fn(async () => ({ report, runId: 'scan-run' })),
     };
     const repair = {
-      apply: vi.fn(async () => ({
+      applyInTransaction: vi.fn(async () => ({
         actionKind: 'derived_html.rerender' as const,
         changed: true,
         findingId: 'finding-one',
         replayed: false,
-        runId: 'apply-run',
+        runId: 'batch-apply-run',
       })),
     };
-    const database = {
+    const transaction = {
+      execute: vi.fn(async () => undefined),
+      insert: vi.fn(() => ({
+        values: () => ({
+          returning: async () => [{ id: 'batch-apply-run' }],
+        }),
+      })),
       select: vi.fn(() => ({
         from: () => ({
           where: () => ({
@@ -53,6 +59,22 @@ describe('reconciliation apply service', () => {
           }),
         }),
       })),
+      transaction: vi.fn(async (callback: (transaction: unknown) => Promise<unknown>) =>
+        callback({}),
+      ),
+      update: vi.fn(() => ({
+        set: () => ({
+          where: () => ({
+            returning: async () => [{ id: 'batch-apply-run' }],
+          }),
+        }),
+      })),
+    };
+    const database = {
+      transaction: vi.fn(
+        async (callback: (activeTransaction: typeof transaction) => Promise<unknown>) =>
+          callback(transaction),
+      ),
     };
     const service = new ReconciliationApplyService(
       database as never,
@@ -67,17 +89,23 @@ describe('reconciliation apply service', () => {
       reason: 'Approved deterministic repair',
     });
 
-    expect(persistence.persistScan).toHaveBeenCalledWith({
+    expect(persistence.persistScanInLockedTransaction).toHaveBeenCalledWith(transaction, {
       initiatorKind: 'local_operator',
       telegramChannelIds: [-1001n],
     });
-    expect(repair.apply).toHaveBeenCalledWith({
-      expectedEvidenceVersion: 1,
-      findingId: 'finding-one',
-      initiatorId: null,
-      initiatorKind: 'local_operator',
-      reason: 'Approved deterministic repair',
-    });
+    expect(repair.applyInTransaction).toHaveBeenCalledWith(
+      {},
+      {
+        expectedEvidenceVersion: 1,
+        findingId: 'finding-one',
+        initiatorId: null,
+        initiatorKind: 'local_operator',
+        reason: 'Approved deterministic repair',
+      },
+      { runId: 'batch-apply-run' },
+    );
+    expect(transaction.execute).toHaveBeenCalledOnce();
+    expect(transaction.transaction).toHaveBeenCalledOnce();
     expect(applied).toMatchObject({
       counts: { open: 0, repaired: 1, resolved: 1 },
       findings: [{ state: 'resolved' }],

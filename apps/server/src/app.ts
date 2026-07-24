@@ -525,7 +525,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     const authorization = await authorizeAdmin(context, 'admin:read');
     if ('response' in authorization) return authorization.response;
     const parsed = z
-      .object({ cursor: z.uuid().optional(), limit: listLimitSchema })
+      .object({ cursor: z.string().min(1).max(512).optional(), limit: listLimitSchema })
       .safeParse(context.req.query());
     if (!parsed.success) {
       return context.json(apiError('invalid_reconciliation_query', 'Invalid cursor or limit'), 400);

@@ -33,26 +33,32 @@ export class DeterministicRepairService {
   constructor(private readonly repository: DeterministicRepairRepository) {}
 
   async apply(input: ReconciliationRepairInput): Promise<ReconciliationRepairResult> {
-    if (!Number.isSafeInteger(input.expectedEvidenceVersion) || input.expectedEvidenceVersion < 1) {
-      throw new RangeError('expectedEvidenceVersion must be a positive safe integer');
-    }
-    if (input.findingId.trim().length === 0) {
-      throw new TypeError('findingId must not be empty');
-    }
-    const reason = input.reason.trim();
-    if (reason.length < 1 || reason.length > 500) {
-      throw new RangeError('reason must contain between 1 and 500 characters');
-    }
-    if (input.initiatorId !== null && input.initiatorId.trim().length === 0) {
-      throw new TypeError('initiatorId must be null or non-empty');
-    }
-    if (
-      input.initiatorKind !== 'local_operator' &&
-      input.initiatorKind !== 'owner_session' &&
-      input.initiatorKind !== 'service_token'
-    ) {
-      throw new TypeError('initiatorKind cannot perform deterministic repair');
-    }
-    return this.repository.apply({ ...input, reason });
+    return this.repository.apply(validateReconciliationRepairInput(input));
   }
+}
+
+export function validateReconciliationRepairInput(
+  input: ReconciliationRepairInput,
+): ReconciliationRepairInput {
+  if (!Number.isSafeInteger(input.expectedEvidenceVersion) || input.expectedEvidenceVersion < 1) {
+    throw new RangeError('expectedEvidenceVersion must be a positive safe integer');
+  }
+  if (input.findingId.trim().length === 0) {
+    throw new TypeError('findingId must not be empty');
+  }
+  const reason = input.reason.trim();
+  if (reason.length < 1 || reason.length > 500) {
+    throw new RangeError('reason must contain between 1 and 500 characters');
+  }
+  if (input.initiatorId !== null && input.initiatorId.trim().length === 0) {
+    throw new TypeError('initiatorId must be null or non-empty');
+  }
+  if (
+    input.initiatorKind !== 'local_operator' &&
+    input.initiatorKind !== 'owner_session' &&
+    input.initiatorKind !== 'service_token'
+  ) {
+    throw new TypeError('initiatorKind cannot perform deterministic repair');
+  }
+  return { ...input, reason };
 }

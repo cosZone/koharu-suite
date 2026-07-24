@@ -119,7 +119,9 @@ raw/provenance 仍只允许 owner 主动揭示，并返回 `Cache-Control: priva
 
 - 扫描、import 和安全 repair 都按 stable key/evidence version 设计为可重跑；
 - 在升级前按[部署手册](../deployment/README.md)备份 PostgreSQL；
-- migration 只做 additive change；回滚旧应用不会删除新的 runs/findings/lineage/tombstone evidence；
+- migration 只做 additive change；回滚旧应用不会删除新的 evidence，但旧 public reader 不理解
+  tombstone。第一次 hide 会写入 `public_reader_compatibility_floor`，marker 存在或仍有 tombstone 时
+  禁止回滚到 G2.2 之前的 server；
 - 若旧版本在回滚期间写入可确定恢复的 evidence，升级后重新 scan/apply；
 - 不要手工删除 reconciliation 或 source-evidence 表来“清理”告警。
 

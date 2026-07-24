@@ -125,8 +125,9 @@ cannot hide or unhide. Raw and provenance data remain an explicit owner reveal a
 
 - scans, imports, and deterministic repairs are safe to rerun by stable key and evidence version;
 - back up PostgreSQL before upgrades as described in the [deployment guide](../deployment/README.en.md);
-- migrations are additive; rolling the application back does not delete new runs, findings, lineage, or
-  tombstone evidence;
+- migrations are additive and rollback does not delete new evidence, but a pre-G2.2 public reader does not
+  understand tombstones. The first hide writes `public_reader_compatibility_floor`; while that marker exists
+  or any tombstone remains, do not roll the server back before G2.2;
 - after upgrading again, rescan and apply only repairs provable from evidence written during rollback;
 - do not manually delete reconciliation or source-evidence tables to clear findings.
 

@@ -16,6 +16,14 @@ const NEXT_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b34';
 const TASK_ID = '019bf895-0e70-7881-83b3-471b8dbb1b35';
 const FINDING_ID = '019bf895-0e70-7881-83b3-471b8dbb1b36';
 const RUN_ID = '019bf895-0e70-7881-83b3-471b8dbb1b37';
+const FINDING_CURSOR = Buffer.from(
+  JSON.stringify({
+    id: FINDING_ID,
+    lastSeenMicros: '1784887200000000',
+    v: 1,
+  }),
+  'utf8',
+).toString('base64url');
 
 const ownerPrincipal: AdminPrincipal = {
   actorId: 'owner-user-id',
@@ -629,7 +637,7 @@ describe('owner admin endpoints', () => {
     });
 
     const findings = await app.request(
-      `/api/v1/admin/reconciliation/findings?limit=20&cursor=${FINDING_ID}`,
+      `/api/v1/admin/reconciliation/findings?limit=20&cursor=${FINDING_CURSOR}`,
       { headers: { Authorization: 'Bearer khs_test' } },
     );
     const runs = await app.request('/api/v1/admin/reconciliation/runs?limit=5', {
@@ -644,7 +652,7 @@ describe('owner admin endpoints', () => {
       items: [{ messageId: MESSAGE_ID, messageTombstoned: true }],
     });
     expect(reconciliation.listFindings).toHaveBeenCalledWith({
-      cursor: FINDING_ID,
+      cursor: FINDING_CURSOR,
       limit: 20,
     });
     expect(reconciliation.listRuns).toHaveBeenCalledWith({ limit: 5 });

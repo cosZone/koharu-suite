@@ -161,42 +161,31 @@ export class PostgresReconciliationPersistenceRepository
     limit: number;
   }): Promise<ReconciliationListPage<ReconciliationFindingSummary>> {
     assertListLimit(input.limit);
-    const cursor = input.cursor
-      ? await this.database
-          .select({
-            id: reconciliationFindings.id,
-            lastSeenAt: reconciliationFindings.lastSeenAt,
-          })
-          .from(reconciliationFindings)
-          .where(eq(reconciliationFindings.id, input.cursor))
-          .limit(1)
-          .then(([row]) => row)
-      : undefined;
-    if (input.cursor && !cursor) {
-      throw new RangeError('Invalid reconciliation cursor');
-    }
+    const cursor = input.cursor ? decodeFindingCursor(input.cursor) : undefined;
     const rows = await this.database
       .select({
         finding: reconciliationFindings,
+        lastSeenMicros: sql<string>`(extract(epoch from ${reconciliationFindings.lastSeenAt}) * 1000000)::bigint::text`,
         messageTombstoned: sql<boolean>`${messages.tombstonedAt} is not null`,
       })
       .from(reconciliationFindings)
       .leftJoin(messages, eq(reconciliationFindings.messageId, messages.id))
       .where(
         cursor
-          ? or(
-              lt(reconciliationFindings.lastSeenAt, cursor.lastSeenAt),
-              and(
-                eq(reconciliationFindings.lastSeenAt, cursor.lastSeenAt),
-                lt(reconciliationFindings.id, cursor.id),
-              ),
-            )
+          ? sql`(
+              ${reconciliationFindings.lastSeenAt},
+              ${reconciliationFindings.id}
+            ) < (
+              to_timestamp(${cursor.lastSeenMicros}::numeric / 1000000),
+              ${cursor.id}::uuid
+            )`
           : undefined,
       )
       .orderBy(desc(reconciliationFindings.lastSeenAt), desc(reconciliationFindings.id))
       .limit(input.limit + 1);
-    return page(
-      rows.map(({ finding, messageTombstoned }) => ({
+    const itemRows = rows.slice(0, input.limit);
+    return {
+      items: itemRows.map(({ finding, messageTombstoned }) => ({
         evidenceVersion: finding.evidenceVersion,
         firstSeenAt: finding.firstSeenAt.toISOString(),
         id: finding.id,
@@ -211,8 +200,14 @@ export class PostgresReconciliationPersistenceRepository
         state: finding.state,
         telegramChatId: finding.telegramChatId?.toString() ?? null,
       })),
-      input.limit,
-    );
+      nextCursor:
+        rows.length > input.limit && itemRows.length > 0
+          ? encodeFindingCursor({
+              id: itemRows.at(-1)?.finding.id ?? '',
+              lastSeenMicros: itemRows.at(-1)?.lastSeenMicros ?? '',
+            })
+          : null,
+    };
   }
 
   async listRuns(input: {
@@ -266,59 +261,66 @@ export class PostgresReconciliationPersistenceRepository
   async persistScan(
     input: PersistedReconciliationScanInput,
   ): Promise<PersistedReconciliationScanResult> {
-    const now = input.now ?? new Date();
-    const scope = reconciliationScope(input.telegramChannelIds);
-    const scopeStrings = scope.map(String);
-    assertInitiator(input.initiatorKind, input.initiatorId);
-
     return this.database.transaction(
       async (transaction) => {
         await transaction.execute(
           sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`,
         );
-        const [run] = await transaction
-          .insert(reconciliationRuns)
-          .values({
-            initiatorId: input.initiatorId,
-            initiatorKind: input.initiatorKind,
-            mode: 'persisted_scan',
-            report: {},
-            scope: scopeStrings,
-            startedAt: now,
-            status: 'running',
-          })
-          .returning({ id: reconciliationRuns.id });
-        if (!run) {
-          throw new Error('Failed to create persisted reconciliation run');
-        }
-
-        const report = await this.persistScanInTransaction(transaction, {
-          completedAt: now,
-          ...(input.initiatorId === undefined ? {} : { initiatorId: input.initiatorId }),
-          initiatorKind: input.initiatorKind,
-          mode: 'persisted-scan',
-          reportStartedAt: now,
-          runId: run.id,
-          scanAt: now,
-          scope,
-          scopeStrings,
-        });
-        const [completed] = await transaction
-          .update(reconciliationRuns)
-          .set({
-            completedAt: now,
-            report: reportJson(report),
-            status: report.status === 'partial' ? 'partial' : 'completed',
-          })
-          .where(and(eq(reconciliationRuns.id, run.id), eq(reconciliationRuns.status, 'running')))
-          .returning({ id: reconciliationRuns.id });
-        if (!completed) {
-          throw new Error('Persisted reconciliation run lost its running state');
-        }
-        return { report, runId: run.id };
+        return this.persistScanInLockedTransaction(transaction, input);
       },
       { isolationLevel: 'repeatable read' },
     );
+  }
+
+  async persistScanInLockedTransaction(
+    transaction: ReconciliationTransaction,
+    input: PersistedReconciliationScanInput,
+  ): Promise<PersistedReconciliationScanResult> {
+    const now = input.now ?? new Date();
+    const scope = reconciliationScope(input.telegramChannelIds);
+    const scopeStrings = scope.map(String);
+    assertInitiator(input.initiatorKind, input.initiatorId);
+
+    const [run] = await transaction
+      .insert(reconciliationRuns)
+      .values({
+        initiatorId: input.initiatorId,
+        initiatorKind: input.initiatorKind,
+        mode: 'persisted_scan',
+        report: {},
+        scope: scopeStrings,
+        startedAt: now,
+        status: 'running',
+      })
+      .returning({ id: reconciliationRuns.id });
+    if (!run) {
+      throw new Error('Failed to create persisted reconciliation run');
+    }
+
+    const report = await this.persistScanInTransaction(transaction, {
+      completedAt: now,
+      ...(input.initiatorId === undefined ? {} : { initiatorId: input.initiatorId }),
+      initiatorKind: input.initiatorKind,
+      mode: 'persisted-scan',
+      reportStartedAt: now,
+      runId: run.id,
+      scanAt: now,
+      scope,
+      scopeStrings,
+    });
+    const [completed] = await transaction
+      .update(reconciliationRuns)
+      .set({
+        completedAt: now,
+        report: reportJson(report),
+        status: report.status === 'partial' ? 'partial' : 'completed',
+      })
+      .where(and(eq(reconciliationRuns.id, run.id), eq(reconciliationRuns.status, 'running')))
+      .returning({ id: reconciliationRuns.id });
+    if (!completed) {
+      throw new Error('Persisted reconciliation run lost its running state');
+    }
+    return { report, runId: run.id };
   }
 
   async scanClaimedRun(
@@ -334,18 +336,10 @@ export class PostgresReconciliationPersistenceRepository
     try {
       return await this.database.transaction(
         async (transaction) => {
-          await transaction.execute(
-            sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`,
-          );
-          const [run] = await transaction
-            .select()
-            .from(reconciliationRuns)
-            .where(eq(reconciliationRuns.id, runId))
-            .limit(1)
-            .for('update');
           const [schedule] = await transaction
             .select({
               claimedRunId: reconciliationSchedule.claimedRunId,
+              intervalSeconds: reconciliationSchedule.intervalSeconds,
               leaseActive: sql<boolean>`${reconciliationSchedule.leaseExpiresAt}
                 > clock_timestamp()`,
               leaseOwner: reconciliationSchedule.leaseOwner,
@@ -353,7 +347,14 @@ export class PostgresReconciliationPersistenceRepository
             })
             .from(reconciliationSchedule)
             .where(eq(reconciliationSchedule.singletonKey, 'telegram'))
-            .limit(1);
+            .limit(1)
+            .for('update');
+          const [run] = await transaction
+            .select()
+            .from(reconciliationRuns)
+            .where(eq(reconciliationRuns.id, runId))
+            .limit(1)
+            .for('update');
           if (!run || schedule?.claimedRunId !== runId) {
             throw new Error('Scheduled reconciliation run is not the current claimed run');
           }
@@ -377,8 +378,11 @@ export class PostgresReconciliationPersistenceRepository
           if (!equalScope(run.scope, scopeStrings)) {
             throw new Error('Scheduled reconciliation run scope does not match the claimed scope');
           }
+          await transaction.execute(
+            sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`,
+          );
           startedAt = run.startedAt;
-          return this.persistScanInTransaction(transaction, {
+          const report = await this.persistScanInTransaction(transaction, {
             initiatorId: run.initiatorId,
             initiatorKind: 'worker',
             mode: 'scheduled-scan',
@@ -389,6 +393,18 @@ export class PostgresReconciliationPersistenceRepository
             scopeStrings,
             signal: input.signal,
           });
+          if (input.signal.aborted) {
+            throw new ClaimedScanInterruptedError();
+          }
+          await finishClaimedScheduledScan(transaction, {
+            leaseOwner: schedule.leaseOwner,
+            leaseToken: schedule.leaseToken,
+            intervalSeconds: schedule.intervalSeconds,
+            report,
+            runId,
+            signal: input.signal,
+          });
+          return report;
         },
         { isolationLevel: 'repeatable read' },
       );
@@ -653,14 +669,18 @@ async function persistFindingBatch(
       throw new Error('Reconciliation finding disappeared during stable-key upsert');
     }
     assertStableIdentity(existing, write);
-    if (write.evidenceVersion < existing.evidenceVersion) {
-      throw new RangeError('Incoming reconciliation evidence version cannot move backwards');
-    }
-    const reopen = write.evidenceVersion > existing.evidenceVersion;
+    const recurringResolved =
+      existing.state === 'resolved' && write.evidenceVersion <= existing.evidenceVersion;
+    const evidenceVersion = recurringResolved
+      ? incrementEvidenceVersion(existing.evidenceVersion)
+      : Math.max(existing.evidenceVersion, write.evidenceVersion);
+    const reopen =
+      existing.state === 'resolved' ||
+      (existing.state === 'ignored' && write.evidenceVersion > existing.evidenceVersion);
     const [updated] = await transaction
       .update(reconciliationFindings)
       .set({
-        evidenceVersion: write.evidenceVersion,
+        evidenceVersion,
         lastSeenAt: sql`clock_timestamp()`,
         ...(reopen ? { resolvedAt: null, state: 'open' as const } : {}),
         sanitizedDetails: write.sanitizedDetails,
@@ -689,7 +709,9 @@ async function persistFindingBatch(
         findingId: existing.id,
         initiatorId,
         initiatorKind,
-        reason: 'A newer evidence version reopened this finding',
+        reason: recurringResolved
+          ? 'Recurring scanner evidence reopened this finding'
+          : 'A newer evidence version reopened this finding',
         runId,
       });
     }
@@ -813,6 +835,107 @@ async function resolveAbsentExhaustiveFindings(
   }
 }
 
+async function finishClaimedScheduledScan(
+  transaction: ReconciliationTransaction,
+  input: {
+    intervalSeconds: number;
+    leaseOwner: string;
+    leaseToken: string;
+    report: ReconciliationReport;
+    runId: string;
+    signal: AbortSignal;
+  },
+): Promise<void> {
+  if (
+    input.report.completedAt === null ||
+    (input.report.status !== 'clean' && input.report.status !== 'partial')
+  ) {
+    throw new TypeError('Scheduled reconciliation scan did not produce a terminal scan report');
+  }
+  if (input.signal.aborted) {
+    throw new ClaimedScanInterruptedError();
+  }
+
+  const [run] = await transaction
+    .select({
+      completedAt: reconciliationRuns.completedAt,
+      initiatorId: reconciliationRuns.initiatorId,
+      initiatorKind: reconciliationRuns.initiatorKind,
+      mode: reconciliationRuns.mode,
+      status: reconciliationRuns.status,
+    })
+    .from(reconciliationRuns)
+    .where(eq(reconciliationRuns.id, input.runId))
+    .limit(1)
+    .for('update');
+  if (
+    !run ||
+    run.completedAt !== null ||
+    run.initiatorKind !== 'worker' ||
+    run.initiatorId !== `${input.leaseOwner}:${input.leaseToken}` ||
+    run.mode !== 'scheduled_scan' ||
+    run.status !== 'running'
+  ) {
+    throw new Error(
+      'Scheduled reconciliation run lost its token-bound running state before commit',
+    );
+  }
+  if (input.signal.aborted) {
+    throw new ClaimedScanInterruptedError();
+  }
+
+  const completedAt = new Date(input.report.completedAt);
+  const status = input.report.status === 'partial' ? 'partial' : 'completed';
+  const [completed] = await transaction
+    .update(reconciliationRuns)
+    .set({
+      completedAt,
+      report: reportJson(input.report),
+      status,
+    })
+    .where(
+      and(
+        eq(reconciliationRuns.id, input.runId),
+        eq(reconciliationRuns.initiatorKind, 'worker'),
+        eq(reconciliationRuns.initiatorId, `${input.leaseOwner}:${input.leaseToken}`),
+        eq(reconciliationRuns.mode, 'scheduled_scan'),
+        eq(reconciliationRuns.status, 'running'),
+      ),
+    )
+    .returning({ id: reconciliationRuns.id });
+  if (!completed) {
+    throw new Error(
+      'Scheduled reconciliation run lost its token-bound running state before commit',
+    );
+  }
+
+  const [released] = await transaction
+    .update(reconciliationSchedule)
+    .set({
+      claimedRunId: null,
+      lastRunId: input.runId,
+      lastStatus: status,
+      leaseExpiresAt: null,
+      leaseOwner: null,
+      leaseToken: null,
+      nextRunAt: sql`clock_timestamp()
+        + (${input.intervalSeconds} * interval '1 second')`,
+      updatedAt: sql`clock_timestamp()`,
+    })
+    .where(
+      and(
+        eq(reconciliationSchedule.singletonKey, 'telegram'),
+        eq(reconciliationSchedule.claimedRunId, input.runId),
+        eq(reconciliationSchedule.leaseOwner, input.leaseOwner),
+        eq(reconciliationSchedule.leaseToken, input.leaseToken),
+      ),
+    )
+    .returning({ singletonKey: reconciliationSchedule.singletonKey });
+  if (!released) {
+    throw new Error('Scheduled reconciliation run lost its active lease before commit');
+  }
+}
+
 async function validateFindingAssociations(
   transaction: ReconciliationTransaction,
   writes: readonly FindingWrite[],
@@ -890,6 +1013,13 @@ function assertPositiveEvidenceVersion(value: number): void {
   }
 }
 
+function incrementEvidenceVersion(value: number): number {
+  if (value >= 2_147_483_647) {
+    throw new RangeError('Reconciliation evidence version exceeds the PostgreSQL integer range');
+  }
+  return value + 1;
+}
+
 function assertInitiator(kind: ReconciliationInitiatorKind, id: string | undefined): void {
   if (kind !== 'local_operator' && (!id || id.trim().length === 0)) {
     throw new TypeError(`${kind} reconciliation initiator requires a non-empty ID`);
@@ -955,4 +1085,64 @@ function page<T extends { id: string }>(
     items,
     nextCursor: rows.length > limit ? (items.at(-1)?.id ?? null) : null,
   };
+}
+
+interface FindingCursorPayload {
+  id: string;
+  lastSeenMicros: string;
+  v: 1;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/u;
+const POSITIVE_INTEGER_PATTERN = /^[1-9]\d*$/u;
+const MAX_CURSOR_TIMESTAMP_MICROS = 253_402_300_799_999_999n;
+
+function encodeFindingCursor(input: Omit<FindingCursorPayload, 'v'>): string {
+  if (!UUID_PATTERN.test(input.id) || !isValidCursorTimestamp(input.lastSeenMicros)) {
+    throw new RangeError('Invalid reconciliation cursor');
+  }
+  const payload: FindingCursorPayload = {
+    id: input.id,
+    lastSeenMicros: input.lastSeenMicros,
+    v: 1,
+  };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function decodeFindingCursor(encoded: string): Omit<FindingCursorPayload, 'v'> {
+  if (encoded.length > 512 || !BASE64URL_PATTERN.test(encoded)) {
+    throw new RangeError('Invalid reconciliation cursor');
+  }
+  try {
+    const bytes = Buffer.from(encoded, 'base64url');
+    if (bytes.toString('base64url') !== encoded) {
+      throw new Error('Non-canonical base64url');
+    }
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const parsed = JSON.parse(json) as Partial<FindingCursorPayload>;
+    const canonical: FindingCursorPayload = {
+      id: parsed.id ?? '',
+      lastSeenMicros: parsed.lastSeenMicros ?? '',
+      v: 1,
+    };
+    if (
+      parsed.v !== 1 ||
+      !UUID_PATTERN.test(canonical.id) ||
+      !isValidCursorTimestamp(canonical.lastSeenMicros) ||
+      JSON.stringify(canonical) !== json
+    ) {
+      throw new Error('Invalid cursor payload');
+    }
+    return {
+      id: canonical.id,
+      lastSeenMicros: canonical.lastSeenMicros,
+    };
+  } catch {
+    throw new RangeError('Invalid reconciliation cursor');
+  }
+}
+
+function isValidCursorTimestamp(value: string): boolean {
+  return POSITIVE_INTEGER_PATTERN.test(value) && BigInt(value) <= MAX_CURSOR_TIMESTAMP_MICROS;
 }

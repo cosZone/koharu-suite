@@ -25,15 +25,6 @@ export interface ScheduledReconciliationLeaseRepository {
     leaseDurationMs: number,
     scope: readonly string[],
   ): Promise<ReconciliationScheduleLease | null>;
-  complete(
-    instanceId: string,
-    input: {
-      leaseToken: string;
-      report: ReconciliationReport;
-      runId: string;
-      status: 'completed' | 'partial';
-    },
-  ): Promise<ReconciliationScheduleState>;
   release(
     instanceId: string,
     input: {
@@ -144,20 +135,26 @@ export class ScheduledReconciliationRunner {
   ): Promise<void> {
     const scanAbort = new AbortController();
     const renewalAbort = new AbortController();
+    let scanSettled = false;
     this.activeScan = scanAbort;
     const scan = this.scanner.scanClaimedRun({
       runId: lease.claimedRunId,
       signal: scanAbort.signal,
       telegramChannelIds,
     });
-    const renewal = this.renewUntilSettled(lease, renewalAbort.signal, scanAbort);
+    const renewal = this.renewUntilSettled(
+      lease,
+      renewalAbort.signal,
+      scanAbort,
+      () => scanSettled,
+    );
+    void renewal.catch(() => undefined);
 
     try {
-      const report = await Promise.race([scan, renewal.then(() => neverReport())]);
-      if (this.stopping || scanAbort.signal.aborted) {
-        await this.releaseInterrupted(lease, telegramChannelIds);
-        return;
-      }
+      const report = await scan;
+      scanSettled = true;
+      renewalAbort.abort();
+      await renewal.catch(() => undefined);
       await this.finishFromReport(lease, report, telegramChannelIds);
     } catch (error) {
       if (!scanAbort.signal.aborted) {
@@ -189,22 +186,7 @@ export class ScheduledReconciliationRunner {
     telegramChannelIds: readonly string[],
   ): Promise<void> {
     assertScheduledScanReport(report, telegramChannelIds);
-    if (report.status === 'clean') {
-      await this.schedule.complete(this.options.instanceId, {
-        leaseToken: lease.leaseToken,
-        report,
-        runId: lease.claimedRunId,
-        status: 'completed',
-      });
-      return;
-    }
-    if (report.status === 'partial') {
-      await this.schedule.complete(this.options.instanceId, {
-        leaseToken: lease.leaseToken,
-        report,
-        runId: lease.claimedRunId,
-        status: 'partial',
-      });
+    if (report.status === 'clean' || report.status === 'partial') {
       return;
     }
     if (report.status === 'interrupted') {
@@ -232,6 +214,7 @@ export class ScheduledReconciliationRunner {
     lease: ReconciliationScheduleLease,
     signal: AbortSignal,
     scanAbort: AbortController,
+    scanIsSettled: () => boolean,
   ): Promise<void> {
     while (!signal.aborted) {
       await abortableDelay(this.options.renewalIntervalMs, signal);
@@ -245,7 +228,9 @@ export class ScheduledReconciliationRunner {
           this.options.leaseDurationMs,
         );
       } catch (error) {
-        scanAbort.abort(error);
+        if (!scanIsSettled()) {
+          scanAbort.abort(error);
+        }
         throw error;
       }
     }
@@ -380,8 +365,4 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
     };
     signal.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-function neverReport(): Promise<ReconciliationReport> {
-  return new Promise(() => {});
 }
