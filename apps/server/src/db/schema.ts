@@ -1089,6 +1089,7 @@ export const mediaCacheBlobs = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    unique('media_cache_blobs_verified_identity_unique').on(table.sha256, table.byteLength),
     index('media_cache_blobs_lru_idx')
       .on(table.lastAccessedAt, table.sha256)
       .where(sql`${table.state} = 'ready'`),
@@ -1139,6 +1140,163 @@ export const mediaCacheBlobs = pgTable(
   ],
 );
 
+export const mediaStorageBackends = pgTable(
+  'media_storage_backends',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    kind: varchar('kind', { length: 16 }).$type<'local' | 's3'>().notNull(),
+    label: varchar('label', { length: 128 }).notNull(),
+    enabled: boolean('enabled').notNull().default(true),
+    readable: boolean('readable').notNull().default(true),
+    writable: boolean('writable').notNull().default(true),
+    readPriority: integer('read_priority').notNull().default(100),
+    writePriority: integer('write_priority').notNull().default(100),
+    maxBytes: bigint('max_bytes', { mode: 'bigint' }).notNull(),
+    readyBytes: bigint('ready_bytes', { mode: 'bigint' }).notNull().default(sql`0`),
+    configFingerprint: char('config_fingerprint', { length: 64 }).notNull(),
+    lastReconciledAt: timestamp('last_reconciled_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('media_storage_backends_local_unique')
+      .on(table.kind)
+      .where(sql`${table.kind} = 'local'`),
+    index('media_storage_backends_read_idx')
+      .on(table.readPriority, table.id)
+      .where(sql`${table.enabled} and ${table.readable}`),
+    index('media_storage_backends_write_idx')
+      .on(table.writePriority, table.id)
+      .where(sql`${table.enabled} and ${table.writable}`),
+    check('media_storage_backends_id_check', sql`${table.id} ~ '^[a-z][a-z0-9_-]{0,63}$'`),
+    check('media_storage_backends_kind_check', sql`${table.kind} in ('local', 's3')`),
+    check(
+      'media_storage_backends_label_check',
+      sql`length(btrim(${table.label})) between 1 and 128`,
+    ),
+    check(
+      'media_storage_backends_capabilities_check',
+      sql`not ${table.enabled} or ${table.readable} or ${table.writable}`,
+    ),
+    check(
+      'media_storage_backends_priority_check',
+      sql`${table.readPriority} between 0 and 1000000
+        and ${table.writePriority} between 0 and 1000000`,
+    ),
+    check(
+      'media_storage_backends_ledger_check',
+      sql`${table.maxBytes} > 0
+        and ${table.readyBytes} >= 0`,
+    ),
+    check(
+      'media_storage_backends_fingerprint_check',
+      sql`${table.configFingerprint} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+export const mediaBlobLocations = pgTable(
+  'media_blob_locations',
+  {
+    backendId: varchar('backend_id', { length: 64 })
+      .notNull()
+      .references(() => mediaStorageBackends.id, { onDelete: 'restrict' }),
+    blobSha256: char('blob_sha256', { length: 64 })
+      .notNull()
+      .references(() => mediaCacheBlobs.sha256, { onDelete: 'restrict' }),
+    storageKey: text('storage_key').notNull(),
+    state: varchar('state', { length: 16 })
+      .$type<'copying' | 'corrupt' | 'deleting' | 'evicted' | 'missing' | 'ready'>()
+      .notNull(),
+    verifiedByteLength: bigint('verified_byte_length', { mode: 'bigint' }),
+    verifiedSha256: char('verified_sha256', { length: 64 }),
+    providerEtag: varchar('provider_etag', { length: 1024 }),
+    providerVersionId: varchar('provider_version_id', { length: 1024 }),
+    providerChecksumSha256: varchar('provider_checksum_sha256', { length: 128 }),
+    lastAccessedAt: timestamp('last_accessed_at', { withTimezone: true }).notNull().defaultNow(),
+    mutationOwner: text('mutation_owner'),
+    mutationToken: uuid('mutation_token'),
+    mutationExpiresAt: timestamp('mutation_expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    verifiedAt: timestamp('verified_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.backendId, table.blobSha256],
+      name: 'media_blob_locations_pk',
+    }),
+    foreignKey({
+      columns: [table.blobSha256, table.verifiedByteLength],
+      foreignColumns: [mediaCacheBlobs.sha256, mediaCacheBlobs.byteLength],
+      name: 'media_blob_locations_verified_identity_fk',
+    }).onDelete('restrict'),
+    index('media_blob_locations_blob_state_idx').on(table.blobSha256, table.state, table.backendId),
+    index('media_blob_locations_lru_idx')
+      .on(table.backendId, table.lastAccessedAt, table.blobSha256)
+      .where(sql`${table.state} = 'ready'`),
+    index('media_blob_locations_mutation_expiry_idx')
+      .on(table.mutationExpiresAt, table.backendId, table.blobSha256)
+      .where(sql`${table.state} in ('copying', 'deleting')`),
+    check(
+      'media_blob_locations_storage_key_check',
+      sql`${table.storageKey}
+        = 'blobs/' || substr(${table.blobSha256}, 1, 2)
+          || '/' || substr(${table.blobSha256}, 3, 2)
+          || '/' || ${table.blobSha256}`,
+    ),
+    check(
+      'media_blob_locations_state_check',
+      sql`${table.state} in ('copying', 'ready', 'deleting', 'evicted', 'missing', 'corrupt')`,
+    ),
+    check(
+      'media_blob_locations_verification_check',
+      sql`(
+          ${table.verifiedByteLength} is null
+          and ${table.verifiedSha256} is null
+          and ${table.verifiedAt} is null
+        ) or (
+          ${table.verifiedByteLength} > 0
+          and ${table.verifiedSha256} = ${table.blobSha256}
+          and ${table.verifiedAt} is not null
+        )`,
+    ),
+    check(
+      'media_blob_locations_ready_check',
+      sql`${table.state} <> 'ready'
+        or (
+          ${table.verifiedByteLength} is not null
+          and ${table.verifiedSha256} is not null
+          and ${table.verifiedAt} is not null
+        )`,
+    ),
+    check(
+      'media_blob_locations_provider_metadata_check',
+      sql`(${table.providerEtag} is null or length(${table.providerEtag}) between 1 and 1024)
+        and (${table.providerVersionId} is null or length(${table.providerVersionId}) between 1 and 1024)
+        and (
+          ${table.providerChecksumSha256} is null
+          or length(${table.providerChecksumSha256}) between 1 and 128
+        )`,
+    ),
+    check(
+      'media_blob_locations_mutation_lease_check',
+      sql`(
+          ${table.state} in ('copying', 'deleting')
+          and ${table.mutationOwner} is not null
+          and length(btrim(${table.mutationOwner})) between 1 and 255
+          and ${table.mutationToken} is not null
+          and ${table.mutationExpiresAt} is not null
+        ) or (
+          ${table.state} not in ('copying', 'deleting')
+          and ${table.mutationOwner} is null
+          and ${table.mutationToken} is null
+          and ${table.mutationExpiresAt} is null
+        )`,
+    ),
+  ],
+);
+
 export const mediaCacheObjects = pgTable(
   'media_cache_objects',
   {
@@ -1180,6 +1338,10 @@ export const mediaCacheObjects = pgTable(
     leaseOwner: text('lease_owner'),
     leaseToken: uuid('lease_token'),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    evictedPolicy: varchar('evicted_policy', { length: 32 })
+      .$type<'recache_on_access' | 'stay_evicted'>()
+      .notNull()
+      .default('recache_on_access'),
     lastAccessedAt: timestamp('last_accessed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1259,6 +1421,10 @@ export const mediaCacheObjects = pgTable(
     ),
     check('media_cache_objects_attempt_check', sql`${table.attemptCount} between 0 and 10`),
     check(
+      'media_cache_objects_evicted_policy_check',
+      sql`${table.evictedPolicy} in ('recache_on_access', 'stay_evicted')`,
+    ),
+    check(
       'media_cache_objects_lease_check',
       sql`(
           ${table.state} in ('reserved', 'downloading', 'staging')
@@ -1272,6 +1438,41 @@ export const mediaCacheObjects = pgTable(
           and ${table.leaseToken} is null
           and ${table.leaseExpiresAt} is null
         )`,
+    ),
+  ],
+);
+
+export const mediaCacheObjectProtections = pgTable(
+  'media_cache_object_protections',
+  {
+    objectId: uuid('object_id')
+      .primaryKey()
+      .references(() => mediaCacheObjects.id, { onDelete: 'cascade' }),
+    ownerKind: varchar('owner_kind', { length: 32 })
+      .$type<'local_operator' | 'owner_session'>()
+      .notNull(),
+    ownerId: text('owner_id').notNull(),
+    reason: text('reason').notNull(),
+    protectedAt: timestamp('protected_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('media_cache_object_protections_expiry_idx')
+      .on(table.expiresAt, table.objectId)
+      .where(sql`${table.expiresAt} is not null`),
+    check(
+      'media_cache_object_protections_owner_check',
+      sql`${table.ownerKind} in ('local_operator', 'owner_session')
+        and length(btrim(${table.ownerId})) between 1 and 255`,
+    ),
+    check(
+      'media_cache_object_protections_reason_check',
+      sql`length(btrim(${table.reason})) between 1 and 500`,
+    ),
+    check(
+      'media_cache_object_protections_expiry_check',
+      sql`${table.expiresAt} is null or ${table.expiresAt} > ${table.protectedAt}`,
     ),
   ],
 );
@@ -1399,7 +1600,19 @@ export const mediaCacheActions = pgTable(
       onDelete: 'restrict',
     }),
     actionKind: varchar('action_kind', { length: 32 })
-      .$type<'evict' | 'reconcile' | 'recover_orphan' | 'restore_missing' | 'retry'>()
+      .$type<
+        | 'evict'
+        | 'migrate'
+        | 'protect'
+        | 'prune'
+        | 'reconcile'
+        | 'recover_orphan'
+        | 'restore'
+        | 'restore_missing'
+        | 'retry'
+        | 'set_evicted_policy'
+        | 'unprotect'
+      >()
       .notNull(),
     initiatorKind: varchar('initiator_kind', { length: 32 })
       .$type<'local_operator' | 'owner_session' | 'worker'>()
@@ -1419,6 +1632,12 @@ export const mediaCacheActions = pgTable(
       sql`${table.actionKind} in (
         'retry',
         'evict',
+        'migrate',
+        'restore',
+        'protect',
+        'unprotect',
+        'prune',
+        'set_evicted_policy',
         'reconcile',
         'recover_orphan',
         'restore_missing'

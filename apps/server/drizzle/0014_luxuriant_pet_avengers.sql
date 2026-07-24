@@ -1,0 +1,1 @@
+ALTER TABLE "media_blob_locations" ADD CONSTRAINT "media_blob_locations_verified_identity_fk" FOREIGN KEY ("blob_sha256","verified_byte_length") REFERENCES "public"."media_cache_blobs"("sha256","byte_length") ON DELETE restrict ON UPDATE no action;
