@@ -232,16 +232,18 @@ describe('database migrations', () => {
 
     await expect(inbox.bindBot(123_456n)).resolves.toBeNull();
     await expect(
-      inbox.checkpointBatch(123_456n, [
+      inbox.checkpointBatch(123_456n, null, [
         channelPostFixture({ updateId: 2_001 }),
         channelPostFixture({ channelId: -1_001_234_567_899, updateId: 2_002 }),
         channelPostFixture({ channelId: -1_001_234_567_891, updateId: 2_003 }),
       ]),
     ).resolves.toBe(2_004n);
-    await inbox.checkpointBatch(123_456n, [
-      channelPostFixture({ updateId: 2_001 }),
-      channelPostFixture({ channelId: -1_001_234_567_891, updateId: 2_003 }),
-    ]);
+    await expect(
+      inbox.checkpointBatch(123_456n, 2_004n, [
+        channelPostFixture({ updateId: 2_001 }),
+        channelPostFixture({ channelId: -1_001_234_567_891, updateId: 2_003 }),
+      ]),
+    ).rejects.toThrow('older than the requested offset');
 
     const tasks = await connection.db
       .select({
@@ -284,7 +286,7 @@ describe('database migrations', () => {
     }
     const repository = new PostgresMessageRepository(database);
     const archived = await repository.ingest(archivedPost);
-    await inbox.checkpointBatch(123_456n, [channelPostFixture({ updateId: 3_001 })]);
+    await inbox.checkpointBatch(123_456n, null, [channelPostFixture({ updateId: 3_001 })]);
 
     const [task] = await database.select({ id: telegramIngestTasks.id }).from(telegramIngestTasks);
     if (!task) {
@@ -349,7 +351,9 @@ describe('database migrations', () => {
         configuredChannels: 1,
       },
     });
-    await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 43, updateId: 3_002 })]);
+    await inbox.checkpointBatch(123_456n, 3_002n, [
+      channelPostFixture({ messageId: 43, updateId: 3_002 }),
+    ]);
     const [disabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
     expect(disabledTaskCount?.value).toBe(1);
     await expect(repository.getMessage(archived.messageId)).resolves.toMatchObject({
@@ -363,7 +367,9 @@ describe('database migrations', () => {
         configuredChannels: 1,
       },
     });
-    await inbox.checkpointBatch(123_456n, [channelPostFixture({ messageId: 44, updateId: 3_003 })]);
+    await inbox.checkpointBatch(123_456n, 3_003n, [
+      channelPostFixture({ messageId: 44, updateId: 3_003 }),
+    ]);
     const [enabledTaskCount] = await database.select({ value: count() }).from(telegramIngestTasks);
     expect(enabledTaskCount?.value).toBe(2);
 
@@ -537,7 +543,7 @@ describe('database migrations', () => {
     ]);
     const inbox = new TelegramInboxRepository(connection.db);
     await inbox.bindBot(123_456n);
-    await inbox.checkpointBatch(123_456n, [
+    await inbox.checkpointBatch(123_456n, null, [
       channelPostFixture({ updateId: 4_001 }),
       channelPostFixture({ messageId: 43, updateId: 4_002 }),
       channelPostFixture({ channelId: Number(secondChannelId), updateId: 4_003 }),
@@ -624,7 +630,7 @@ describe('database migrations', () => {
     ]);
     const inbox = new TelegramInboxRepository(connection.db);
     await inbox.bindBot(123_456n);
-    await inbox.checkpointBatch(123_456n, [
+    await inbox.checkpointBatch(123_456n, null, [
       channelPostFixture({ updateId: 5_001 }),
       channelPostFixture({ messageId: 43, updateId: 5_002 }),
       channelPostFixture({ channelId: Number(secondChannelId), updateId: 5_003 }),

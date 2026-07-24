@@ -171,13 +171,29 @@ Then check the Owner Desk, channel list, and one new message. Use only an explic
 ## Rollback
 
 1. Stop the new server and worker with `docker compose stop -t 30 worker server`.
-2. Restore the prior tag or digest in `KOHARU_IMAGE`.
-3. Start the prior worker, verify `kodama health worker`, and confirm there is one lock owner.
-4. Start the prior server and check `/readyz`, the public API, and the Owner Desk.
+2. Before changing the image, check whether G2.2 tombstones have been used:
 
-The heartbeat migration is forward-compatible, and an ordinary application rollback must not execute a
-destructive down migration. If release notes identify an incompatible schema, stop all application containers
-and restore the pre-upgrade backup:
+   ```sql
+   select key, value
+   from app_metadata
+   where key = 'public_reader_compatibility_floor';
+
+   select count(*) as tombstoned_messages
+   from messages
+   where tombstoned_at is not null;
+   ```
+
+3. If the marker exists or the count is non-zero, do not start a pre-G2.2 server. Its public reader does not
+   understand `tombstoned_at` and would republish owner-hidden messages. Prefer a forward fix, or restore the
+   pre-upgrade backup only after accepting the loss of post-upgrade data.
+4. Restore the prior tag or digest in `KOHARU_IMAGE` only after the compatibility check passes.
+5. Start the prior worker, verify `kodama health worker`, and confirm there is one lock owner.
+6. Start the prior server and check `/readyz`, the public API, and the Owner Desk.
+
+An additive migration does not guarantee behavioral compatibility with an old reader, and an ordinary
+application rollback must still not execute a destructive down migration. If the tombstone floor above or the
+release notes identify an incompatible schema, stop all application containers and restore the pre-upgrade
+backup:
 
 ```bash
 docker compose stop worker server

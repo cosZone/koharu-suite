@@ -164,12 +164,28 @@ curl --fail https://blog-admin.example.com/readyz
 ## 回滚
 
 1. 停止新 server 与 worker：`docker compose stop -t 30 worker server`。
-2. 把 `KOHARU_IMAGE` 恢复为升级前记录的 tag 或 digest。
-3. 启动旧 worker，确认 `kodama health worker` 成功且只有一个 lock owner。
-4. 启动旧 server，检查 `/readyz`、公开 API 与 Owner Desk。
+2. 在切换镜像前检查是否已经使用 G2.2 tombstone：
 
-heartbeat migration 是向前兼容的，普通应用回滚不执行 destructive down migration。如果 release
-notes 标注新旧 schema 不兼容，停止全部应用容器后恢复升级前备份：
+   ```sql
+   select key, value
+   from app_metadata
+   where key = 'public_reader_compatibility_floor';
+
+   select count(*) as tombstoned_messages
+   from messages
+   where tombstoned_at is not null;
+   ```
+
+3. 若 marker 存在或计数非零，不要启动 G2.2 之前的 server。旧 public reader 不认识
+   `tombstoned_at`，会把 owner 已隐藏的消息重新公开；应优先前向修复，或在确认会丢弃升级后数据后
+   恢复升级前备份。
+4. 只有通过兼容性检查后，才把 `KOHARU_IMAGE` 恢复为升级前记录的 tag 或 digest。
+5. 启动旧 worker，确认 `kodama health worker` 成功且只有一个 lock owner。
+6. 启动旧 server，检查 `/readyz`、公开 API 与 Owner Desk。
+
+additive migration 不等于旧 reader 的行为兼容；普通应用回滚仍不执行 destructive down migration。
+如果上述 tombstone floor 或 release notes 标注新旧 schema 不兼容，停止全部应用容器后恢复升级前
+备份：
 
 ```bash
 docker compose stop worker server

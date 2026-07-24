@@ -7,7 +7,15 @@ import type {
   SourceWriteDecision,
   SourceWriteResult,
 } from '../messages/types.js';
-import type { ImportConfiguredChannel, ImportTransaction } from './import-repository.js';
+import {
+  type TelegramDesktopCompleteRange,
+  validateTelegramDesktopCompleteRanges,
+} from './coverage.js';
+import type {
+  ImportConfiguredChannel,
+  ImportRunObservationLink,
+  ImportTransaction,
+} from './import-repository.js';
 import {
   addTelegramDesktopImportIssue,
   createTelegramDesktopImportReport,
@@ -58,6 +66,11 @@ interface TelegramDesktopImportRepository {
   assertApplyLock(): Promise<void>;
   configuredChannels(channelIds: bigint[]): Promise<ImportConfiguredChannel[]>;
   createRun(report: TelegramDesktopImportReport): Promise<string>;
+  linkRunObservation(transaction: ImportTransaction, link: ImportRunObservationLink): Promise<void>;
+  persistRunCoverages(
+    runId: string,
+    ranges: readonly TelegramDesktopCompleteRange[],
+  ): Promise<void>;
   transaction<T>(callback: (transaction: ImportTransaction) => Promise<T>): Promise<T>;
   updateRun(
     id: string,
@@ -138,6 +151,7 @@ function recordDecision(
 export interface TelegramDesktopImportOptions {
   apply: boolean;
   channelIds: bigint[];
+  completeRanges?: TelegramDesktopCompleteRange[];
   inputPath: string;
   signal?: AbortSignal;
 }
@@ -159,6 +173,11 @@ export class TelegramDesktopImportService {
   ) {}
 
   async run(options: TelegramDesktopImportOptions): Promise<TelegramDesktopImportReport> {
+    const completeRanges = validateTelegramDesktopCompleteRanges(
+      options.completeRanges ?? [],
+      options.channelIds,
+      options.apply,
+    );
     assertImportNotAborted(options.signal);
     const initialFileSha256 = await sha256RegularFile(options.inputPath);
     assertImportNotAborted(options.signal);
@@ -228,6 +247,9 @@ export class TelegramDesktopImportService {
       if (runId) {
         await this.repository.assertApplyLock();
         assertImportNotAborted(options.signal);
+        if (report.status === 'clean') {
+          await this.repository.persistRunCoverages(runId, completeRanges);
+        }
         await this.repository.updateRun(
           runId,
           report,
@@ -367,13 +389,23 @@ export class TelegramDesktopImportService {
       for (const candidate of candidates) {
         assertImportNotAborted(signal);
         try {
-          const result = await transaction.transaction((savepoint) =>
-            this.writer.ingestSnapshotInTransaction(
+          const result = await transaction.transaction(async (savepoint) => {
+            const written = await this.writer.ingestSnapshotInTransaction(
               savepoint,
               candidate.snapshot,
               candidate.observation,
-            ),
-          );
+            );
+            if (!report.runId) {
+              throw new Error('Telegram Desktop apply run ID is unavailable');
+            }
+            await this.repository.linkRunObservation(savepoint, {
+              observationId: written.observationId,
+              replayed: written.replayed,
+              resolutionAtRun: written.resolution,
+              runId: report.runId,
+            });
+            return written;
+          });
           committed.push({ candidate, decision: result, kind: 'written' });
         } catch (error) {
           if (!(error instanceof RecoverableTelegramDesktopItemWriteError)) {

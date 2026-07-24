@@ -8,6 +8,13 @@ import { BetterAuthRuntime } from './auth/runtime-auth.js';
 import type { AuthConfig, PublicApiConfig, TelegramConfig } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
 import { PostgresMessageRepository } from './messages/repository.js';
+import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
+import { DeterministicRepairService } from './reconciliation/repair.js';
+import { PostgresDeterministicRepairRepository } from './reconciliation/repair-repository.js';
+import { PostgresReconciliationScheduleRepository } from './reconciliation/schedule-repository.js';
+import { ScheduledReconciliationRunner } from './reconciliation/scheduled-runner.js';
+import { MessageTombstoneService } from './reconciliation/tombstone.js';
+import { PostgresMessageTombstoneRepository } from './reconciliation/tombstone-repository.js';
 import { closeServer, startServer } from './server.js';
 import { GrammyTelegramApi } from './telegram/api.js';
 import { TelegramChannelService } from './telegram/channel-service.js';
@@ -63,15 +70,30 @@ interface RuntimeHeartbeat {
   markStopping(instanceId: string): Promise<boolean>;
 }
 
+interface RuntimeReconciliationSchedule {
+  initialize(input?: { intervalSeconds?: number }): Promise<unknown>;
+}
+
+interface RuntimeReconciliationRunner {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
 export interface WorkerRuntimeDependencies {
   closeMainDatabase(): Promise<void>;
   heartbeat: RuntimeHeartbeat;
   inbox: RuntimeInbox;
   poller: RuntimePoller;
+  reconciliationRunner: RuntimeReconciliationRunner;
+  reconciliationSchedule: RuntimeReconciliationSchedule;
   workers: RuntimeWorkerPool;
 }
 
 const defaultAdminAssetsRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../admin/dist');
+const RECONCILIATION_INTERVAL_SECONDS = 3_600;
+const RECONCILIATION_LEASE_DURATION_MS = 120_000;
+const RECONCILIATION_POLL_INTERVAL_MS = 30_000;
+const RECONCILIATION_RENEWAL_INTERVAL_MS = 40_000;
 
 function deferred(): {
   promise: Promise<void>;
@@ -165,9 +187,16 @@ export class WorkerRuntime implements StoppableRuntime {
       if (this.stopping) {
         throw new Error('Worker stopped during startup');
       }
+      await this.dependencies.reconciliationSchedule.initialize({
+        intervalSeconds: RECONCILIATION_INTERVAL_SECONDS,
+      });
+      if (this.stopping) {
+        throw new Error('Worker stopped during startup');
+      }
+      const reconciliationLifetime = this.dependencies.reconciliationRunner.start();
       const pollerLifetime = this.dependencies.poller.start();
       const workerLifetime = this.dependencies.workers.start();
-      this.monitorLifetime(pollerLifetime, workerLifetime);
+      this.monitorLifetime(pollerLifetime, workerLifetime, reconciliationLifetime);
       await this.dependencies.heartbeat.markRunning(this.instanceId);
       this.scheduleHeartbeat();
     } catch (error) {
@@ -181,8 +210,12 @@ export class WorkerRuntime implements StoppableRuntime {
     }
   }
 
-  private monitorLifetime(pollerLifetime: Promise<void>, workerLifetime: Promise<void>): void {
-    void Promise.race([pollerLifetime, workerLifetime]).then(
+  private monitorLifetime(
+    pollerLifetime: Promise<void>,
+    workerLifetime: Promise<void>,
+    reconciliationLifetime: Promise<void>,
+  ): void {
+    void Promise.race([pollerLifetime, workerLifetime, reconciliationLifetime]).then(
       () => {
         if (!this.stopping) {
           const error = new Error('Telegram worker runtime stopped unexpectedly');
@@ -232,6 +265,7 @@ export class WorkerRuntime implements StoppableRuntime {
 
     try {
       await runAll([
+        () => this.dependencies.reconciliationRunner.stop(),
         () => this.dependencies.poller.stop(),
         () => this.dependencies.workers.stop(),
         () => this.dependencies.inbox.close(),
@@ -272,6 +306,13 @@ export function startServerRuntime(config: ServerRuntimeConfig): ServerRuntime {
     messages: repository,
     operations: new PostgresAdminOperations(mainConnection.db),
     publicApi: config.publicApi,
+    reconciliation: new PostgresReconciliationPersistenceRepository(mainConnection.db),
+    repair: new DeterministicRepairService(
+      new PostgresDeterministicRepairRepository(mainConnection.db),
+    ),
+    tombstone: new MessageTombstoneService(
+      new PostgresMessageTombstoneRepository(mainConnection.db),
+    ),
     readiness: async () => {
       await mainConnection.db.execute(sql`select 1`);
     },
@@ -288,6 +329,18 @@ export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime 
   const mainConnection = createDatabaseConnection(config.databaseUrl);
   const repository = new PostgresMessageRepository(mainConnection.db);
   const heartbeat = new PostgresWorkerRuntimeRepository(mainConnection.db);
+  const reconciliationSchedule = new PostgresReconciliationScheduleRepository(mainConnection.db);
+  const reconciliationRunner = new ScheduledReconciliationRunner(
+    reconciliationSchedule,
+    new PostgresReconciliationPersistenceRepository(mainConnection.db),
+    {
+      getTelegramChannelIds: () => reconciliationSchedule.listConfiguredChannelScope(),
+      instanceId: config.instanceId,
+      leaseDurationMs: RECONCILIATION_LEASE_DURATION_MS,
+      pollIntervalMs: RECONCILIATION_POLL_INTERVAL_MS,
+      renewalIntervalMs: RECONCILIATION_RENEWAL_INTERVAL_MS,
+    },
+  );
   const api = new GrammyTelegramApi(config.botToken, {
     ...(config.apiRoot ? { apiRoot: config.apiRoot } : {}),
   });
@@ -306,6 +359,8 @@ export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime 
     heartbeat,
     inbox,
     poller,
+    reconciliationRunner,
+    reconciliationSchedule,
     workers,
   });
 }

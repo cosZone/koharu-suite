@@ -50,6 +50,34 @@
       "when": 1784849572392,
       "tag": "0006_unusual_wolfsbane",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1784855037347,
+      "tag": "0007_fat_human_torch",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1784864144967,
+      "tag": "0008_mean_dexter_bennett",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1784864641745,
+      "tag": "0009_slimy_silver_fox",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1784865190893,
+      "tag": "0010_even_shocker",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,2 @@
+ALTER TABLE "messages" ADD COLUMN "tombstoned_at" timestamp with time zone;--> statement-breakpoint
+CREATE INDEX "messages_public_channel_published_idx" ON "messages" USING btree ("channel_id","tombstoned_at","published_at","id");

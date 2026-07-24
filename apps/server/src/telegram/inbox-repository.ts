@@ -6,6 +6,7 @@ import {
   telegramChannelAllowlist,
   telegramIngestTasks,
   telegramPollingState,
+  telegramPollReceipts,
 } from '../db/schema.js';
 import { TELEGRAM_BOT_BIND_ADVISORY_LOCK, TELEGRAM_POLLER_ADVISORY_LOCK } from './constants.js';
 
@@ -58,7 +59,11 @@ export class TelegramInboxRepository {
     });
   }
 
-  async checkpointBatch(botId: bigint, updates: Update[]): Promise<bigint | null> {
+  async checkpointBatch(
+    botId: bigint,
+    requestedOffset: bigint | null,
+    updates: Update[],
+  ): Promise<bigint | null> {
     return this.database.transaction(async (transaction) => {
       const [state] = await transaction
         .select({
@@ -73,8 +78,18 @@ export class TelegramInboxRepository {
       if (!state || state.botId !== botId) {
         throw new Error('Telegram polling state does not match the active Bot');
       }
+      if (state.nextUpdateId !== requestedOffset) {
+        throw new Error('Telegram poll request offset does not match the durable cursor');
+      }
       if (updates.length === 0) {
         return state.nextUpdateId;
+      }
+
+      const updateIds = updates.map((update) => update.update_id);
+      const returnedFirstUpdateId = BigInt(Math.min(...updateIds));
+      const returnedLastUpdateId = BigInt(Math.max(...updateIds));
+      if (requestedOffset !== null && returnedFirstUpdateId < requestedOffset) {
+        throw new Error('Telegram returned an update older than the requested offset');
       }
 
       const candidates = updates.flatMap((update) => {
@@ -120,11 +135,26 @@ export class TelegramInboxRepository {
           .onConflictDoNothing({ target: telegramIngestTasks.telegramUpdateId });
       }
 
-      const batchNext = BigInt(Math.max(...updates.map((update) => update.update_id))) + 1n;
+      const batchNext = returnedLastUpdateId + 1n;
       const nextUpdateId =
         state.nextUpdateId === null || batchNext > state.nextUpdateId
           ? batchNext
           : state.nextUpdateId;
+      await transaction
+        .insert(telegramPollReceipts)
+        .values({
+          acceptedCount: accepted.length,
+          botId,
+          checkpointOffset: nextUpdateId,
+          ignoredCount: updates.length - accepted.length,
+          requestedOffset,
+          returnedCount: updates.length,
+          returnedFirstUpdateId,
+          returnedLastUpdateId,
+        })
+        .onConflictDoNothing({
+          target: [telegramPollReceipts.botId, telegramPollReceipts.checkpointOffset],
+        });
       await transaction
         .update(telegramPollingState)
         .set({ nextUpdateId, updatedAt: new Date() })
@@ -207,9 +237,13 @@ export class ReservedTelegramInboxRepository {
     return this.delegate.bindBot(botId);
   }
 
-  async checkpointBatch(botId: bigint, updates: Update[]): Promise<bigint | null> {
+  async checkpointBatch(
+    botId: bigint,
+    requestedOffset: bigint | null,
+    updates: Update[],
+  ): Promise<bigint | null> {
     await this.assertPollerLock();
-    return this.delegate.checkpointBatch(botId, updates);
+    return this.delegate.checkpointBatch(botId, requestedOffset, updates);
   }
 
   async close(): Promise<void> {

@@ -12,17 +12,19 @@ Telegram 多频道归档、动态内容、统一管理与静态发布能力。
 - 内容与媒体可导出、可恢复，移除后端不影响既有静态站点；
 - 以 PostgreSQL 18、Astro 6 Live Content Collections 和开放 JSON API 为基础。
 
-当前 [G1.5 #10](https://github.com/cosZone/koharu-suite/issues/10) 在可靠的多频道采集之上补齐了基础
-运维能力：
+当前 [G2.2 #19](https://github.com/cosZone/koharu-suite/issues/19) 在多频道采集与 Desktop 历史导入之上
+补齐了可审计的对账与恢复能力：
 
-- `apps/server`：Hono API、scoped service token、blocked task 恢复、频道启停、版本化 HTML renderer、
-  cursor 分页、公开 API 防护与 `kodama doctor`；
-- `apps/admin`：React + Vite Owner Desk，支持登录、归档状态、消息浏览、blocked retry/skip、频道启停、
-  rerender、按需 raw reveal 与 TOTP；
+- `apps/server`：Hono API、持久化/定时 reconciliation、Desktop coverage 与精确 lineage、确定性 repair、
+  Owner tombstone、scoped service token 和 `kodama doctor`；
+- `apps/admin`：React + Vite Owner Desk，支持归档运维、finding 分页、Desktop 恢复指引、显式修复与
+  hide/unhide；
 - PostgreSQL 18、Testcontainers、Docker Compose 与 CI。
 
 完整路线图见 [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1)。
 生产部署、升级、备份和回滚流程见[部署手册](./docs/deployment/README.md)。
+Telegram gap、Desktop 辅助恢复、显式修复与 tombstone 规则见
+[对账与恢复手册](./docs/reconciliation/README.md)。
 
 ## 本地开发
 
@@ -165,6 +167,13 @@ pnpm exec kodama import telegram-desktop \
   --input /path/to/result.json \
   --channel=-1001234567890 \
   --channel=-1009876543210 \
+  --apply
+
+# 只有确认 export 对有界范围完整时才声明；可重复
+pnpm exec kodama import telegram-desktop \
+  --input /path/to/result.json \
+  --channel=-1001234567890 \
+  --complete-range=-1001234567890:1:500 \
   --apply
 
 # 自动化可读取 versioned JSON report

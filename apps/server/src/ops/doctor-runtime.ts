@@ -27,7 +27,15 @@ interface SchemaTableRow extends Record<string, unknown> {
   tableName: string;
 }
 
+interface SchemaConstraintRow extends Record<string, unknown> {
+  constraintName: string;
+  schemaName: string;
+}
+
 function expectedSchemaObject(value: string): string {
+  if (value.startsWith('constraint:')) {
+    return value;
+  }
   return value.includes('.') ? value : `public.${value}`;
 }
 
@@ -67,7 +75,7 @@ export class PostgresDoctorDiagnostics implements DoctorDatabaseDiagnostics {
   }
 
   async listMissingSchemaObjects(expectedObjects: readonly string[]): Promise<string[]> {
-    const [tables, columns] = await Promise.all([
+    const [tables, columns, constraints] = await Promise.all([
       this.database.execute<SchemaTableRow>(sql`
         select
           table_schema as "schemaName",
@@ -83,6 +91,13 @@ export class PostgresDoctorDiagnostics implements DoctorDatabaseDiagnostics {
         from information_schema.columns
         where table_schema in ('public', 'drizzle')
       `),
+      this.database.execute<SchemaConstraintRow>(sql`
+        select
+          constraint_schema as "schemaName",
+          constraint_name as "constraintName"
+        from information_schema.table_constraints
+        where constraint_schema in ('public', 'drizzle')
+      `),
     ]);
     const found = new Set<string>();
     for (const table of tables) {
@@ -93,6 +108,9 @@ export class PostgresDoctorDiagnostics implements DoctorDatabaseDiagnostics {
       if (column.schemaName === 'public') {
         found.add(`${column.tableName}.${column.columnName}`);
       }
+    }
+    for (const constraint of constraints) {
+      found.add(`constraint:${constraint.schemaName}.${constraint.constraintName}`);
     }
 
     return expectedObjects.filter((object) => !found.has(expectedSchemaObject(object)));

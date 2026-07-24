@@ -10,6 +10,7 @@ import { PostgresAdminRepository } from '../../src/admin/repository.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  importRunObservations,
   importRuns,
   messageMedia,
   messageRevisions,
@@ -762,16 +763,34 @@ describe('source-neutral message writer', () => {
       }
     };
     const rowCounts = async () => {
-      const [runCount, channelCount, messageCount, revisionCount, observationCount] =
-        await Promise.all(
-          [importRuns, telegramChannels, messages, messageRevisions, messageSourceObservations].map(
-            async (table) => {
-              const [row] = await database.select({ value: count() }).from(table);
-              return row?.value ?? 0;
-            },
-          ),
-        );
-      return { channelCount, messageCount, observationCount, revisionCount, runCount };
+      const [
+        runCount,
+        runObservationCount,
+        channelCount,
+        messageCount,
+        revisionCount,
+        observationCount,
+      ] = await Promise.all(
+        [
+          importRuns,
+          importRunObservations,
+          telegramChannels,
+          messages,
+          messageRevisions,
+          messageSourceObservations,
+        ].map(async (table) => {
+          const [row] = await database.select({ value: count() }).from(table);
+          return row?.value ?? 0;
+        }),
+      );
+      return {
+        channelCount,
+        messageCount,
+        observationCount,
+        revisionCount,
+        runCount,
+        runObservationCount,
+      };
     };
     const expectSanitized = (value: unknown, inputPath: string) => {
       const serialized = JSON.stringify(value);
@@ -801,6 +820,7 @@ describe('source-neutral message writer', () => {
         observationCount: 0,
         revisionCount: 0,
         runCount: 0,
+        runObservationCount: 0,
       });
       expectSanitized(preview, cleanInput);
 
@@ -826,6 +846,7 @@ describe('source-neutral message writer', () => {
         observationCount: 1,
         revisionCount: 1,
         runCount: 1,
+        runObservationCount: 1,
       });
 
       const [appliedRun] = await database
@@ -833,6 +854,7 @@ describe('source-neutral message writer', () => {
         .from(importRuns)
         .where(eq(importRuns.id, applied.runId as string));
       const [appliedObservation] = await database.select().from(messageSourceObservations);
+      const [appliedLineage] = await database.select().from(importRunObservations);
       expect(appliedRun).toMatchObject({
         completedAt: expect.any(Date),
         id: applied.runId,
@@ -844,6 +866,40 @@ describe('source-neutral message writer', () => {
         resolution: 'created',
         sourceKind: 'telegram_desktop_json',
       });
+      expect(appliedLineage).toMatchObject({
+        observationId: appliedObservation?.id,
+        replayed: false,
+        resolutionAtRun: 'created',
+        runId: applied.runId,
+        sourceKind: 'telegram_desktop_json',
+      });
+      if (!appliedObservation || !applied.runId) {
+        throw new Error('Applied import lineage fixture was not created');
+      }
+      const retryRepository = new PostgresTelegramDesktopImportRepository(databaseUrl, database);
+      try {
+        await database.transaction(async (transaction) => {
+          await retryRepository.linkRunObservation(transaction, {
+            observationId: appliedObservation.id,
+            replayed: true,
+            resolutionAtRun: 'created',
+            runId: applied.runId as string,
+          });
+        });
+      } finally {
+        await retryRepository.close();
+      }
+      const retriedLineage = await database
+        .select()
+        .from(importRunObservations)
+        .where(eq(importRunObservations.runId, applied.runId));
+      expect(retriedLineage).toEqual([
+        expect.objectContaining({
+          observationId: appliedObservation.id,
+          replayed: false,
+          runId: applied.runId,
+        }),
+      ]);
       expectSanitized({ report: applied, storedReport: appliedRun?.report }, cleanInput);
 
       const replay = await runImport({ apply: true, inputPath: cleanInput });
@@ -864,6 +920,7 @@ describe('source-neutral message writer', () => {
         observationCount: 1,
         revisionCount: 1,
         runCount: 2,
+        runObservationCount: 2,
       });
       const [replayRun] = await database
         .select()
@@ -873,6 +930,18 @@ describe('source-neutral message writer', () => {
         completedAt: expect.any(Date),
         status: 'completed',
       });
+      const replayLineage = await database
+        .select()
+        .from(importRunObservations)
+        .where(eq(importRunObservations.runId, replay.runId as string));
+      expect(replayLineage).toEqual([
+        expect.objectContaining({
+          observationId: appliedObservation?.id,
+          replayed: true,
+          resolutionAtRun: 'created',
+          runId: replay.runId,
+        }),
+      ]);
       expectSanitized({ report: replay, storedReport: replayRun?.report }, cleanInput);
 
       const partial = await runImport({ apply: true, inputPath: conflictInput });
@@ -898,6 +967,7 @@ describe('source-neutral message writer', () => {
         observationCount: 2,
         revisionCount: 1,
         runCount: 3,
+        runObservationCount: 3,
       });
       const [partialRun] = await database
         .select()
@@ -916,6 +986,18 @@ describe('source-neutral message writer', () => {
         rawJson: { text: conflictBody },
         revisionId: null,
       });
+      const conflictLineage = await database
+        .select()
+        .from(importRunObservations)
+        .where(eq(importRunObservations.runId, partial.runId as string));
+      expect(conflictLineage).toEqual([
+        expect.objectContaining({
+          observationId: conflictObservation?.id,
+          replayed: false,
+          resolutionAtRun: 'conflict',
+          runId: partial.runId,
+        }),
+      ]);
       expectSanitized({ report: partial, storedReport: partialRun?.report }, conflictInput);
       expect(await controlPlaneSnapshot()).toEqual(controlPlaneBefore);
     } finally {

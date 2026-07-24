@@ -14,18 +14,20 @@ Core principles:
   posts;
 - build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
 
-[G1.5 #10](https://github.com/cosZone/koharu-suite/issues/10) adds baseline operations on top of reliable
-multi-channel ingestion:
+[G2.2 #19](https://github.com/cosZone/koharu-suite/issues/19) adds auditable reconciliation and recovery on top
+of multi-channel ingestion and Desktop history imports:
 
-- `apps/server`: Hono API, scoped service tokens, blocked-task recovery, channel state controls, a versioned
-  HTML renderer, cursor pagination, public API safeguards, and `kodama doctor`;
-- `apps/admin`: a React and Vite Owner Desk for authentication, archive status, message browsing, blocked
-  retry/skip, channel state controls, rerendering, explicit raw reveal, and TOTP;
+- `apps/server`: Hono API, persisted and scheduled reconciliation, explicit Desktop coverage, exact lineage,
+  deterministic repair, owner tombstones, scoped service tokens, and `kodama doctor`;
+- `apps/admin`: a React and Vite Owner Desk for archive operations, paginated findings, Desktop recovery
+  guidance, explicit repair, and hide/unhide;
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the complete roadmap.
 See the [deployment guide](./docs/deployment/README.en.md) for production setup, upgrades, backups, and
 rollback.
+See the [reconciliation and recovery guide](./docs/reconciliation/README.en.md) for Telegram gap evidence,
+Desktop-assisted recovery, explicit repair, and tombstone behavior.
 
 ## Local development
 
@@ -177,6 +179,13 @@ pnpm exec kodama import telegram-desktop \
   --input /path/to/result.json \
   --channel=-1001234567890 \
   --channel=-1009876543210 \
+  --apply
+
+# Declare only a bounded range known to be complete; repeat as needed
+pnpm exec kodama import telegram-desktop \
+  --input /path/to/result.json \
+  --channel=-1001234567890 \
+  --complete-range=-1001234567890:1:500 \
   --apply
 
 # Automation can consume the versioned JSON report

@@ -14,6 +14,16 @@ const OTHER_CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af2';
 const MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b33';
 const NEXT_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b34';
 const TASK_ID = '019bf895-0e70-7881-83b3-471b8dbb1b35';
+const FINDING_ID = '019bf895-0e70-7881-83b3-471b8dbb1b36';
+const RUN_ID = '019bf895-0e70-7881-83b3-471b8dbb1b37';
+const FINDING_CURSOR = Buffer.from(
+  JSON.stringify({
+    id: FINDING_ID,
+    lastSeenMicros: '1784887200000000',
+    v: 1,
+  }),
+  'utf8',
+).toString('base64url');
 
 const ownerPrincipal: AdminPrincipal = {
   actorId: 'owner-user-id',
@@ -94,6 +104,55 @@ function createOperations(): AppDependencies['operations'] {
       username: 'koharu_test',
     })),
     skipTask: vi.fn(async () => undefined),
+  };
+}
+
+function createReconciliation(): AppDependencies['reconciliation'] {
+  return {
+    ignoreFinding: vi.fn(async () => ({
+      evidenceVersion: 1,
+      id: FINDING_ID,
+      state: 'ignored' as const,
+    })),
+    listFindings: vi.fn(async () => ({ items: [], nextCursor: null })),
+    listRuns: vi.fn(async () => ({ items: [], nextCursor: null })),
+    persistScan: vi.fn(async () => ({
+      report: {} as never,
+      runId: RUN_ID,
+    })),
+  };
+}
+
+function createRepair(): AppDependencies['repair'] {
+  return {
+    apply: vi.fn(async () => ({
+      actionKind: 'derived_html.rerender' as const,
+      changed: true,
+      findingId: FINDING_ID,
+      replayed: false,
+      runId: RUN_ID,
+    })),
+  };
+}
+
+function createTombstone(): AppDependencies['tombstone'] {
+  return {
+    hide: vi.fn(async () => ({
+      actionId: RUN_ID,
+      changed: true,
+      findingId: FINDING_ID,
+      messageId: MESSAGE_ID,
+      replayed: false,
+      tombstoned: true,
+    })),
+    unhide: vi.fn(async () => ({
+      actionId: RUN_ID,
+      changed: true,
+      findingId: FINDING_ID,
+      messageId: MESSAGE_ID,
+      replayed: false,
+      tombstoned: false,
+    })),
   };
 }
 
@@ -544,6 +603,296 @@ describe('owner admin endpoints', () => {
       hasMore: true,
       updated: 500,
     });
+  });
+
+  it('lists bounded reconciliation data with admin:read and no-store headers', async () => {
+    const authorize = vi.fn(async () => ({
+      allowed: true,
+      principal: serviceTokenPrincipal,
+    }));
+    const reconciliation = createReconciliation();
+    vi.mocked(reconciliation.listFindings).mockResolvedValue({
+      items: [
+        {
+          evidenceVersion: 1,
+          firstSeenAt: '2026-07-24T10:00:00.000Z',
+          id: FINDING_ID,
+          kind: 'desktop_absence_candidate',
+          lastSeenAt: '2026-07-24T11:00:00.000Z',
+          messageId: MESSAGE_ID,
+          messageTombstoned: true,
+          observationId: null,
+          sanitizedDetails: { reason: 'Desktop export absence requires owner review' },
+          severity: 'warning',
+          stableKey: 'desktop-absence:test',
+          state: 'open',
+          telegramChatId: '-1002234260754',
+        },
+      ],
+      nextCursor: null,
+    });
+    const app = createApp({
+      auth: createAuthorizedAuth(serviceTokenPrincipal, authorize),
+      reconciliation,
+    });
+
+    const findings = await app.request(
+      `/api/v1/admin/reconciliation/findings?limit=20&cursor=${FINDING_CURSOR}`,
+      { headers: { Authorization: 'Bearer khs_test' } },
+    );
+    const runs = await app.request('/api/v1/admin/reconciliation/runs?limit=5', {
+      headers: { Authorization: 'Bearer khs_test' },
+    });
+
+    expect(findings.status).toBe(200);
+    expect(runs.status).toBe(200);
+    expect(findings.headers.get('cache-control')).toBe('private, no-store');
+    expect(findings.headers.get('vary')).toBe('Cookie, Authorization');
+    await expect(findings.json()).resolves.toMatchObject({
+      items: [{ messageId: MESSAGE_ID, messageTombstoned: true }],
+    });
+    expect(reconciliation.listFindings).toHaveBeenCalledWith({
+      cursor: FINDING_CURSOR,
+      limit: 20,
+    });
+    expect(reconciliation.listRuns).toHaveBeenCalledWith({ limit: 5 });
+    expect(authorize).toHaveBeenNthCalledWith(1, expect.any(Headers), 'admin:read');
+    expect(authorize).toHaveBeenNthCalledWith(2, expect.any(Headers), 'admin:read');
+  });
+
+  it('runs a persisted reconciliation scan with content:write and normalized actor data', async () => {
+    const authorize = vi.fn(async () => ({
+      allowed: true,
+      principal: serviceTokenPrincipal,
+    }));
+    const reconciliation = createReconciliation();
+    const response = await createApp({
+      auth: createAuthorizedAuth(serviceTokenPrincipal, authorize),
+      reconciliation,
+    }).request('/api/v1/admin/reconciliation/scan', {
+      body: JSON.stringify({ telegramChannelIds: ['-1002234260754'] }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(200);
+    expect(authorize).toHaveBeenCalledWith(expect.any(Headers), 'content:write');
+    expect(reconciliation.persistScan).toHaveBeenCalledWith({
+      initiatorId: serviceTokenPrincipal.actorId,
+      initiatorKind: 'service_token',
+      telegramChannelIds: [-1_002_234_260_754n],
+    });
+    await expect(response.json()).resolves.toMatchObject({ runId: RUN_ID });
+  });
+
+  it('keeps ignore owner-only while repair remains available to content writers', async () => {
+    const reconciliation = createReconciliation();
+    const repair = createRepair();
+    const requestBody = JSON.stringify({
+      expectedEvidenceVersion: 1,
+      reason: '  operator reviewed evidence  ',
+    });
+    const serviceApp = createApp({
+      auth: createAuthorizedAuth(serviceTokenPrincipal),
+      reconciliation,
+      repair,
+    });
+
+    const forbiddenIgnore = await serviceApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/ignore`,
+      {
+        body: requestBody,
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(forbiddenIgnore.status).toBe(403);
+    expect(reconciliation.ignoreFinding).not.toHaveBeenCalled();
+
+    const repairResponse = await serviceApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/repair`,
+      {
+        body: requestBody,
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(repairResponse.status).toBe(200);
+    expect(repair.apply).toHaveBeenCalledWith({
+      expectedEvidenceVersion: 1,
+      findingId: FINDING_ID,
+      initiatorId: serviceTokenPrincipal.actorId,
+      initiatorKind: 'service_token',
+      reason: 'operator reviewed evidence',
+    });
+
+    const ownerReconciliation = createReconciliation();
+    const ownerResponse = await createApp({
+      auth: createAuthorizedAuth(),
+      reconciliation: ownerReconciliation,
+    }).request(`/api/v1/admin/reconciliation/findings/${FINDING_ID}/ignore`, {
+      body: requestBody,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(ownerResponse.status).toBe(200);
+    expect(ownerReconciliation.ignoreFinding).toHaveBeenCalledWith({
+      expectedEvidenceVersion: 1,
+      findingId: FINDING_ID,
+      initiatorId: ownerPrincipal.actorId,
+      initiatorKind: 'owner_session',
+      reason: 'operator reviewed evidence',
+    });
+  });
+
+  it('returns structured reconciliation validation and conflict errors', async () => {
+    const repair = createRepair();
+    vi.mocked(repair.apply).mockRejectedValueOnce(new Error('evidence version changed'));
+    const app = createApp({
+      auth: createAuthorizedAuth(),
+      repair,
+    });
+
+    const invalid = await app.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/repair`,
+      {
+        body: JSON.stringify({ expectedEvidenceVersion: 0, reason: '' }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({
+      error: { code: 'invalid_reconciliation_action' },
+    });
+
+    const conflict = await app.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/repair`,
+      {
+        body: JSON.stringify({ expectedEvidenceVersion: 1, reason: 'reviewed' }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(conflict.status).toBe(409);
+    await expect(conflict.json()).resolves.toEqual({
+      error: {
+        code: 'reconciliation_conflict',
+        message: 'evidence version changed',
+      },
+    });
+
+    vi.mocked(repair.apply).mockRejectedValueOnce(
+      new Error('Reconciliation finding was not found'),
+    );
+    const missing = await app.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/repair`,
+      {
+        body: JSON.stringify({ expectedEvidenceVersion: 1, reason: 'reviewed' }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(missing.status).toBe(404);
+    await expect(missing.json()).resolves.toMatchObject({
+      error: { code: 'finding_not_found' },
+    });
+
+    vi.mocked(repair.apply).mockRejectedValueOnce(
+      new Error('This finding kind has no deterministic safe repair'),
+    );
+    const nonRepairable = await app.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/repair`,
+      {
+        body: JSON.stringify({ expectedEvidenceVersion: 1, reason: 'reviewed' }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(nonRepairable.status).toBe(409);
+  });
+
+  it('keeps message hide and unhide owner-only with strict audited input', async () => {
+    const tombstone = createTombstone();
+    const body = JSON.stringify({
+      expectedEvidenceVersion: 2,
+      messageId: MESSAGE_ID,
+      reason: '  Desktop export confirms this absence  ',
+    });
+    const serviceResponse = await createApp({
+      auth: createAuthorizedAuth(serviceTokenPrincipal),
+      tombstone,
+    }).request(`/api/v1/admin/reconciliation/findings/${FINDING_ID}/hide`, {
+      body,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(serviceResponse.status).toBe(403);
+    expect(tombstone.hide).not.toHaveBeenCalled();
+
+    const ownerApp = createApp({
+      auth: createAuthorizedAuth(),
+      tombstone,
+    });
+    const hidden = await ownerApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/hide`,
+      {
+        body,
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(hidden.status).toBe(200);
+    expect(tombstone.hide).toHaveBeenCalledWith({
+      expectedEvidenceVersion: 2,
+      findingId: FINDING_ID,
+      initiatorId: ownerPrincipal.actorId,
+      initiatorKind: 'owner_session',
+      messageId: MESSAGE_ID,
+      reason: 'Desktop export confirms this absence',
+    });
+
+    const invalid = await ownerApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/unhide`,
+      {
+        body: JSON.stringify({
+          expectedEvidenceVersion: 2,
+          extra: true,
+          messageId: MESSAGE_ID,
+          reason: 'reviewed',
+        }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({
+      error: { code: 'invalid_reconciliation_tombstone' },
+    });
+
+    vi.mocked(tombstone.unhide).mockRejectedValueOnce(new Error('Message was not found'));
+    const missing = await ownerApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/unhide`,
+      {
+        body,
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(missing.status).toBe(404);
+
+    vi.mocked(tombstone.unhide).mockRejectedValueOnce(
+      new Error('Reconciliation finding evidence version changed'),
+    );
+    const conflict = await ownerApp.request(
+      `/api/v1/admin/reconciliation/findings/${FINDING_ID}/unhide`,
+      {
+        body,
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(conflict.status).toBe(409);
   });
 });
 

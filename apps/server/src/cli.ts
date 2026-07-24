@@ -23,6 +23,7 @@ import {
 import { createDatabaseConnection } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { loadEnvironmentFile } from './env.js';
+import { parseTelegramDesktopCompleteRange } from './imports/coverage.js';
 import { closeImportResources, registerImportCancellation } from './imports/import-lifecycle.js';
 import { PostgresTelegramDesktopImportRepository } from './imports/import-repository.js';
 import {
@@ -41,6 +42,12 @@ import {
 } from './ops/doctor.js';
 import { PostgresDoctorDiagnostics, TelegramDoctorDiagnostics } from './ops/doctor-runtime.js';
 import { registerProcessLifecycle } from './process-lifecycle.js';
+import { ReconciliationApplyService } from './reconciliation/apply-service.js';
+import { runReconciliationCli } from './reconciliation/cli.js';
+import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
+import { PostgresDeterministicRepairRepository } from './reconciliation/repair-repository.js';
+import { PostgresReconciliationRepository } from './reconciliation/repository.js';
+import { ReconciliationService } from './reconciliation/service.js';
 import { createWorkerRuntime, startServerRuntime } from './runtime.js';
 import { GrammyTelegramApi } from './telegram/api.js';
 import { TelegramChannelService } from './telegram/channel-service.js';
@@ -60,6 +67,7 @@ Commands:
   token       Create, list, or revoke scoped service tokens
   channel     Add, list, enable, or disable Telegram channels
   import      Import historical content
+  reconcile   Inspect scoped Telegram archive consistency
   doctor      Run read-only deployment diagnostics
   health      Run a container-local health check
   help        Show this help
@@ -78,8 +86,10 @@ Options:
       --id <id>                Service token ID
       --input <path>           Telegram Desktop result.json
       --channel <id>           Repeatable canonical Telegram channel ID
-      --apply                  Apply an import (default: dry-run)
-      --json                   Print a versioned JSON import report
+      --complete-range <range> Explicit complete channel:start:end coverage; repeatable, apply only
+      --apply                  Apply a supported operation (default: dry-run)
+      --reason <text>          Required operator reason for reconciliation apply
+      --json                   Print a versioned JSON report
 
 Owner commands:
   kodama owner create --email owner@example.com [--password-stdin]
@@ -97,7 +107,11 @@ Channel commands:
   kodama channel disable --telegram-id -1001234567890
 
 Import command:
-  kodama import telegram-desktop --input /path/to/result.json --channel -1001234567890 [--apply] [--json]
+  kodama import telegram-desktop --input /path/to/result.json --channel -1001234567890 [--apply] [--complete-range=-1001234567890:1:100] [--json]
+
+Reconciliation command:
+  kodama reconcile telegram --channel -1001234567890 [--channel -1009876543210] [--json]
+  kodama reconcile telegram --channel -1001234567890 --apply --reason "approved repair"
 
 Doctor command:
   kodama doctor
@@ -113,6 +127,7 @@ TELEGRAM_CHANNEL_ID is an optional one-time bootstrap when the allowlist is empt
 interface CliOptions {
   apply?: boolean;
   channel?: string[];
+  'complete-range'?: string[];
   'database-url'?: string;
   email?: string;
   'expires-in'?: string;
@@ -123,6 +138,7 @@ interface CliOptions {
   name?: string;
   'password-stdin'?: boolean;
   port?: string;
+  reason?: string;
   scope?: string[];
   'telegram-id'?: string;
   version?: boolean;
@@ -143,6 +159,7 @@ function parseCli(): {
     options: {
       apply: { type: 'boolean' },
       channel: { multiple: true, type: 'string' },
+      'complete-range': { multiple: true, type: 'string' },
       'database-url': { type: 'string' },
       email: { type: 'string' },
       'expires-in': { type: 'string' },
@@ -153,6 +170,7 @@ function parseCli(): {
       name: { type: 'string' },
       'password-stdin': { type: 'boolean' },
       port: { short: 'p', type: 'string' },
+      reason: { type: 'string' },
       scope: { multiple: true, type: 'string' },
       'telegram-id': { type: 'string' },
       version: { short: 'v', type: 'boolean' },
@@ -253,6 +271,7 @@ async function main(): Promise<void> {
 
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
     const channelIds = options.channel.map(parseTelegramChannelId);
+    const completeRanges = (options['complete-range'] ?? []).map(parseTelegramDesktopCompleteRange);
     const connection = createDatabaseConnection(databaseUrl);
     const repository = new PostgresTelegramDesktopImportRepository(databaseUrl, connection.db);
     const cancellation = registerImportCancellation();
@@ -263,6 +282,7 @@ async function main(): Promise<void> {
       ).run({
         apply: options.apply === true,
         channelIds,
+        completeRanges,
         inputPath: options.input,
         signal: cancellation.signal,
       });
@@ -301,6 +321,58 @@ async function main(): Promise<void> {
         process.stderr.write(`kodama: import cleanup failed: ${message}\n`);
         process.exitCode = 1;
       }
+    }
+    return;
+  }
+
+  if (command === 'reconcile') {
+    if (subcommand !== 'telegram') {
+      throw new Error('reconcile command must be telegram');
+    }
+    if (!options.channel || options.channel.length === 0) {
+      throw new Error('reconcile telegram requires at least one --channel');
+    }
+
+    const channelIds = options.channel.map(parseTelegramChannelId);
+    if (options.reason !== undefined && options.apply !== true) {
+      process.exitCode = await runReconciliationCli(
+        {
+          apply: false,
+          channelIds,
+          json: options.json === true,
+          reason: options.reason,
+        },
+        {
+          write: (output) => process.stdout.write(output),
+        },
+      );
+      return;
+    }
+
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const connection = createDatabaseConnection(databaseUrl);
+    try {
+      const scanner = new ReconciliationService(
+        new PostgresReconciliationRepository(connection.db),
+      );
+      const persistence = new PostgresReconciliationPersistenceRepository(connection.db);
+      const repair = new PostgresDeterministicRepairRepository(connection.db);
+      const apply = new ReconciliationApplyService(connection.db, persistence, repair);
+      process.exitCode = await runReconciliationCli(
+        {
+          apply: options.apply === true,
+          channelIds,
+          json: options.json === true,
+          ...(options.reason === undefined ? {} : { reason: options.reason }),
+        },
+        {
+          apply: (input) => apply.apply(input),
+          scan: (scope) => scanner.scan({ telegramChannelIds: scope }),
+          write: (output) => process.stdout.write(output),
+        },
+      );
+    } finally {
+      await connection.close();
     }
     return;
   }
