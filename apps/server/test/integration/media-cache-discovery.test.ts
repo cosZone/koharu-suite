@@ -335,6 +335,95 @@ describe('media cache discovery repository', () => {
     expect(sourceIds).toEqual(expect.arrayContaining([{ id: olderId }, { id: newerId }]));
   });
 
+  it('timestamps evidence after acquiring the coordination lock, not when its transaction began', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createRevision(connection, [
+      { bytes: 1n * MEBIBYTE, kind: 'photo', position: 0 },
+    ]);
+    let announceOldTransaction: (() => void) | undefined;
+    let releaseOldTransaction: (() => void) | undefined;
+    const oldTransactionStarted = new Promise<void>((resolve) => {
+      announceOldTransaction = resolve;
+    });
+    const holdOldTransaction = new Promise<void>((resolve) => {
+      releaseOldTransaction = resolve;
+    });
+    const oldWrite = connection.db.transaction(async (transaction) => {
+      await transaction.execute(sql`select now()`);
+      announceOldTransaction?.();
+      await holdOldTransaction;
+      await lockSourceEvidenceDiscovery(transaction);
+      const [observation] = await transaction
+        .insert(messageSourceObservations)
+        .values({
+          channelId: fixture.channelId,
+          contentFingerprint: `delayed-${fixtureSequence}`,
+          contentFingerprintVersion: 1,
+          messageId: fixture.messageId,
+          rawJson: {},
+          resolution: 'matched',
+          revisionId: fixture.revisionId,
+          sourceKey: `delayed:${fixtureSequence}`,
+          sourceKind: 'telegram_desktop_json',
+          telegramMessageId: 99_999n,
+        })
+        .returning({ id: messageSourceObservations.id });
+      if (!observation) {
+        throw new Error('Delayed observation was not created');
+      }
+      const [sourceMedia] = await transaction
+        .insert(messageSourceMediaObservations)
+        .values({
+          availability: 'available',
+          createdAt: sql`clock_timestamp()`,
+          desktopSourcePath: 'photos/delayed.jpg',
+          mediaKind: 'photo',
+          observationId: observation.id,
+          position: 0,
+          sourceKind: 'telegram_desktop_json',
+        })
+        .returning({
+          createdAt: messageSourceMediaObservations.createdAt,
+          id: messageSourceMediaObservations.id,
+        });
+      if (!sourceMedia) {
+        throw new Error('Delayed source media was not created');
+      }
+      return sourceMedia;
+    });
+    await oldTransactionStarted;
+
+    const [databaseClock] = await connection.db.execute<{ now: Date | string }>(
+      sql`select clock_timestamp() as now`,
+    );
+    if (!databaseClock) {
+      throw new Error('PostgreSQL clock was not available');
+    }
+    const newerId = await addEvidence(connection, fixture, {
+      createdAt: new Date(databaseClock.now),
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    const repository = new PostgresMediaCacheDiscoveryRepository(connection.db);
+    await expect(repository.discoverBatch()).resolves.toMatchObject({
+      cursor: { id: newerId },
+      scanned: 1,
+      sourcesCreated: 1,
+    });
+
+    releaseOldTransaction?.();
+    const delayed = await oldWrite;
+    expect(delayed.createdAt.getTime()).toBeGreaterThan(new Date(databaseClock.now).getTime());
+    await expect(repository.discoverBatch()).resolves.toMatchObject({
+      cursor: { id: delayed.id },
+      scanned: 1,
+      sourcesCreated: 1,
+    });
+  });
+
   it('discovers only current non-tombstoned revisions from created or matched evidence', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');

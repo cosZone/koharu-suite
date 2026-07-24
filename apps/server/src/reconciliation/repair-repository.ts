@@ -352,13 +352,12 @@ export class PostgresDeterministicRepairRepository implements DeterministicRepai
       .map((media, position) => ({ media, position }))
       .filter(({ position }) => !positions.has(position));
     if (missing.length > 0) {
-      await transaction
-        .insert(messageSourceMediaObservations)
-        .values(
-          missing.map(({ media, position }) =>
-            sourceMediaEvidence(observation.id, observation.sourceKind, media, position),
-          ),
-        );
+      await transaction.insert(messageSourceMediaObservations).values(
+        missing.map(({ media, position }) => ({
+          ...sourceMediaEvidence(observation.id, observation.sourceKind, media, position),
+          createdAt: sql`clock_timestamp()`,
+        })),
+      );
     }
     return {
       afterState: {

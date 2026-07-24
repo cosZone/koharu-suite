@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, lt, or, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, or, type SQL, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   mediaCacheObjects,
@@ -761,13 +761,12 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       return;
     }
 
-    await transaction
-      .insert(messageSourceMediaObservations)
-      .values(
-        mediaItems.map((media, position) =>
-          sourceMediaObservation(media, observation, observationId, position),
-        ),
-      );
+    await transaction.insert(messageSourceMediaObservations).values(
+      mediaItems.map((media, position) => ({
+        ...sourceMediaObservation(media, observation, observationId, position),
+        createdAt: sql`clock_timestamp()`,
+      })),
+    );
   }
 
   private async selectCurrentRevision(
