@@ -48,7 +48,8 @@ TELEGRAM_WORKER_CONCURRENCY=4
 ```
 
 Never commit `.env`, backups, bot tokens, or passwords. Production `BETTER_AUTH_URL` must be the canonical
-public HTTPS origin for the Admin and API. Compose binds `POSTGRES_PUBLISHED_PORT` only to host loopback
+public HTTPS origin for Admin, API, and RSS URLs; feed URLs never trust the request `Host`. Compose binds
+`POSTGRES_PUBLISHED_PORT` only to host loopback
 `127.0.0.1` by default for local maintenance. If the database does not need host access, remove the port in a
 deployment-specific Compose override.
 
@@ -59,6 +60,11 @@ docker compose pull
 docker compose up -d db
 docker compose run --rm migrate
 ```
+
+The G2.5 migration installs `pg_trgm` and creates the GIN trigram index. A managed PostgreSQL migration role
+may not be allowed to install extensions. Before the first deployment or upgrade, ask the database
+administrator to preinstall `pg_trgm` or grant the narrowly required permission. Do not skip a failed
+extension migration.
 
 Configure the first public channel and the singleton owner:
 
@@ -208,14 +214,18 @@ and minimum Node/PostgreSQL requirements first:
 docker compose stop -t 30 worker server
 docker compose pull
 docker compose run --rm migrate
+docker compose run --rm --no-deps server node dist/cli.js doctor
 docker compose up -d worker
 docker compose exec worker node dist/cli.js health worker
 docker compose up -d server
 curl --fail https://blog-admin.example.com/readyz
+curl --head https://blog-admin.example.com/api/v1/rss.xml
 ```
 
-Then check the Owner Desk, channel list, and one new message. Use only an explicit version or digest;
-`koharu-suite` does not publish `latest`. Never overlap the old and new workers during an upgrade.
+Confirm Doctor reports `Search` as `ok`, then check Owner Desk search, global/per-channel RSS, the channel
+list, and one new message. Use only an explicit version or digest; `koharu-suite` does not publish `latest`.
+Never overlap the old and new workers during an upgrade. See the
+[search and RSS operations guide](../search-rss/README.en.md) for complete smoke and troubleshooting.
 
 ## Rollback
 
@@ -238,6 +248,10 @@ Then check the Owner Desk, channel list, and one new message. Use only an explic
 4. Restore the prior tag or digest in `KOHARU_IMAGE` only after the compatibility check passes.
 5. Start the prior worker, verify `kodama health worker`, and confirm there is one lock owner.
 6. Start the prior server and check `/readyz`, the public API, and the Owner Desk.
+
+G2.5 `pg_trgm` and indexes are additive. Keep them during an application rollback. If schema rollback is
+unavoidable, remove only the project-owned G2.5 indexes. **Do not `DROP EXTENSION pg_trgm`**, because other
+database objects may share it. Search and RSS have no persistent cache to clear or rebuild.
 
 If rollback also requires disabling S3, stop new storage mutations, let required commands complete or be
 taken over after lease expiry, copy/restore objects that must remain cached to `local`, and verify public

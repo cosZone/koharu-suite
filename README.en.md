@@ -14,13 +14,13 @@ Core principles:
   posts;
 - build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
 
-[G2.4 #24](https://github.com/cosZone/koharu-suite/issues/24) adds optional local hot and S3-compatible
-durable cached tiers on top of multi-channel archiving and auditable recovery:
+[G2.5 #26](https://github.com/cosZone/koharu-suite/issues/26) adds public search and RSS on top of
+multi-channel archiving, auditable recovery, and local/S3-compatible media tiers:
 
-- `apps/server`: Hono API, PostgreSQL ledger, crash-safe content-addressed storage, Bot and explicit Desktop
-  caching, bounded thumbnails, server-proxied media routes, and `kodama media` operations;
-- `apps/admin`: a React and Vite Owner Desk for sanitized state, copy/restore, protection, policy, prune
-  preview/apply, retry, eviction, and reconciliation;
+- `apps/server`: Hono API, PostgreSQL 18 `pg_trgm` current-revision search, global/per-channel RSS 2.0,
+  PostgreSQL ledger, crash-safe content-addressed storage, and `kodama` operations;
+- `apps/admin`: a React and Vite Owner Desk for search/feed entry points, sanitized state, copy/restore,
+  protection, policy, prune, retry, eviction, and reconciliation;
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the complete roadmap.
@@ -30,6 +30,8 @@ See the [reconciliation and recovery guide](./docs/reconciliation/README.en.md) 
 Desktop-assisted recovery, explicit repair, and tombstone behavior.
 See the [media cache operations guide](./docs/media-cache/README.en.md) for capacity, S3 configuration,
 privacy, backup, rollback, and crash recovery.
+See the [search and RSS operations guide](./docs/search-rss/README.en.md) for search parameters, short-query
+bounds, RSS caching, `pg_trgm` privileges, and troubleshooting.
 
 ## Local development
 
@@ -145,12 +147,21 @@ curl http://localhost:3000/api/v1/channels
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50"
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50&cursor=<nextCursor>"
 curl http://localhost:3000/api/v1/messages/<suiteMessageId>
+curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro 6"
+curl http://localhost:3000/api/v1/rss.xml
+curl http://localhost:3000/api/v1/channels/<suiteChannelId>/rss.xml
 ```
 
 Message lists return `{ items, nextCursor }`. `limit` defaults to 50 and accepts 1–100; `cursor` is an opaque
 value bound to the selected channel and clients should neither decode nor modify it. Archived revisions store
 safe HTML rendered from escaped text/entities. After a renderer upgrade, “Rerender outdated” in Owner Desk
 updates only derived HTML/version fields and leaves revision history unchanged.
+
+Search reads only non-tombstoned current revisions. Queries of at least three characters default to relevance
+ordering; 1–2 character queries require one channel, an explicit UTC window no wider than 31 days, and newest
+ordering. Global and per-channel RSS 2.0 feeds each contain at most 50 items without pagination and support GET,
+HEAD, ETag, and 304. See the [search and RSS operations guide](./docs/search-rss/README.en.md) for the complete
+contract.
 
 The public API uses stable suite IDs. M1 archives Telegram media metadata without downloading files. Public
 responses omit raw updates, numeric Telegram IDs, internal file IDs, and the bot token. Raw updates are exposed

@@ -44,8 +44,9 @@ TELEGRAM_BOT_TOKEN=<bot-token>
 TELEGRAM_WORKER_CONCURRENCY=4
 ```
 
-不要把 `.env`、备份、Bot token 或密码提交到 Git。生产环境的 `BETTER_AUTH_URL` 必须是 Admin/API
-对外暴露的 canonical HTTPS origin。Compose 默认把 `POSTGRES_PUBLISHED_PORT` 只绑定到主机
+不要把 `.env`、备份、Bot token 或密码提交到 Git。生产环境的 `BETTER_AUTH_URL` 必须是
+Admin/API/RSS URL 对外暴露的 canonical HTTPS origin；feed URL 不信任请求 `Host`。Compose 默认把
+`POSTGRES_PUBLISHED_PORT` 只绑定到主机
 `127.0.0.1`，供本地维护；数据库不需要从主机访问时，仍建议在部署专用 Compose override 中移除
 该端口。
 
@@ -56,6 +57,10 @@ docker compose pull
 docker compose up -d db
 docker compose run --rm migrate
 ```
+
+G2.5 migration 会安装 `pg_trgm` 并创建 GIN trigram index。托管 PostgreSQL 的 migration role
+可能没有安装 extension 的权限；首次部署/升级前应让数据库管理员预装 `pg_trgm`，或授予所需的受限
+权限。extension migration 失败时不要跳过。
 
 配置第一个公开频道和唯一 owner：
 
@@ -199,14 +204,17 @@ Preview 允许短维护窗口。先阅读 GitHub pre-release notes，确认 migr
 docker compose stop -t 30 worker server
 docker compose pull
 docker compose run --rm migrate
+docker compose run --rm --no-deps server node dist/cli.js doctor
 docker compose up -d worker
 docker compose exec worker node dist/cli.js health worker
 docker compose up -d server
 curl --fail https://blog-admin.example.com/readyz
+curl --head https://blog-admin.example.com/api/v1/rss.xml
 ```
 
-再检查 Owner Desk、频道列表和一条新消息。只使用明确版本或 digest；`koharu-suite` 不发布
-`latest`。升级期间不要同时启动旧 worker 和新 worker。
+确认 Doctor 的 `Search` 为 `ok`，再检查 Owner Desk 搜索、全局/频道 RSS、频道列表和一条新消息。
+只使用明确版本或 digest；`koharu-suite` 不发布 `latest`。升级期间不要同时启动旧 worker 和新
+worker。完整 smoke 与故障排查见[搜索与 RSS 运维手册](../search-rss/README.md)。
 
 ## 回滚
 
@@ -229,6 +237,10 @@ curl --fail https://blog-admin.example.com/readyz
 4. 只有通过兼容性检查后，才把 `KOHARU_IMAGE` 恢复为升级前记录的 tag 或 digest。
 5. 启动旧 worker，确认 `kodama health worker` 成功且只有一个 lock owner。
 6. 启动旧 server，检查 `/readyz`、公开 API 与 Owner Desk。
+
+G2.5 的 `pg_trgm` 和 indexes 是 additive。应用回滚时保留它们；若必须回滚 schema，只删除项目
+拥有的 G2.5 indexes，**不要 `DROP EXTENSION pg_trgm`**，因为它可能被其他数据库对象共享。
+搜索/RSS 没有需要清理或重建的持久 cache。
 
 若回滚还需要停用 S3，先停止新 storage mutation，等待或让 worker 接管过期 lease，把仍需缓存的
 对象 copy/restore 到 `local` 并验证公开读取。随后停止 server/worker，同时清空

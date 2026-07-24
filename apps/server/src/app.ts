@@ -22,7 +22,16 @@ import {
 } from './media-cache/admin-service.js';
 import { resolveMediaByteRange } from './media-cache/http-range.js';
 import type { PublicMediaReader } from './media-cache/public-reader.js';
-import type { MessageReader } from './messages/types.js';
+import { buildRssDocument } from './messages/rss.js';
+import {
+  decodeMessageSearchCursor,
+  encodeMessageSearchCursor,
+  type MessageSearchCursor,
+  type MessageSearchKey,
+  type MessageSearchSort,
+  unicodeLength,
+} from './messages/search.js';
+import type { MessageDiscoveryReader, MessageReader } from './messages/types.js';
 import type { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
 import type { DeterministicRepairService } from './reconciliation/repair.js';
 import type { MessageTombstoneService } from './reconciliation/tombstone.js';
@@ -45,6 +54,8 @@ export interface AppDependencies {
   admin: AdminReader;
   adminAssetsRoot?: string;
   auth: RuntimeAuth;
+  canonicalOrigin: string;
+  discovery: MessageDiscoveryReader;
   media: PublicMediaReader;
   mediaCacheAdmin: MediaCacheAdminReader;
   mediaCacheMutations: MediaCacheAdminMutations;
@@ -83,6 +94,26 @@ const unavailableMessageReader: MessageReader = {
   getMessage: async () => null,
   listChannels: async () => [],
   listMessages: async () => null,
+};
+const unavailableDiscoveryReader: MessageDiscoveryReader = {
+  getFeed: async (channelId) => ({
+    channel:
+      channelId === undefined
+        ? null
+        : {
+            id: channelId,
+            title: 'Koharu Suite Archive',
+            updatedAt: new Date(0).toISOString(),
+            username: null,
+          },
+    items: [],
+    updatedAt: null,
+  }),
+  searchMessages: async (options) => ({
+    items: [],
+    mode: unicodeLength(options.query) < 3 ? 'short_substring' : 'trigram',
+    nextCursor: null,
+  }),
 };
 const unavailableAdminReader: AdminReader = {
   getRawUpdate: async () => null,
@@ -342,9 +373,12 @@ function isPublicApiPath(path: string, mediaEnabled: boolean): boolean {
   return (
     path === '/api/v1/health' ||
     path === '/api/v1/channels' ||
+    /^\/api\/v1\/channels\/[^/]+\/rss\.xml$/u.test(path) ||
     (mediaEnabled && path.startsWith('/api/v1/media/')) ||
     path === '/api/v1/messages' ||
-    path.startsWith('/api/v1/messages/')
+    path.startsWith('/api/v1/messages/') ||
+    path === '/api/v1/rss.xml' ||
+    path === '/api/v1/search/messages'
   );
 }
 
@@ -353,12 +387,28 @@ function forwardedAddress(context: Context): string | null {
   return value && value.length <= 128 ? value : null;
 }
 
+function parseSearchTimestamp(value: string | undefined): Date | null | false {
+  if (value === undefined) {
+    return null;
+  }
+  if (!value.endsWith('Z')) {
+    return false;
+  }
+  const timestamp = new Date(value);
+  if (!Number.isFinite(timestamp.getTime()) || timestamp.toISOString() !== value) {
+    return false;
+  }
+  return timestamp;
+}
+
 export function createApp(dependencies: Partial<AppDependencies> = {}) {
   const mediaEnabled = dependencies.media !== undefined;
   const resolved = {
     admin: dependencies.admin ?? unavailableAdminReader,
     adminAssetsRoot: dependencies.adminAssetsRoot,
     auth: dependencies.auth ?? unavailableAuth,
+    canonicalOrigin: dependencies.canonicalOrigin ?? 'http://localhost',
+    discovery: dependencies.discovery ?? unavailableDiscoveryReader,
     media: dependencies.media ?? unavailableMediaReader,
     mediaCacheAdmin: dependencies.mediaCacheAdmin ?? unavailableMediaCacheAdmin,
     mediaCacheMutations: dependencies.mediaCacheMutations ?? unavailableMediaCacheMutations,
@@ -450,7 +500,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       );
       context.header(
         'Access-Control-Expose-Headers',
-        'Content-Length, Content-Range, ETag, Accept-Ranges',
+        'Content-Length, Content-Range, ETag, Last-Modified, Accept-Ranges',
       );
     }
     if (context.req.method === 'OPTIONS') {
@@ -489,6 +539,140 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
   app.get('/api/v1/channels', async (context) =>
     context.json({ items: await resolved.messages.listChannels() }),
   );
+  app.get('/api/v1/search/messages', async (context) => {
+    const query = context.req.query('q')?.trim() ?? '';
+    const queryLength = unicodeLength(query);
+    if (queryLength < 1 || queryLength > 200) {
+      return context.json(
+        apiError('invalid_query', 'q must contain between 1 and 200 Unicode characters'),
+        400,
+      );
+    }
+
+    const rawChannelId = context.req.query('channel');
+    const parsedChannelId =
+      rawChannelId === undefined ? null : uuidSchema.safeParse(rawChannelId.trim());
+    if (parsedChannelId !== null && !parsedChannelId.success) {
+      return context.json(apiError('invalid_channel', 'channel must be a suite channel UUID'), 400);
+    }
+    const channelId = parsedChannelId?.data ?? null;
+    const from = parseSearchTimestamp(context.req.query('from'));
+    const to = parseSearchTimestamp(context.req.query('to'));
+    if (from === false || to === false || (from !== null && to !== null && from >= to)) {
+      return context.json(
+        apiError(
+          'invalid_time_range',
+          'from and to must be canonical UTC timestamps with from earlier than to',
+        ),
+        400,
+      );
+    }
+
+    const rawSort = context.req.query('sort');
+    const parsedSort =
+      rawSort === undefined || rawSort === 'relevance' || rawSort === 'newest'
+        ? rawSort
+        : 'invalid';
+    if (parsedSort === 'invalid') {
+      return context.json(apiError('invalid_sort', 'sort must be relevance or newest'), 400);
+    }
+    const shortQuery = queryLength < 3;
+    const sort: MessageSearchSort = parsedSort ?? (shortQuery ? 'newest' : 'relevance');
+    const boundedShortRange =
+      channelId !== null &&
+      from !== null &&
+      to !== null &&
+      to.getTime() - from.getTime() <= 31 * 24 * 60 * 60 * 1_000;
+    if (shortQuery && (!boundedShortRange || sort !== 'newest')) {
+      return context.json(
+        apiError(
+          'short_query_requires_bounded_scope',
+          '1-2 character searches require one channel, a UTC window of at most 31 days, and newest sorting',
+        ),
+        400,
+      );
+    }
+
+    const maxLimit = shortQuery ? 20 : 50;
+    const parsedLimit = z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(maxLimit)
+      .default(20)
+      .safeParse(context.req.query('limit'));
+    if (!parsedLimit.success) {
+      return context.json(
+        apiError('invalid_limit', `limit must be between 1 and ${maxLimit}`),
+        400,
+      );
+    }
+
+    const key: MessageSearchKey = {
+      channelId,
+      from: from?.toISOString() ?? null,
+      query,
+      sort,
+      to: to?.toISOString() ?? null,
+    };
+    let cursor: MessageSearchCursor | undefined;
+    const encodedCursor = context.req.query('cursor');
+    if (encodedCursor !== undefined) {
+      try {
+        cursor = decodeMessageSearchCursor(encodedCursor, key);
+      } catch {
+        return context.json(apiError('invalid_cursor', 'cursor is invalid'), 400);
+      }
+    }
+    const page = await resolved.discovery.searchMessages({
+      ...key,
+      ...(cursor ? { cursor } : {}),
+      limit: parsedLimit.data,
+    });
+    if (!page) {
+      return context.json(apiError('channel_not_found', 'Channel was not found'), 404);
+    }
+    return context.json({
+      items: page.items,
+      mode: page.mode,
+      nextCursor: page.nextCursor ? encodeMessageSearchCursor(page.nextCursor) : null,
+    });
+  });
+  const serveRss = async (context: Context, channelId?: string) => {
+    const feed = await resolved.discovery.getFeed(channelId);
+    if (!feed) {
+      return context.json(apiError('channel_not_found', 'Channel was not found'), 404);
+    }
+    const selfPath =
+      channelId === undefined
+        ? '/api/v1/rss.xml'
+        : `/api/v1/channels/${encodeURIComponent(channelId)}/rss.xml`;
+    const document = buildRssDocument({
+      canonicalOrigin: resolved.canonicalOrigin,
+      feed,
+      selfPath,
+    });
+    context.header('Cache-Control', 'public, no-cache');
+    context.header('Content-Type', 'application/rss+xml; charset=utf-8');
+    context.header('Content-Length', String(document.byteLength));
+    context.header('ETag', document.etag);
+    context.header('Last-Modified', document.lastModified);
+    if (matchesIfNoneMatch(context.req.header('If-None-Match'), document.etag)) {
+      return context.body(null, 304);
+    }
+    if (context.req.method === 'HEAD') {
+      return context.body(null, 200);
+    }
+    return context.body(document.body, 200);
+  };
+  app.on(['GET', 'HEAD'], '/api/v1/rss.xml', (context) => serveRss(context));
+  app.on(['GET', 'HEAD'], '/api/v1/channels/:id/rss.xml', async (context) => {
+    const parsedChannelId = uuidSchema.safeParse(context.req.param('id'));
+    if (!parsedChannelId.success) {
+      return context.json(apiError('invalid_channel', 'id must be a suite channel UUID'), 400);
+    }
+    return serveRss(context, parsedChannelId.data);
+  });
   if (mediaEnabled) {
     app.on(['GET', 'HEAD'], '/api/v1/media/:id', async (context) => {
       const parsedObjectId = uuidSchema.safeParse(context.req.param('id'));

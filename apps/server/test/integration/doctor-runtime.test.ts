@@ -40,6 +40,12 @@ describe('PostgreSQL doctor diagnostics', () => {
     const diagnostics = new PostgresDoctorDiagnostics(connection.db);
 
     await expect(diagnostics.getPostgresMajorVersion()).resolves.toBe(18);
+    await expect(diagnostics.getSearchCapabilitySnapshot()).resolves.toEqual({
+      indexDefinition: expect.stringMatching(
+        /CREATE INDEX message_revisions_text_trgm_idx .* USING gin \(text gin_trgm_ops\) WHERE \(text IS NOT NULL\)/u,
+      ),
+      pgTrgmVersion: expect.any(String),
+    });
     await expect(diagnostics.listMissingSchemaObjects(EXPECTED_DATABASE_OBJECTS)).resolves.toEqual(
       [],
     );

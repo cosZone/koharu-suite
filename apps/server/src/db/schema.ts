@@ -378,6 +378,9 @@ export const messages = pgTable(
       table.publishedAt,
       table.id,
     ),
+    index('messages_public_published_idx')
+      .on(table.publishedAt, table.id)
+      .where(sql`${table.tombstonedAt} is null`),
   ],
 );
 
@@ -412,6 +415,9 @@ export const messageRevisions = pgTable(
       table.revisionNumber,
     ),
     uniqueIndex('message_revisions_update_unique').on(table.telegramUpdateId),
+    index('message_revisions_text_trgm_idx')
+      .using('gin', sql`${table.text} gin_trgm_ops`)
+      .where(sql`${table.text} is not null`),
   ],
 );
 

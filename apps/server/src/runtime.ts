@@ -443,6 +443,8 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
       admin: new PostgresAdminRepository(mainConnection.db),
       adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
       auth: new BetterAuthRuntime(mainConnection.db, config.auth),
+      canonicalOrigin: config.auth.baseUrl,
+      discovery: repository,
       ...(committedBlobReader && accessCoalescer
         ? {
             media: new LocalPublicMediaReader(

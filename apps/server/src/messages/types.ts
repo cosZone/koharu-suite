@@ -1,6 +1,8 @@
 import type { Update } from 'grammy/types';
 import type { MessageCursor } from '../http/cursor.js';
 import type { NormalizedMediaKind, NormalizedMessageEntity } from '../telegram/types.js';
+import type { MessageFeed } from './rss.js';
+import type { MessageSearchOptions, MessageSearchPage } from './search.js';
 
 export type MessageSourceKind = 'telegram_bot_update' | 'telegram_desktop_json';
 
@@ -132,4 +134,9 @@ export interface MessageReader {
   getMessage(id: string): Promise<PublicMessage | null>;
   listChannels(): Promise<PublicChannel[]>;
   listMessages(channelId: string, options: MessageListOptions): Promise<MessagePage | null>;
+}
+
+export interface MessageDiscoveryReader {
+  getFeed(channelId?: string): Promise<MessageFeed | null>;
+  searchMessages(options: MessageSearchOptions): Promise<MessageSearchPage | null>;
 }

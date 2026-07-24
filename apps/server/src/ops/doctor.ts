@@ -4,6 +4,7 @@ export type DoctorCheckId =
   | 'config'
   | 'postgres-version'
   | 'database-schema'
+  | 'search'
   | 'media-cache-ledger'
   | 'owner'
   | 'telegram-bot'
@@ -35,9 +36,15 @@ export interface DoctorDatabaseDiagnostics {
   getBoundTelegramBotId(): Promise<bigint | null>;
   getMediaCacheLedgerSnapshot(): Promise<DoctorMediaCacheLedgerSnapshot>;
   getPostgresMajorVersion(): Promise<number>;
+  getSearchCapabilitySnapshot(): Promise<DoctorSearchCapabilitySnapshot>;
   listEnabledChannels(): Promise<DoctorTelegramChannel[]>;
   listMissingSchemaObjects(expectedObjects: readonly string[]): Promise<string[]>;
   listOwners(): Promise<DoctorOwner[]>;
+}
+
+export interface DoctorSearchCapabilitySnapshot {
+  indexDefinition: string | null;
+  pgTrgmVersion: string | null;
 }
 
 export interface DoctorMediaCacheLedgerSnapshot {
@@ -504,6 +511,59 @@ async function checkDatabaseSchema(
   }
 }
 
+function searchIndexDefinitionIsValid(indexDefinition: string): boolean {
+  const normalized = indexDefinition.replaceAll('"', '').replace(/\s+/gu, ' ').trim().toLowerCase();
+  return (
+    /^create index message_revisions_text_trgm_idx on public\.message_revisions using gin\s*\(/u.test(
+      normalized,
+    ) &&
+    /\(\s*text\s+(?:public\.)?gin_trgm_ops\s*\)/u.test(normalized) &&
+    /where\s+\(*\s*text\s+is\s+not\s+null\s*\)*\s*$/u.test(normalized)
+  );
+}
+
+async function checkSearchCapability(
+  database: DoctorDatabaseDiagnostics,
+  sensitiveValues: readonly string[],
+): Promise<DoctorCheckResult> {
+  try {
+    const snapshot = await database.getSearchCapabilitySnapshot();
+    const details: string[] = [];
+    if (snapshot.pgTrgmVersion === null) {
+      details.push('Missing PostgreSQL extension: pg_trgm');
+    }
+    if (snapshot.indexDefinition === null) {
+      details.push('Missing index: public.message_revisions_text_trgm_idx');
+    } else if (!searchIndexDefinitionIsValid(snapshot.indexDefinition)) {
+      details.push(
+        'Index public.message_revisions_text_trgm_idx does not provide the required GIN gin_trgm_ops partial definition',
+      );
+    }
+
+    if (details.length > 0) {
+      return result(
+        'search',
+        'Search',
+        'fail',
+        'Search database capability is incomplete',
+        sensitiveValues,
+        [...details, 'Fix: run kodama migrate'],
+      );
+    }
+    return result(
+      'search',
+      'Search',
+      'ok',
+      `pg_trgm ${snapshot.pgTrgmVersion} and trigram index verified`,
+      sensitiveValues,
+    );
+  } catch {
+    return result('search', 'Search', 'fail', 'Search capability check failed', sensitiveValues, [
+      'Fix: run kodama migrate',
+    ]);
+  }
+}
+
 async function checkMediaCacheLedger(
   database: DoctorDatabaseDiagnostics,
   sensitiveValues: readonly string[],
@@ -777,6 +837,7 @@ export async function runDoctor(dependencies: DoctorDependencies): Promise<Docto
   checks.push(await checkConfig(dependencies, sensitiveValues));
   checks.push(await checkPostgresVersion(dependencies.database, sensitiveValues));
   checks.push(await checkDatabaseSchema(dependencies.database, sensitiveValues));
+  checks.push(await checkSearchCapability(dependencies.database, sensitiveValues));
   checks.push(await checkMediaCacheLedger(dependencies.database, sensitiveValues));
   checks.push(await checkOwner(dependencies.database, sensitiveValues));
   const telegramIdentity = await checkTelegramBot(dependencies, sensitiveValues);

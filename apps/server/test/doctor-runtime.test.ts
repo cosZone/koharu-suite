@@ -4,6 +4,31 @@ import { PostgresDoctorDiagnostics, TelegramDoctorDiagnostics } from '../src/ops
 import type { TelegramApi } from '../src/telegram/api.js';
 
 describe('doctor runtime adapters', () => {
+  it('reads only the pg_trgm extension version and canonical search index definition', async () => {
+    const execute = vi.fn(async (_query: unknown) => [
+      {
+        indexDefinition:
+          'CREATE INDEX message_revisions_text_trgm_idx ON public.message_revisions USING gin (text gin_trgm_ops) WHERE (text IS NOT NULL)',
+        pgTrgmVersion: '1.6',
+      },
+    ]);
+    const diagnostics = new PostgresDoctorDiagnostics({
+      execute,
+    } as unknown as Database);
+
+    await expect(diagnostics.getSearchCapabilitySnapshot()).resolves.toEqual({
+      indexDefinition:
+        'CREATE INDEX message_revisions_text_trgm_idx ON public.message_revisions USING gin (text gin_trgm_ops) WHERE (text IS NOT NULL)',
+      pgTrgmVersion: '1.6',
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    const serializedQuery = JSON.stringify(execute.mock.calls[0]?.[0]);
+    expect(serializedQuery).toContain('pg_extension');
+    expect(serializedQuery).toContain('pg_get_indexdef');
+    expect(serializedQuery).toContain('message_revisions_text_trgm_idx');
+    expect(serializedQuery).not.toContain('message_revisions.text');
+  });
+
   it('checks migration tables and required columns without interpolating object names', async () => {
     const execute = vi
       .fn()

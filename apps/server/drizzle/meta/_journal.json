@@ -134,6 +134,20 @@
       "when": 1784892737966,
       "tag": "0018_dapper_imperial_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1784894480646,
+      "tag": "0019_enable-pg-trgm",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1784894500606,
+      "tag": "0020_naive_rocket_raccoon",
+      "breakpoints": true
     }
   ]
 }
