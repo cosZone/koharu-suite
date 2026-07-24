@@ -194,6 +194,9 @@ describe('persistent media blob backends', () => {
     const registry = new PersistentBlobBackendRegistry([local, s3]);
 
     expect(registry.pair('local', 's3-default')).toEqual({ source: local, target: s3 });
+    expect(registry.find('local')).toBe(local);
+    expect(registry.find('provider-private')).toBeUndefined();
+    expect(new PersistentBlobBackendRegistry([local]).find('s3-default')).toBeUndefined();
     expect(() => registry.pair('local', 'local')).toThrow('Only local and s3-default');
     expect(() => registry.get('provider-private')).toThrow('Unsupported');
     expect(() => new PersistentBlobBackendRegistry([local, local])).toThrow('Duplicate');

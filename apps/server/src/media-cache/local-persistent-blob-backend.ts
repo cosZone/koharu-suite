@@ -182,11 +182,18 @@ export class PersistentBlobBackendRegistry {
     }
   }
 
+  find(id: string): PersistentBlobBackend | undefined {
+    if (id !== 'local' && id !== 's3-default') {
+      return undefined;
+    }
+    return this.#backends.get(id);
+  }
+
   get(id: string): PersistentBlobBackend {
     if (id !== 'local' && id !== 's3-default') {
       throw new TypeError('Unsupported persistent media backend');
     }
-    const backend = this.#backends.get(id);
+    const backend = this.find(id);
     if (!backend) {
       throw new Error(`Persistent media backend ${id} is unavailable`);
     }
