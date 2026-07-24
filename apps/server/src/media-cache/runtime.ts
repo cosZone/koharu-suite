@@ -7,7 +7,7 @@ import type { GrammyTelegramApi } from '../telegram/api.js';
 import { LocalMediaBlobStore } from './blob-store.js';
 import { MediaCacheCommandProcessor, PostgresMediaCacheCommandQueue } from './command-queue.js';
 import { PostgresMediaCacheDiscoveryRepository } from './discovery-repository.js';
-import { MediaCacheEvictionService } from './eviction-repository.js';
+import { type MediaCacheBlobEvictor, MediaCacheEvictionService } from './eviction-repository.js';
 import {
   MEDIA_CACHE_ADVISORY_LOCK,
   PostgresMediaCacheLedgerRepository,
@@ -30,6 +30,10 @@ interface MediaCacheRunOnce {
 interface MediaCacheCapacity {
   initialize(): Promise<void>;
   pruneConfiguredExcess(signal?: AbortSignal): Promise<void>;
+}
+
+interface MediaCacheCapacityBlobStore extends MediaCacheBlobEvictor {
+  initialize(): Promise<void>;
 }
 
 export interface MediaCacheWorkerRuntimeOptions {
@@ -207,7 +211,7 @@ class PostgresMediaCacheCapacity implements MediaCacheCapacity {
 
   constructor(
     private readonly database: Database,
-    private readonly blobStore: LocalMediaBlobStore,
+    private readonly blobStore: MediaCacheCapacityBlobStore,
     private readonly maxBytes: number,
     private readonly leaseOwner: string,
   ) {
