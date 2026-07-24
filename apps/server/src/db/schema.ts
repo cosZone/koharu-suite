@@ -1481,7 +1481,9 @@ export const mediaCacheCommands = pgTable(
   'media_cache_commands',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    operation: varchar('operation', { length: 16 }).$type<'evict' | 'reconcile'>().notNull(),
+    operation: varchar('operation', { length: 16 })
+      .$type<'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore'>()
+      .notNull(),
     state: varchar('state', { length: 16 })
       .$type<'failed' | 'pending' | 'running' | 'succeeded'>()
       .notNull()
@@ -1489,6 +1491,15 @@ export const mediaCacheCommands = pgTable(
     objectId: uuid('object_id').references(() => mediaCacheObjects.id, {
       onDelete: 'restrict',
     }),
+    sourceBackendId: varchar('source_backend_id', { length: 64 }).references(
+      () => mediaStorageBackends.id,
+      { onDelete: 'restrict' },
+    ),
+    targetBackendId: varchar('target_backend_id', { length: 64 }).references(
+      () => mediaStorageBackends.id,
+      { onDelete: 'restrict' },
+    ),
+    targetBytes: bigint('target_bytes', { mode: 'bigint' }),
     initiatorId: text('initiator_id').notNull(),
     reason: text('reason').notNull(),
     attemptCount: integer('attempt_count').notNull().default(0),
@@ -1506,14 +1517,45 @@ export const mediaCacheCommands = pgTable(
       .on(table.state, table.leaseExpiresAt, table.createdAt, table.id)
       .where(sql`${table.state} in ('pending', 'running')`),
     index('media_cache_commands_object_idx').on(table.objectId, table.createdAt, table.id),
+    index('media_cache_commands_backend_idx').on(table.targetBackendId, table.createdAt, table.id),
     check(
       'media_cache_commands_operation_check',
-      sql`${table.operation} in ('evict', 'reconcile')`,
+      sql`${table.operation} in ('evict', 'migrate', 'prune', 'reconcile', 'restore')`,
     ),
     check(
       'media_cache_commands_target_check',
-      sql`(${table.operation} = 'evict' and ${table.objectId} is not null)
-        or (${table.operation} = 'reconcile' and ${table.objectId} is null)`,
+      sql`(
+          ${table.operation} = 'evict'
+          and ${table.objectId} is not null
+          and ${table.sourceBackendId} is null
+          and ${table.targetBackendId} is null
+          and ${table.targetBytes} is null
+        ) or (
+          ${table.operation} = 'reconcile'
+          and ${table.objectId} is null
+          and ${table.sourceBackendId} is null
+          and ${table.targetBackendId} is null
+          and ${table.targetBytes} is null
+        ) or (
+          ${table.operation} = 'migrate'
+          and ${table.sourceBackendId} is not null
+          and ${table.targetBackendId} is not null
+          and ${table.sourceBackendId} <> ${table.targetBackendId}
+          and ${table.targetBytes} is null
+        ) or (
+          ${table.operation} = 'restore'
+          and ${table.objectId} is not null
+          and ${table.sourceBackendId} is null
+          and ${table.targetBackendId} is not null
+          and ${table.targetBytes} is null
+        ) or (
+          ${table.operation} = 'prune'
+          and ${table.objectId} is null
+          and ${table.sourceBackendId} is null
+          and ${table.targetBackendId} is not null
+          and ${table.targetBytes} is not null
+          and ${table.targetBytes} >= 0
+        )`,
     ),
     check(
       'media_cache_commands_initiator_check',

@@ -11,6 +11,7 @@ import {
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -447,6 +448,43 @@ describe('PostgreSQL media cache Admin service', () => {
       state: 'pending',
     });
     expect(JSON.stringify(result)).not.toContain(SHA256);
+  });
+
+  it('roundtrips bigint prune payloads through a claimed durable command', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await connection.db.insert(mediaStorageBackends).values({
+      configFingerprint: 'a'.repeat(64),
+      id: 's3-default',
+      kind: 's3',
+      label: 'S3',
+      maxBytes: 5_368_709_120n,
+    });
+    const queue = new PostgresMediaCacheCommandQueue(connection.db);
+    const receipt = await queue.enqueue({
+      initiatorId: 'owner-user-id',
+      operation: 'prune',
+      reason: 'enforce the configured S3 capacity',
+      targetBackendId: 's3-default',
+      targetBytes: 4_294_967_296n,
+    });
+
+    const command = await queue.claim({ leaseOwner: 'worker:test' });
+
+    expect(command).toMatchObject({
+      id: receipt.commandId,
+      objectId: null,
+      operation: 'prune',
+      sourceBackendId: null,
+      targetBackendId: 's3-default',
+      targetBytes: 4_294_967_296n,
+    });
+    if (!command) throw new Error('Command was not claimed');
+    await queue.succeed(command, {
+      prunedBlobCount: 0,
+      prunedBytes: '0',
+      readyBytes: '0',
+      targetBackendId: 's3-default',
+    });
   });
 
   it('executes an eviction command once and never exposes its blob identity in the result', async () => {

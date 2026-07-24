@@ -12,6 +12,7 @@ import {
   mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
+  mediaCacheCommands,
   mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
@@ -120,6 +121,7 @@ describe('G2.4 media storage schema', () => {
       truncate table
         ${mediaCacheObjectProtections},
         ${mediaCacheActions},
+        ${mediaCacheCommands},
         ${mediaBlobLocations},
         ${mediaStorageBackends},
         ${mediaCacheObjects},
@@ -322,6 +324,75 @@ describe('G2.4 media storage schema', () => {
       ownerId: 'owner-user-id',
       reason: 'Keep the shared original available',
     });
+  }, 30_000);
+
+  it('accepts only typed storage operation command targets', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const database = connection.db;
+    const object = await insertObjectFixture(connection);
+    const fingerprint = 'f'.repeat(64);
+    await database.insert(mediaStorageBackends).values([
+      {
+        configFingerprint: fingerprint,
+        id: 'local',
+        kind: 'local',
+        label: 'Local hot cache',
+        maxBytes: 5_368_709_120n,
+      },
+      {
+        configFingerprint: fingerprint,
+        id: 's3-default',
+        kind: 's3',
+        label: 'S3 durable cache',
+        maxBytes: 5_368_709_120n,
+      },
+    ]);
+
+    await expect(
+      database.insert(mediaCacheCommands).values([
+        {
+          initiatorId: 'owner-user-id',
+          objectId: object.id,
+          operation: 'migrate',
+          reason: 'Copy one object to durable storage',
+          sourceBackendId: 'local',
+          targetBackendId: 's3-default',
+        },
+        {
+          initiatorId: 'owner-user-id',
+          objectId: object.id,
+          operation: 'restore',
+          reason: 'Restore the local hot copy',
+          targetBackendId: 'local',
+        },
+        {
+          initiatorId: 'owner-user-id',
+          operation: 'prune',
+          reason: 'Apply the reviewed S3 budget',
+          targetBackendId: 's3-default',
+          targetBytes: 1_024n,
+        },
+      ]),
+    ).resolves.toBeDefined();
+
+    await expect(
+      database.insert(mediaCacheCommands).values({
+        initiatorId: 'owner-user-id',
+        operation: 'migrate',
+        reason: 'Invalid same-backend copy',
+        sourceBackendId: 'local',
+        targetBackendId: 'local',
+      }),
+    ).rejects.toThrow();
+    await expect(
+      database.insert(mediaCacheCommands).values({
+        initiatorId: 'owner-user-id',
+        operation: 'prune',
+        reason: 'Invalid negative budget',
+        targetBackendId: 's3-default',
+        targetBytes: -1n,
+      }),
+    ).rejects.toThrow();
   }, 30_000);
 
   it('upgrades a populated G2.3 database before adding the verified identity FK', async () => {

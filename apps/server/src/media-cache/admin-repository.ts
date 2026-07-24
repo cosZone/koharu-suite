@@ -9,6 +9,10 @@ import {
   mediaCacheRuntime,
   messageMedia,
 } from '../db/schema.js';
+import {
+  type MediaCacheCommandOperation,
+  sanitizeStorageOperationResult,
+} from './command-queue.js';
 
 const objectCursorSchema = z
   .object({
@@ -59,7 +63,7 @@ export interface MediaCacheAdminStatus {
     createdAt: string;
     errorCode: string | null;
     id: string;
-    operation: 'evict' | 'reconcile';
+    operation: MediaCacheCommandOperation;
     result: Record<string, unknown> | null;
     state: 'failed' | 'pending' | 'running' | 'succeeded';
     updatedAt: string;
@@ -166,7 +170,7 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
         ...command,
         completedAt: command.completedAt?.toISOString() ?? null,
         createdAt: command.createdAt.toISOString(),
-        result: sanitizeCommandResult(command.operation, command.result),
+        result: sanitizeMediaCacheCommandResult(command.operation, command.result),
         updatedAt: command.updatedAt.toISOString(),
       })),
       enabled: this.config.enabled,
@@ -243,8 +247,8 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
   }
 }
 
-function sanitizeCommandResult(
-  operation: 'evict' | 'reconcile',
+export function sanitizeMediaCacheCommandResult(
+  operation: MediaCacheCommandOperation,
   result: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
   if (!result) return null;
@@ -265,22 +269,25 @@ function sanitizeCommandResult(
       ...(isDecimalString(result.readyBytes) ? { readyBytes: result.readyBytes } : {}),
     };
   }
-  const sanitized: Record<string, unknown> = {};
-  for (const key of [
-    'checked',
-    'missing',
-    'orphanFailed',
-    'orphanFound',
-    'orphanRecovered',
-    'pages',
-    'repairFailed',
-    'repaired',
-  ]) {
-    if (Number.isSafeInteger(result[key]) && Number(result[key]) >= 0) {
-      sanitized[key] = result[key];
+  if (operation === 'reconcile') {
+    const sanitized: Record<string, unknown> = {};
+    for (const key of [
+      'checked',
+      'missing',
+      'orphanFailed',
+      'orphanFound',
+      'orphanRecovered',
+      'pages',
+      'repairFailed',
+      'repaired',
+    ]) {
+      if (Number.isSafeInteger(result[key]) && Number(result[key]) >= 0) {
+        sanitized[key] = result[key];
+      }
     }
+    return sanitized;
   }
-  return sanitized;
+  return sanitizeStorageOperationResult(operation, result);
 }
 
 function isDecimalString(value: unknown): value is string {
