@@ -14,13 +14,13 @@ Core principles:
   posts;
 - build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
 
-[G2.2 #19](https://github.com/cosZone/koharu-suite/issues/19) adds auditable reconciliation and recovery on top
-of multi-channel ingestion and Desktop history imports:
+[G2.3 #22](https://github.com/cosZone/koharu-suite/issues/22) adds an optional local media cache on top of
+multi-channel archiving and auditable recovery:
 
-- `apps/server`: Hono API, persisted and scheduled reconciliation, explicit Desktop coverage, exact lineage,
-  deterministic repair, owner tombstones, scoped service tokens, and `kodama doctor`;
-- `apps/admin`: a React and Vite Owner Desk for archive operations, paginated findings, Desktop recovery
-  guidance, explicit repair, and hide/unhide;
+- `apps/server`: Hono API, PostgreSQL ledger, crash-safe content-addressed blob store, Bot and explicit
+  Desktop caching, bounded thumbnails, public media routes, and `kodama media` operations;
+- `apps/admin`: a React and Vite Owner Desk for sanitized status, paginated objects, retry, eviction, and
+  reconciliation;
 - PostgreSQL 18, Testcontainers, Docker Compose, and CI.
 
 See [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1) for the complete roadmap.
@@ -28,6 +28,8 @@ See the [deployment guide](./docs/deployment/README.en.md) for production setup,
 rollback.
 See the [reconciliation and recovery guide](./docs/reconciliation/README.en.md) for Telegram gap evidence,
 Desktop-assisted recovery, explicit repair, and tombstone behavior.
+See the [media cache operations guide](./docs/media-cache/README.en.md) for capacity, privacy, backup,
+deletion, and crash recovery of the optional local cache.
 
 ## Local development
 

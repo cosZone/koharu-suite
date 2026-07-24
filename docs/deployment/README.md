@@ -79,6 +79,27 @@ docker compose exec worker node dist/cli.js health worker
 `/healthz` 只证明 HTTP 进程存活；`/readyz` 还会探测 PostgreSQL。worker heartbeat 每 10 秒刷新，
 超过 30 秒视为 stale。反向代理只应把流量转到 server 的 3000 端口。
 
+## 可选本地媒体缓存
+
+媒体缓存默认关闭。启用时在 `.env` 增加：
+
+```dotenv
+MEDIA_CACHE_ENABLED=true
+MEDIA_CACHE_MAX_BYTES=5368709120
+MEDIA_CACHE_DOWNLOAD_CONCURRENCY=2
+```
+
+Compose 会把同一个 `media-cache-data` volume 以 read-write 挂载到 worker、以 read-only 挂载到
+server；两者固定使用 `/var/lib/koharu/media-cache`。不要用 override 把 server 改为可写，也不要让
+两个 worker 共享这个 Preview volume。镜像会为首次创建的 named volume 预置 `.tmp/` 与 `blobs/`；
+server 只验证该布局且不会创建目录。非 Compose 部署必须先准备完整目录并配置权限，再启动 server，
+否则启用缓存的 server 会 fail closed。
+
+升级备份只要求 PostgreSQL；cache bytes 可以由 source evidence 重建。若要保留 warm cache，必须
+停止 server/worker 后在同一个停机窗口同时快照数据库和完整 volume。卷丢失、整体删除、权限修复、
+dry-run prune、reconcile 与 Telegram fallback 的详细流程见
+[媒体缓存运维手册](../media-cache/README.md)。
+
 ## 本地可重复 smoke
 
 仓库内的 smoke 使用合成消息和本地 Telegram fixture，不需要真实 secret：

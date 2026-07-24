@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   resolveAuthConfig,
   resolveDatabaseUrl,
+  resolveMediaCacheConfig,
   resolvePort,
   resolvePublicApiConfig,
   resolveTelegramConfig,
@@ -197,6 +198,42 @@ describe('configuration', () => {
       rateLimitWindowMs: 60_000,
       trustProxy: false,
     });
+  });
+
+  it('keeps the media cache disabled by default with the 5 GiB application budget', () => {
+    expect(resolveMediaCacheConfig({})).toEqual({
+      downloadConcurrency: 2,
+      enabled: false,
+      maxBytes: 5 * 1024 * 1024 * 1024,
+      root: '/var/lib/koharu/media-cache',
+    });
+  });
+
+  it('parses explicit bounded media cache settings', () => {
+    expect(
+      resolveMediaCacheConfig({
+        MEDIA_CACHE_DOWNLOAD_CONCURRENCY: '4',
+        MEDIA_CACHE_ENABLED: 'true',
+        MEDIA_CACHE_MAX_BYTES: String(128 * 1024 * 1024),
+        MEDIA_CACHE_ROOT: '/srv/koharu/cache/',
+      }),
+    ).toEqual({
+      downloadConcurrency: 4,
+      enabled: true,
+      maxBytes: 128 * 1024 * 1024,
+      root: '/srv/koharu/cache/',
+    });
+  });
+
+  it.each([
+    { MEDIA_CACHE_DOWNLOAD_CONCURRENCY: '0' },
+    { MEDIA_CACHE_DOWNLOAD_CONCURRENCY: '5' },
+    { MEDIA_CACHE_ENABLED: '1' },
+    { MEDIA_CACHE_MAX_BYTES: '0' },
+    { MEDIA_CACHE_MAX_BYTES: String(5 * 1024 * 1024 * 1024 + 1) },
+    { MEDIA_CACHE_ROOT: 'relative/cache' },
+  ])('rejects unsafe media cache configuration: %j', (environment) => {
+    expect(() => resolveMediaCacheConfig(environment)).toThrow();
   });
 
   it('parses exact public origins, rate-limit bounds, and explicit proxy trust', () => {

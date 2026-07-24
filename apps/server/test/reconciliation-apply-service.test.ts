@@ -104,7 +104,7 @@ describe('reconciliation apply service', () => {
       },
       { runId: 'batch-apply-run' },
     );
-    expect(transaction.execute).toHaveBeenCalledOnce();
+    expect(transaction.execute).toHaveBeenCalledTimes(2);
     expect(transaction.transaction).toHaveBeenCalledOnce();
     expect(applied).toMatchObject({
       counts: { open: 0, repaired: 1, resolved: 1 },

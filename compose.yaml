@@ -63,6 +63,9 @@ services:
       ADMIN_ASSETS_ROOT: /app/admin
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET to at least 32 high-entropy characters}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:?Set BETTER_AUTH_URL to the canonical public origin}
+      MEDIA_CACHE_ENABLED: ${MEDIA_CACHE_ENABLED:-false}
+      MEDIA_CACHE_MAX_BYTES: ${MEDIA_CACHE_MAX_BYTES:-5368709120}
+      MEDIA_CACHE_ROOT: /var/lib/koharu/media-cache
       PORT: 3000
       PUBLIC_CORS_ORIGINS: ${PUBLIC_CORS_ORIGINS:-}
       PUBLIC_RATE_LIMIT_MAX: ${PUBLIC_RATE_LIMIT_MAX:-120}
@@ -83,6 +86,8 @@ services:
       - "${KOHARU_HTTP_PORT:-3000}:3000"
     restart: unless-stopped
     stop_grace_period: 30s
+    volumes:
+      - media-cache-data:/var/lib/koharu/media-cache:ro
 
   worker:
     <<: *kodama-image
@@ -95,6 +100,10 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *postgres-environment
+      MEDIA_CACHE_DOWNLOAD_CONCURRENCY: ${MEDIA_CACHE_DOWNLOAD_CONCURRENCY:-2}
+      MEDIA_CACHE_ENABLED: ${MEDIA_CACHE_ENABLED:-false}
+      MEDIA_CACHE_MAX_BYTES: ${MEDIA_CACHE_MAX_BYTES:-5368709120}
+      MEDIA_CACHE_ROOT: /var/lib/koharu/media-cache
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
       TELEGRAM_WORKER_CONCURRENCY: ${TELEGRAM_WORKER_CONCURRENCY:-4}
@@ -112,6 +121,9 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
+    volumes:
+      - media-cache-data:/var/lib/koharu/media-cache
 
 volumes:
+  media-cache-data:
   postgres-data:

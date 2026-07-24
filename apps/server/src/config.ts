@@ -1,3 +1,4 @@
+import { isAbsolute, normalize } from 'node:path';
 import { z } from 'zod';
 import { parseCorsOriginAllowlist } from './http/public-policy.js';
 
@@ -41,6 +42,21 @@ const postgresEnvironmentSchema = z.object({
   POSTGRES_PASSWORD: z.string(),
   POSTGRES_PORT: portSchema,
   POSTGRES_USER: z.string().min(1),
+});
+const MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+const mediaCacheEnvironmentSchema = z.object({
+  MEDIA_CACHE_DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
+  MEDIA_CACHE_ENABLED: z
+    .enum(['false', 'true'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  MEDIA_CACHE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(MEDIA_CACHE_MAX_BYTES)
+    .default(MEDIA_CACHE_MAX_BYTES),
+  MEDIA_CACHE_ROOT: z.string().trim().min(1).default('/var/lib/koharu/media-cache'),
 });
 
 function databaseUrlFromEnvironment(environment: NodeJS.ProcessEnv): string {
@@ -91,6 +107,13 @@ export interface PublicApiConfig {
   trustProxy: boolean;
 }
 
+export interface MediaCacheConfig {
+  downloadConcurrency: number;
+  enabled: boolean;
+  maxBytes: number;
+  root: string;
+}
+
 function parseAuthBaseUrl(value: string): string {
   const url = new URL(value);
   const isLocalHttp =
@@ -133,6 +156,21 @@ export function resolvePublicApiConfig(
     rateLimitMax: parsed.PUBLIC_RATE_LIMIT_MAX,
     rateLimitWindowMs: parsed.PUBLIC_RATE_LIMIT_WINDOW_SECONDS * 1_000,
     trustProxy: parsed.TRUST_PROXY,
+  };
+}
+
+export function resolveMediaCacheConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): MediaCacheConfig {
+  const parsed = mediaCacheEnvironmentSchema.parse(environment);
+  if (!isAbsolute(parsed.MEDIA_CACHE_ROOT)) {
+    throw new Error('MEDIA_CACHE_ROOT must be an absolute path');
+  }
+  return {
+    downloadConcurrency: parsed.MEDIA_CACHE_DOWNLOAD_CONCURRENCY,
+    enabled: parsed.MEDIA_CACHE_ENABLED,
+    maxBytes: parsed.MEDIA_CACHE_MAX_BYTES,
+    root: normalize(parsed.MEDIA_CACHE_ROOT),
   };
 }
 

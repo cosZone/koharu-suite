@@ -12,19 +12,20 @@ Telegram 多频道归档、动态内容、统一管理与静态发布能力。
 - 内容与媒体可导出、可恢复，移除后端不影响既有静态站点；
 - 以 PostgreSQL 18、Astro 6 Live Content Collections 和开放 JSON API 为基础。
 
-当前 [G2.2 #19](https://github.com/cosZone/koharu-suite/issues/19) 在多频道采集与 Desktop 历史导入之上
-补齐了可审计的对账与恢复能力：
+当前 [G2.3 #22](https://github.com/cosZone/koharu-suite/issues/22) 在多频道归档与可审计恢复之上增加了
+可选的本地媒体缓存：
 
-- `apps/server`：Hono API、持久化/定时 reconciliation、Desktop coverage 与精确 lineage、确定性 repair、
-  Owner tombstone、scoped service token 和 `kodama doctor`；
-- `apps/admin`：React + Vite Owner Desk，支持归档运维、finding 分页、Desktop 恢复指引、显式修复与
-  hide/unhide；
+- `apps/server`：Hono API、PostgreSQL 账本、crash-safe content-addressed blob store、Bot/显式
+  Desktop 缓存、bounded thumbnail、公开 media route 与 `kodama media` 运维命令；
+- `apps/admin`：React + Vite Owner Desk，支持脱敏状态、分页对象、retry、evict 与 reconcile；
 - PostgreSQL 18、Testcontainers、Docker Compose 与 CI。
 
 完整路线图见 [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1)。
 生产部署、升级、备份和回滚流程见[部署手册](./docs/deployment/README.md)。
 Telegram gap、Desktop 辅助恢复、显式修复与 tombstone 规则见
 [对账与恢复手册](./docs/reconciliation/README.md)。
+本地媒体缓存的容量、隐私、备份、删除与崩溃恢复见
+[媒体缓存运维手册](./docs/media-cache/README.md)。
 
 ## 本地开发
 

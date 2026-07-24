@@ -53,6 +53,10 @@ WORKDIR /app
 COPY --from=build /opt/koharu-suite ./
 COPY --from=build /app/apps/admin/dist ./admin
 
+RUN mkdir -p /var/lib/koharu/media-cache/.tmp /var/lib/koharu/media-cache/blobs \
+  && chown -R node:node /var/lib/koharu/media-cache \
+  && chmod 0700 /var/lib/koharu/media-cache /var/lib/koharu/media-cache/.tmp /var/lib/koharu/media-cache/blobs
+
 USER node
 
 EXPOSE 3000

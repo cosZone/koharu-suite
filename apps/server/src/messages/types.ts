@@ -88,12 +88,16 @@ export interface PublicChannel {
 }
 
 export interface PublicMedia {
+  cacheStatus: 'pending' | 'ready' | 'unavailable';
   duration: number | null;
   fileName: string | null;
   fileSize: string | null;
   height: number | null;
+  id: string;
   kind: NormalizedMediaKind;
   mimeType: string | null;
+  originalUrl: string | null;
+  thumbnailUrl: string | null;
   width: number | null;
 }
 

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ServerRuntime, WorkerRuntime, type WorkerRuntimeDependencies } from '../src/runtime.js';
+import {
+  MediaCacheAccessRuntime,
+  ServerRuntime,
+  WorkerRuntime,
+  type WorkerRuntimeDependencies,
+} from '../src/runtime.js';
 
 function pending(): Promise<void> {
   return new Promise(() => {});
@@ -110,6 +115,47 @@ describe('server runtime', () => {
     await expect(runtime.stop()).rejects.toBe(error);
     expect(closeDatabase).toHaveBeenCalledOnce();
   });
+
+  it('stops HTTP, flushes media observations, and then closes the database', async () => {
+    const order: string[] = [];
+    const runtime = new ServerRuntime(
+      pending(),
+      async () => {
+        order.push('http');
+      },
+      async () => {
+        order.push('database');
+      },
+      async () => {
+        order.push('media');
+      },
+    );
+
+    await runtime.stop();
+
+    expect(order).toEqual(['http', 'media', 'database']);
+  });
+});
+
+describe('media cache access runtime', () => {
+  it('flushes on schedule and performs one final flush when closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const flush = vi.fn(async () => {});
+      const runtime = new MediaCacheAccessRuntime({ flush }, 1_000);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(flush).toHaveBeenCalledOnce();
+
+      await runtime.close();
+      expect(flush).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(flush).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('worker runtime', () => {
@@ -141,6 +187,34 @@ describe('worker runtime', () => {
       'polling-database',
       'main-database',
     ]);
+  });
+
+  it('owns an installed media cache worker as part of the worker lifecycle', async () => {
+    const order: string[] = [];
+    const dependencies = workerDependencies(order, {
+      mediaCacheWorker: {
+        done: pending(),
+        initialize: vi.fn(async () => {
+          order.push('media:initialize');
+        }),
+        start: vi.fn(() => {
+          order.push('media:start');
+          return pending();
+        }),
+        stop: vi.fn(async () => {
+          order.push('media:stop');
+        }),
+      },
+    });
+    const runtime = new WorkerRuntime('worker-media', dependencies, 60_000);
+
+    await runtime.start();
+    expect(order.indexOf('media:initialize')).toBeLessThan(order.indexOf('media:start'));
+    expect(order).toContain('media:start');
+
+    await runtime.stop();
+    expect(order).toContain('media:stop');
+    expect(order.indexOf('media:stop')).toBeLessThan(order.indexOf('main-database'));
   });
 
   it('refreshes heartbeat on schedule and stops refreshing during shutdown', async () => {

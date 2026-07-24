@@ -129,6 +129,63 @@ interface ReconciliationRun {
   status: string;
 }
 
+export interface MediaCacheStatus {
+  commands: Array<{
+    completedAt: string | null;
+    createdAt: string;
+    errorCode: string | null;
+    id: string;
+    operation: 'evict' | 'reconcile';
+    result: Record<string, unknown> | null;
+    state: 'failed' | 'pending' | 'running' | 'succeeded';
+    updatedAt: string;
+  }>;
+  enabled: boolean;
+  failures: Array<{
+    lastErrorClass: string | null;
+    lastErrorCode: string | null;
+    objectId: string;
+    planId: string;
+    reasonCode: string | null;
+    state: string;
+    updatedAt: string;
+    variant: 'original' | 'thumbnail';
+  }>;
+  stateCounts: {
+    blobs: Array<{ count: number; state: string }>;
+    objects: Array<{ count: number; state: string }>;
+    plans: Array<{ count: number; state: string }>;
+  };
+  usage: {
+    lastReconciledAt: string | null;
+    maxBytes: string;
+    readyBytes: string;
+    reservedBytes: string;
+    updatedAt: string | null;
+  };
+}
+
+export interface MediaCacheObject {
+  actualBytes: string | null;
+  canonicalMediaId: string;
+  declaredBytes: string | null;
+  id: string;
+  kind: string;
+  messageId: string;
+  planId: string;
+  planState: string;
+  reasonCode: string | null;
+  state: string;
+  updatedAt: string;
+  variant: 'original' | 'thumbnail';
+}
+
+interface MediaCacheCommandReceipt {
+  commandId: string;
+  operation: 'evict' | 'reconcile';
+  state: 'pending';
+}
+
 type AuthStep = 'login' | 'two-factor';
 type VerifyMethod = 'recovery' | 'totp';
 
@@ -152,6 +209,21 @@ function formatDate(value: string): string {
     month: 'short',
     year: 'numeric',
   }).format(new Date(value));
+}
+
+function formatBytes(value: string): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1_024) return `${bytes} B`;
+  const units = ['KiB', 'MiB', 'GiB'];
+  let amount = bytes;
+  let unit = 'B';
+  for (const candidate of units) {
+    amount /= 1_024;
+    unit = candidate;
+    if (amount < 1_024 || candidate === 'GiB') break;
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${unit}`;
 }
 
 const SAFE_MESSAGE_TAGS = new Set([
@@ -849,6 +921,240 @@ function OperationsPanel({
   );
 }
 
+interface MediaCachePanelProps {
+  busyAction: string | null;
+  nextCursor: string | null;
+  notice: string | null;
+  objects: MediaCacheObject[];
+  onAction(object: MediaCacheObject, action: 'evict' | 'retry', reason: string): void;
+  onLoadMore(): void;
+  onReasonChange(key: string, reason: string): void;
+  onReconcile(reason: string): void;
+  reasons: Record<string, string>;
+  status: MediaCacheStatus;
+}
+
+export function MediaCachePanel({
+  busyAction,
+  nextCursor,
+  notice,
+  objects,
+  onAction,
+  onLoadMore,
+  onReasonChange,
+  onReconcile,
+  reasons,
+  status,
+}: MediaCachePanelProps) {
+  const readyBytes = Number(status.usage.readyBytes);
+  const reservedBytes = Number(status.usage.reservedBytes);
+  const maxBytes = Math.max(1, Number(status.usage.maxBytes));
+  const reconcileReason = reasons.reconcile?.trim() ?? '';
+
+  return (
+    <section className="media-cache" aria-labelledby="media-cache-title">
+      <div className="media-cache__heading">
+        <div>
+          <Kicker>LOCAL CACHE</Kicker>
+          <h2 id="media-cache-title">媒体缓存</h2>
+          <p>缓存可随时重建；删除本地副本不会删除文章、媒体 metadata 或来源证据。</p>
+        </div>
+        <Badge tone={status.enabled ? 'success' : 'neutral'}>
+          {status.enabled ? '已启用' : '未启用'}
+        </Badge>
+      </div>
+
+      <div className="media-cache__usage">
+        <div className="media-cache__usage-item">
+          <span>已使用</span>
+          <strong>{formatBytes(status.usage.readyBytes)}</strong>
+        </div>
+        <div className="media-cache__usage-item">
+          <span>已预留</span>
+          <strong>{formatBytes(status.usage.reservedBytes)}</strong>
+        </div>
+        <div className="media-cache__usage-item">
+          <span>上限</span>
+          <strong>{formatBytes(status.usage.maxBytes)}</strong>
+        </div>
+        <progress
+          aria-label="媒体缓存容量"
+          max={maxBytes}
+          value={Math.min(maxBytes, Math.max(0, readyBytes + reservedBytes))}
+        />
+      </div>
+
+      <ul className="media-cache__counts" aria-label="媒体缓存状态计数">
+        {status.stateCounts.objects.map((entry) => (
+          <li key={entry.state}>
+            <strong>{entry.count}</strong> {entry.state}
+          </li>
+        ))}
+        {status.stateCounts.objects.length === 0 ? <li>暂无缓存对象</li> : null}
+      </ul>
+
+      {notice ? (
+        <p className="media-cache__notice" role="status">
+          {notice}
+        </p>
+      ) : null}
+
+      {status.failures.length > 0 ? (
+        <div className="media-cache__failures">
+          <h3>最近失败</h3>
+          <ul>
+            {status.failures.map((failure) => (
+              <li key={failure.objectId}>
+                <code>{failure.objectId.slice(0, 8)}</code>
+                <span>
+                  {failure.variant} · {failure.state} ·{' '}
+                  {failure.reasonCode ??
+                    failure.lastErrorCode ??
+                    failure.lastErrorClass ??
+                    'unknown'}
+                </span>
+                <time dateTime={failure.updatedAt}>{formatDate(failure.updatedAt)}</time>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {status.commands.length > 0 ? (
+        <div className="media-cache__failures">
+          <h3>最近的维护命令</h3>
+          <ul>
+            {status.commands.map((command) => (
+              <li key={command.id}>
+                <code>{command.id.slice(0, 8)}</code>
+                <span>
+                  {command.operation} · {command.state}
+                  {command.errorCode ? ` · ${command.errorCode}` : ''}
+                </span>
+                <time dateTime={command.updatedAt}>{formatDate(command.updatedAt)}</time>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <div className="media-cache__objects">
+        {objects.map((object) => {
+          const reason = reasons[object.id]?.trim() ?? '';
+          const canEvict = object.state === 'ready';
+          const canRetry = [
+            'blocked',
+            'evicted',
+            'integrity_conflict',
+            'missing',
+            'retry_wait',
+            'skipped',
+          ].includes(object.state);
+          const busy = busyAction !== null;
+          return (
+            <article key={object.id}>
+              <header>
+                <div>
+                  <strong>
+                    {object.kind} · {object.variant}
+                  </strong>
+                  <code>{object.id}</code>
+                </div>
+                <Badge
+                  tone={
+                    object.state === 'ready'
+                      ? 'success'
+                      : object.state === 'blocked' || object.state === 'integrity_conflict'
+                        ? 'warning'
+                        : 'neutral'
+                  }
+                >
+                  {object.state}
+                </Badge>
+              </header>
+              <p>
+                Post {object.planState} ·{' '}
+                {object.actualBytes
+                  ? formatBytes(object.actualBytes)
+                  : object.declaredBytes
+                    ? `声明 ${formatBytes(object.declaredBytes)}`
+                    : '大小未知'}
+                {object.reasonCode ? ` · ${object.reasonCode}` : ''}
+              </p>
+              {canEvict || canRetry ? (
+                <>
+                  <Field label="操作原因（必填，将写入审计记录）">
+                    <Input
+                      disabled={busy}
+                      maxLength={500}
+                      onChange={(event) => onReasonChange(object.id, event.target.value)}
+                      placeholder={canEvict ? '例如：主动释放本地空间' : '例如：上游文件已恢复'}
+                      value={reasons[object.id] ?? ''}
+                    />
+                  </Field>
+                  <div className="media-cache__actions">
+                    {canRetry ? (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        onClick={() => onAction(object, 'retry', reason)}
+                        type="button"
+                      >
+                        {busyAction === `${object.id}:retry` ? '正在重试…' : '重试'}
+                      </Button>
+                    ) : null}
+                    {canEvict ? (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        onClick={() => onAction(object, 'evict', reason)}
+                        type="button"
+                        variant="danger"
+                      >
+                        {busyAction === `${object.id}:evict` ? '正在驱逐…' : '驱逐本地副本'}
+                      </Button>
+                    ) : null}
+                  </div>
+                </>
+              ) : null}
+            </article>
+          );
+        })}
+        {objects.length === 0 ? (
+          <EmptyState tone="success">
+            {status.enabled
+              ? '尚未发现可缓存媒体。'
+              : '启用 MEDIA_CACHE_ENABLED 后才会建立本地副本。'}
+          </EmptyState>
+        ) : null}
+        {nextCursor ? (
+          <Button disabled={busyAction !== null} onClick={onLoadMore} type="button" variant="quiet">
+            加载更多缓存对象
+          </Button>
+        ) : null}
+      </div>
+
+      <div className="media-cache__reconcile">
+        <Field label="对账原因（必填，将写入审计记录）">
+          <Input
+            disabled={busyAction !== null}
+            maxLength={500}
+            onChange={(event) => onReasonChange('reconcile', event.target.value)}
+            placeholder="例如：卷已恢复，需要核对 DB 与文件系统"
+            value={reasons.reconcile ?? ''}
+          />
+        </Field>
+        <Button
+          disabled={busyAction !== null || reconcileReason.length === 0}
+          onClick={() => onReconcile(reconcileReason)}
+          type="button"
+          variant="quiet"
+        >
+          {busyAction === 'reconcile' ? '正在对账…' : '运行媒体缓存对账'}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 interface ReconciliationPanelProps {
   busy: boolean;
   findings: ReconciliationFinding[];
@@ -1019,6 +1325,12 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [reconciliationBusy, setReconciliationBusy] = useState<string | null>(null);
   const [reconciliationNotice, setReconciliationNotice] = useState<string | null>(null);
   const [reconciliationReasons, setReconciliationReasons] = useState<Record<string, string>>({});
+  const [mediaCacheStatus, setMediaCacheStatus] = useState<MediaCacheStatus | null>(null);
+  const [mediaCacheObjects, setMediaCacheObjects] = useState<MediaCacheObject[]>([]);
+  const [mediaCacheNextCursor, setMediaCacheNextCursor] = useState<string | null>(null);
+  const [mediaCacheBusy, setMediaCacheBusy] = useState<string | null>(null);
+  const [mediaCacheNotice, setMediaCacheNotice] = useState<string | null>(null);
+  const [mediaCacheReasons, setMediaCacheReasons] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1040,6 +1352,13 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
       fetchJson<{ items: ReconciliationRun[] }>('/api/v1/admin/reconciliation/runs?limit=5', {
         signal: controller.signal,
       }),
+      fetchJson<MediaCacheStatus>('/api/v1/admin/media-cache/status', {
+        signal: controller.signal,
+      }),
+      fetchJson<{ items: MediaCacheObject[]; nextCursor: string | null }>(
+        '/api/v1/admin/media-cache/objects?limit=20',
+        { signal: controller.signal },
+      ),
     ])
       .then(
         ([
@@ -1049,6 +1368,8 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           configuredChannelResult,
           findingResult,
           runResult,
+          nextMediaCacheStatus,
+          mediaCacheObjectResult,
         ]) => {
           setStatus(nextStatus);
           setChannels(channelResult.items);
@@ -1057,6 +1378,9 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           setReconciliationFindings(findingResult.items);
           setReconciliationNextCursor(findingResult.nextCursor);
           setReconciliationRuns(runResult.items);
+          setMediaCacheStatus(nextMediaCacheStatus);
+          setMediaCacheObjects(mediaCacheObjectResult.items);
+          setMediaCacheNextCursor(mediaCacheObjectResult.nextCursor);
           setSelectedChannel(channelResult.items[0]?.id ?? null);
         },
       )
@@ -1300,6 +1624,106 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     }
   }
 
+  async function refreshMediaCache() {
+    const [nextStatus, objectResult] = await Promise.all([
+      fetchJson<MediaCacheStatus>('/api/v1/admin/media-cache/status', { cache: 'no-store' }),
+      fetchJson<{ items: MediaCacheObject[]; nextCursor: string | null }>(
+        '/api/v1/admin/media-cache/objects?limit=20',
+        { cache: 'no-store' },
+      ),
+    ]);
+    setMediaCacheStatus(nextStatus);
+    setMediaCacheObjects(objectResult.items);
+    setMediaCacheNextCursor(objectResult.nextCursor);
+  }
+
+  async function loadMoreMediaCacheObjects() {
+    if (!mediaCacheNextCursor) return;
+    setMediaCacheBusy('more');
+    setError(null);
+    try {
+      const result = await fetchJson<{
+        items: MediaCacheObject[];
+        nextCursor: string | null;
+      }>(
+        `/api/v1/admin/media-cache/objects?limit=20&cursor=${encodeURIComponent(mediaCacheNextCursor)}`,
+      );
+      setMediaCacheObjects((current) => [...current, ...result.items]);
+      setMediaCacheNextCursor(result.nextCursor);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法加载更多缓存对象');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function actOnMediaCacheObject(
+    object: MediaCacheObject,
+    action: 'evict' | 'retry',
+    reason: string,
+  ) {
+    if (
+      action === 'evict' &&
+      !window.confirm('驱逐这份本地副本？文章、媒体 metadata 与 Telegram 来源证据会保留。')
+    ) {
+      return;
+    }
+    setMediaCacheBusy(`${object.id}:${action}`);
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      const result = await fetchJson<MediaCacheCommandReceipt | { state: 'retry_wait' }>(
+        `/api/v1/admin/media-cache/objects/${object.id}/${action}`,
+        {
+          body: JSON.stringify({ reason }),
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+        },
+      );
+      await refreshMediaCache();
+      setMediaCacheReasons((current) => {
+        const next = { ...current };
+        delete next[object.id];
+        return next;
+      });
+      setMediaCacheNotice(
+        action === 'evict' && 'commandId' in result
+          ? `驱逐命令已入队（${result.commandId}），将由 worker 执行。`
+          : '对象已重新进入缓存队列。',
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '媒体缓存操作失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function reconcileMediaCache(reason: string) {
+    if (!window.confirm('运行媒体缓存对账？只会修复缓存账本与可丢弃的本地副本。')) return;
+    setMediaCacheBusy('reconcile');
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      const result = await fetchJson<MediaCacheCommandReceipt>(
+        '/api/v1/admin/media-cache/reconcile',
+        {
+          body: JSON.stringify({ reason }),
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+        },
+      );
+      await refreshMediaCache();
+      setMediaCacheReasons((current) => ({ ...current, reconcile: '' }));
+      setMediaCacheNotice(
+        `媒体缓存对账命令已入队（${result.commandId}），worker 会自动完成全部分页。`,
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '媒体缓存对账失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
   async function signOut() {
     await authClient.signOut();
     await onSessionRevoked('已安全退出。');
@@ -1483,6 +1907,23 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
             onRerender={rerenderOutdated}
             onTaskAction={actOnTask}
           />
+
+          {mediaCacheStatus ? (
+            <MediaCachePanel
+              busyAction={mediaCacheBusy}
+              nextCursor={mediaCacheNextCursor}
+              notice={mediaCacheNotice}
+              objects={mediaCacheObjects}
+              onAction={actOnMediaCacheObject}
+              onLoadMore={loadMoreMediaCacheObjects}
+              onReasonChange={(key, reason) =>
+                setMediaCacheReasons((current) => ({ ...current, [key]: reason }))
+              }
+              onReconcile={reconcileMediaCache}
+              reasons={mediaCacheReasons}
+              status={mediaCacheStatus}
+            />
+          ) : null}
 
           <ReconciliationPanel
             busy={reconciliationBusy !== null}

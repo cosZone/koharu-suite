@@ -16,6 +16,7 @@ export KOHARU_IMAGE="${KOHARU_IMAGE:-koharu-suite-smoke:${project_name}}"
 export KOHARU_REVISION="${KOHARU_REVISION:-smoke}"
 export KOHARU_SOURCE="${KOHARU_SOURCE:-https://github.com/cosZone/koharu-suite}"
 export KOHARU_VERSION="${KOHARU_VERSION:-0.1.0-smoke}"
+export MEDIA_CACHE_ENABLED=true
 export POSTGRES_DB="${POSTGRES_DB:-koharu}"
 export POSTGRES_PASSWORD="compose-smoke-postgres-password"
 export POSTGRES_PUBLISHED_PORT="${KOHARU_SMOKE_POSTGRES_PORT:-55432}"
@@ -47,6 +48,17 @@ fi
   'test "${TELEGRAM_BOT_TOKEN+x}" != x && test "${KOHARU_TEST_TELEGRAM_API_ROOT+x}" != x'
 "${compose[@]}" exec --no-TTY worker sh -c \
   'test "${BETTER_AUTH_SECRET+x}" != x && test "${BETTER_AUTH_URL+x}" != x'
+"${compose[@]}" exec --no-TTY server sh -c \
+  'test -d /var/lib/koharu/media-cache/.tmp && test -d /var/lib/koharu/media-cache/blobs'
+"${compose[@]}" exec --no-TTY worker sh -c \
+  'test -w /var/lib/koharu/media-cache && printf "media-cache-volume-smoke\n" > /var/lib/koharu/media-cache/.compose-smoke'
+"${compose[@]}" exec --no-TTY server sh -c \
+  'test -r /var/lib/koharu/media-cache/.compose-smoke && grep -q media-cache-volume-smoke /var/lib/koharu/media-cache/.compose-smoke'
+if "${compose[@]}" exec --no-TTY server sh -c \
+  'printf "server-must-not-write\n" > /var/lib/koharu/media-cache/.server-write-test' 2>/dev/null; then
+  printf 'Server unexpectedly wrote to the read-only media cache volume.\n' >&2
+  exit 1
+fi
 
 node scripts/compose-smoke/assert-public-api.mjs
 
