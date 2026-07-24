@@ -28,7 +28,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run --exclude \"test/integration/**\"",
-    "test:integration": "vitest run test/integration",
+    "test:integration": "vitest run test/integration --maxWorkers=2 --testTimeout=15000 --hookTimeout=30000",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -36,11 +36,14 @@
     "@hono/node-server": "catalog:",
     "@streamparser/json": "0.0.22",
     "@streamparser/json-node": "0.0.22",
+    "abort-controller": "catalog:",
     "better-auth": "catalog:",
     "drizzle-orm": "catalog:",
+    "file-type": "catalog:",
     "grammy": "catalog:",
     "hono": "catalog:",
     "postgres": "catalog:",
+    "sharp": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

@@ -4,6 +4,7 @@ export type DoctorCheckId =
   | 'config'
   | 'postgres-version'
   | 'database-schema'
+  | 'media-cache-ledger'
   | 'owner'
   | 'telegram-bot'
   | 'telegram-channels';
@@ -32,10 +33,25 @@ export interface DoctorTelegramChannel {
 
 export interface DoctorDatabaseDiagnostics {
   getBoundTelegramBotId(): Promise<bigint | null>;
+  getMediaCacheLedgerSnapshot(): Promise<DoctorMediaCacheLedgerSnapshot>;
   getPostgresMajorVersion(): Promise<number>;
   listEnabledChannels(): Promise<DoctorTelegramChannel[]>;
   listMissingSchemaObjects(expectedObjects: readonly string[]): Promise<string[]>;
   listOwners(): Promise<DoctorOwner[]>;
+}
+
+export interface DoctorMediaCacheLedgerSnapshot {
+  activeThumbnailReservationCount: bigint;
+  activeThumbnailReservedBytes: bigint;
+  cacheRowCount: bigint;
+  originalReservationCount: bigint;
+  originalReservedBytes: bigint;
+  physicalBlobBytes: bigint;
+  physicalBlobCount: bigint;
+  runtimeMaxBytes: bigint | null;
+  runtimeReadyBytes: bigint | null;
+  runtimeReservedBytes: bigint | null;
+  runtimeRowCount: bigint;
 }
 
 export interface DoctorTelegramBot {
@@ -159,6 +175,167 @@ export const EXPECTED_DATABASE_OBJECTS = [
   'worker_runtime.instance_id',
   'worker_runtime.last_telegram_success_at',
   'worker_runtime.state',
+  'media_cache_runtime',
+  'media_cache_runtime.singleton_key',
+  'media_cache_runtime.discovery_cursor_created_at',
+  'media_cache_runtime.discovery_cursor_id',
+  'media_cache_runtime.ready_bytes',
+  'media_cache_runtime.reserved_bytes',
+  'media_cache_runtime.max_bytes',
+  'media_cache_runtime.last_reconciled_at',
+  'media_cache_runtime.updated_at',
+  'media_cache_post_plans',
+  'media_cache_post_plans.id',
+  'media_cache_post_plans.message_id',
+  'media_cache_post_plans.revision_id',
+  'media_cache_post_plans.state',
+  'media_cache_post_plans.ready_original_bytes',
+  'media_cache_post_plans.reserved_original_bytes',
+  'media_cache_post_plans.reason_code',
+  'media_cache_post_plans.last_error_class',
+  'media_cache_post_plans.last_error_code',
+  'media_cache_post_plans.attempt_count',
+  'media_cache_post_plans.available_at',
+  'media_cache_post_plans.lease_owner',
+  'media_cache_post_plans.lease_token',
+  'media_cache_post_plans.lease_expires_at',
+  'media_cache_post_plans.created_at',
+  'media_cache_post_plans.updated_at',
+  'media_cache_blobs',
+  'media_cache_blobs.sha256',
+  'media_cache_blobs.byte_length',
+  'media_cache_blobs.detected_mime',
+  'media_cache_blobs.relative_key',
+  'media_cache_blobs.state',
+  'media_cache_blobs.eviction_owner',
+  'media_cache_blobs.eviction_token',
+  'media_cache_blobs.eviction_expires_at',
+  'media_cache_blobs.last_accessed_at',
+  'media_cache_blobs.created_at',
+  'media_cache_blobs.updated_at',
+  'media_cache_objects',
+  'media_cache_objects.id',
+  'media_cache_objects.post_plan_id',
+  'media_cache_objects.revision_id',
+  'media_cache_objects.canonical_media_id',
+  'media_cache_objects.variant',
+  'media_cache_objects.recipe_version',
+  'media_cache_objects.state',
+  'media_cache_objects.blob_sha256',
+  'media_cache_objects.declared_bytes',
+  'media_cache_objects.reserved_bytes',
+  'media_cache_objects.actual_bytes',
+  'media_cache_objects.reason_code',
+  'media_cache_objects.last_error_class',
+  'media_cache_objects.last_error_code',
+  'media_cache_objects.attempt_count',
+  'media_cache_objects.available_at',
+  'media_cache_objects.lease_owner',
+  'media_cache_objects.lease_token',
+  'media_cache_objects.lease_expires_at',
+  'media_cache_objects.last_accessed_at',
+  'media_cache_objects.created_at',
+  'media_cache_objects.updated_at',
+  'media_cache_object_sources',
+  'media_cache_object_sources.object_id',
+  'media_cache_object_sources.source_media_observation_id',
+  'media_cache_object_sources.source_priority',
+  'media_cache_actions',
+  'media_cache_actions.id',
+  'media_cache_actions.object_id',
+  'media_cache_actions.blob_sha256',
+  'media_cache_actions.action_kind',
+  'media_cache_actions.initiator_kind',
+  'media_cache_actions.initiator_id',
+  'media_cache_actions.reason',
+  'media_cache_actions.before_state',
+  'media_cache_actions.after_state',
+  'media_cache_actions.created_at',
+  'media_cache_commands',
+  'media_cache_commands.id',
+  'media_cache_commands.operation',
+  'media_cache_commands.state',
+  'media_cache_commands.object_id',
+  'media_cache_commands.initiator_id',
+  'media_cache_commands.reason',
+  'media_cache_commands.attempt_count',
+  'media_cache_commands.lease_owner',
+  'media_cache_commands.lease_token',
+  'media_cache_commands.lease_expires_at',
+  'media_cache_commands.result',
+  'media_cache_commands.error_code',
+  'media_cache_commands.created_at',
+  'media_cache_commands.updated_at',
+  'media_cache_commands.completed_at',
+  'constraint:public.media_cache_runtime_pkey',
+  'constraint:public.media_cache_runtime_singleton_check',
+  'constraint:public.media_cache_runtime_cursor_check',
+  'constraint:public.media_cache_runtime_ledger_check',
+  'constraint:public.media_cache_post_plans_revision_message_fk',
+  'constraint:public.media_cache_post_plans_pkey',
+  'constraint:public.media_cache_post_plans_id_revision_unique',
+  'constraint:public.media_cache_post_plans_revision_unique',
+  'constraint:public.media_cache_post_plans_state_check',
+  'constraint:public.media_cache_post_plans_budget_check',
+  'constraint:public.media_cache_post_plans_attempt_check',
+  'constraint:public.media_cache_post_plans_lease_check',
+  'constraint:public.media_cache_blobs_sha256_check',
+  'constraint:public.media_cache_blobs_pkey',
+  'constraint:public.media_cache_blobs_byte_length_check',
+  'constraint:public.media_cache_blobs_mime_check',
+  'constraint:public.media_cache_blobs_relative_key_check',
+  'constraint:public.media_cache_blobs_state_check',
+  'constraint:public.media_cache_blobs_eviction_lease_check',
+  'constraint:public.media_cache_objects_media_variant_recipe_unique',
+  'constraint:public.media_cache_objects_pkey',
+  'constraint:public.media_cache_objects_plan_revision_fk',
+  'constraint:public.media_cache_objects_media_revision_fk',
+  'constraint:public.media_cache_objects_blob_sha256_media_cache_blobs_sha256_fk',
+  'constraint:public.media_cache_objects_variant_check',
+  'constraint:public.media_cache_objects_recipe_check',
+  'constraint:public.media_cache_objects_state_check',
+  'constraint:public.media_cache_objects_bytes_check',
+  'constraint:public.media_cache_objects_ready_check',
+  'constraint:public.media_cache_objects_attempt_check',
+  'constraint:public.media_cache_objects_lease_check',
+  'constraint:public.media_cache_object_sources_pk',
+  'constraint:public.media_cache_object_sources_object_id_media_cache_objects_id_fk',
+  'constraint:public.media_cache_object_sources_source_media_observation_id_message_',
+  'constraint:public.media_cache_object_sources_priority_check',
+  'constraint:public.media_cache_actions_object_id_media_cache_objects_id_fk',
+  'constraint:public.media_cache_actions_blob_sha256_media_cache_blobs_sha256_fk',
+  'constraint:public.media_cache_actions_pkey',
+  'constraint:public.media_cache_actions_kind_check',
+  'constraint:public.media_cache_actions_initiator_check',
+  'constraint:public.media_cache_actions_reason_check',
+  'constraint:public.media_cache_actions_state_check',
+  'constraint:public.media_cache_commands_pkey',
+  'constraint:public.media_cache_commands_object_id_media_cache_objects_id_fk',
+  'constraint:public.media_cache_commands_operation_check',
+  'constraint:public.media_cache_commands_target_check',
+  'constraint:public.media_cache_commands_initiator_check',
+  'constraint:public.media_cache_commands_attempt_check',
+  'constraint:public.media_cache_commands_lease_check',
+  'constraint:public.media_cache_commands_terminal_check',
+  'index:public.media_cache_post_plans_runnable_idx',
+  'index:public.media_cache_post_plans_state_idx',
+  'index:public.media_cache_post_plans_lease_expiry_idx',
+  'index:public.media_cache_blobs_lru_idx',
+  'index:public.media_cache_blobs_state_idx',
+  'index:public.media_cache_blobs_eviction_expiry_idx',
+  'index:public.media_cache_objects_plan_state_idx',
+  'index:public.media_cache_objects_blob_state_idx',
+  'index:public.media_cache_objects_state_updated_idx',
+  'index:public.media_cache_objects_blob_plan_idx',
+  'index:public.media_cache_objects_runnable_idx',
+  'index:public.media_cache_objects_lease_expiry_idx',
+  'index:public.media_cache_object_sources_resolver_idx',
+  'index:public.media_cache_object_sources_observation_idx',
+  'index:public.media_cache_actions_created_idx',
+  'index:public.media_cache_actions_object_created_idx',
+  'index:public.media_cache_actions_blob_created_idx',
+  'index:public.media_cache_commands_claim_idx',
+  'index:public.media_cache_commands_object_idx',
   'constraint:public.message_source_media_observations_observation_source_fk',
   'constraint:public.message_source_media_observations_source_check',
   'constraint:public.message_source_observations_id_source_kind_unique',
@@ -176,6 +353,7 @@ export const EXPECTED_DATABASE_OBJECTS = [
 ] as const;
 
 const EXPECTED_POSTGRES_MAJOR = 18;
+const MEDIA_CACHE_MAX_BYTES = 5n * 1024n * 1024n * 1024n;
 const REDACTED = '[redacted]';
 const REDACTED_DATABASE_URL = '[redacted database URL]';
 const SECRET_ASSIGNMENT =
@@ -323,6 +501,87 @@ async function checkDatabaseSchema(
     );
   } catch (error) {
     return failure('database-schema', 'Database schema', error, sensitiveValues);
+  }
+}
+
+async function checkMediaCacheLedger(
+  database: DoctorDatabaseDiagnostics,
+  sensitiveValues: readonly string[],
+): Promise<DoctorCheckResult> {
+  try {
+    const snapshot = await database.getMediaCacheLedgerSnapshot();
+    if (snapshot.cacheRowCount === 0n) {
+      return result(
+        'media-cache-ledger',
+        'Media cache ledger',
+        'ok',
+        'No media cache rows to verify',
+        sensitiveValues,
+      );
+    }
+
+    const details = [
+      `Cache rows: ${snapshot.cacheRowCount}`,
+      `Runtime rows: ${snapshot.runtimeRowCount}`,
+      `Physical blob rows: ${snapshot.physicalBlobCount}`,
+      `Original reservation rows: ${snapshot.originalReservationCount}`,
+      `Active thumbnail reservation rows: ${snapshot.activeThumbnailReservationCount}`,
+    ];
+    if (
+      snapshot.runtimeRowCount !== 1n ||
+      snapshot.runtimeReadyBytes === null ||
+      snapshot.runtimeReservedBytes === null ||
+      snapshot.runtimeMaxBytes === null
+    ) {
+      return result(
+        'media-cache-ledger',
+        'Media cache ledger',
+        'fail',
+        'Expected exactly one complete media cache runtime row',
+        sensitiveValues,
+        details,
+      );
+    }
+
+    const expectedReservedBytes =
+      snapshot.originalReservedBytes + snapshot.activeThumbnailReservedBytes;
+    details.push(
+      `Ready bytes: runtime=${snapshot.runtimeReadyBytes}, ledger=${snapshot.physicalBlobBytes}`,
+      `Reserved bytes: runtime=${snapshot.runtimeReservedBytes}, ledger=${expectedReservedBytes}`,
+      `Maximum bytes: ${snapshot.runtimeMaxBytes}`,
+    );
+    const countersAreNonnegative =
+      snapshot.runtimeReadyBytes >= 0n &&
+      snapshot.runtimeReservedBytes >= 0n &&
+      snapshot.physicalBlobBytes >= 0n &&
+      snapshot.originalReservedBytes >= 0n &&
+      snapshot.activeThumbnailReservedBytes >= 0n;
+    const maximumIsValid =
+      snapshot.runtimeMaxBytes > 0n && snapshot.runtimeMaxBytes <= MEDIA_CACHE_MAX_BYTES;
+    const countersMatch =
+      snapshot.runtimeReadyBytes === snapshot.physicalBlobBytes &&
+      snapshot.runtimeReservedBytes === expectedReservedBytes;
+
+    if (!countersAreNonnegative || !maximumIsValid || !countersMatch) {
+      return result(
+        'media-cache-ledger',
+        'Media cache ledger',
+        'fail',
+        'Media cache counters do not match the read-only ledger recomputation',
+        sensitiveValues,
+        details,
+      );
+    }
+    return result(
+      'media-cache-ledger',
+      'Media cache ledger',
+      'ok',
+      'Media cache counters match the ledger',
+      sensitiveValues,
+      details,
+    );
+  } catch (error) {
+    return failure('media-cache-ledger', 'Media cache ledger', error, sensitiveValues);
   }
 }
 
@@ -518,6 +777,7 @@ export async function runDoctor(dependencies: DoctorDependencies): Promise<Docto
   checks.push(await checkConfig(dependencies, sensitiveValues));
   checks.push(await checkPostgresVersion(dependencies.database, sensitiveValues));
   checks.push(await checkDatabaseSchema(dependencies.database, sensitiveValues));
+  checks.push(await checkMediaCacheLedger(dependencies.database, sensitiveValues));
   checks.push(await checkOwner(dependencies.database, sensitiveValues));
   const telegramIdentity = await checkTelegramBot(dependencies, sensitiveValues);
   checks.push(telegramIdentity.result);

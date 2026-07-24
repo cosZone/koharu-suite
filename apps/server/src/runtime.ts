@@ -5,8 +5,18 @@ import { PostgresAdminOperations } from './admin/operations.js';
 import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
 import { BetterAuthRuntime } from './auth/runtime-auth.js';
-import type { AuthConfig, PublicApiConfig, TelegramConfig } from './config.js';
+import type { AuthConfig, MediaCacheConfig, PublicApiConfig, TelegramConfig } from './config.js';
 import { createDatabaseConnection } from './db/client.js';
+import { MediaCacheAccessCoalescer } from './media-cache/access-coalescer.js';
+import { PostgresMediaCacheAdminRepository } from './media-cache/admin-repository.js';
+import { PostgresMediaCacheAdminService } from './media-cache/admin-service.js';
+import { LocalMediaBlobStore } from './media-cache/blob-store.js';
+import { createPostgresMediaCacheAccessWriter } from './media-cache/eviction-repository.js';
+import {
+  LocalPublicMediaReader,
+  PostgresPublicMediaObjectRepository,
+} from './media-cache/public-reader.js';
+import { createMediaCacheWorkerRuntime } from './media-cache/runtime.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
 import { DeterministicRepairService } from './reconciliation/repair.js';
@@ -35,6 +45,7 @@ export interface StoppableRuntime {
 export interface ServerRuntimeConfig {
   auth: AuthConfig;
   databaseUrl: string;
+  mediaCache: MediaCacheConfig;
   port: number;
   publicApi: PublicApiConfig;
 }
@@ -42,6 +53,7 @@ export interface ServerRuntimeConfig {
 export interface WorkerRuntimeConfig extends TelegramConfig {
   databaseUrl: string;
   instanceId: string;
+  mediaCache: MediaCacheConfig;
 }
 
 interface RuntimePoller {
@@ -52,10 +64,18 @@ interface RuntimePoller {
   stop(): Promise<void>;
 }
 
-interface RuntimeWorkerPool {
+export interface RuntimeWorkerPool {
   readonly done: Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
+}
+
+interface RuntimeMediaCacheWorker extends RuntimeWorkerPool {
+  initialize(): Promise<void>;
+}
+
+interface RuntimeMediaCacheAccessFlusher {
+  flush(): Promise<void>;
 }
 
 interface RuntimeInbox {
@@ -83,6 +103,7 @@ export interface WorkerRuntimeDependencies {
   closeMainDatabase(): Promise<void>;
   heartbeat: RuntimeHeartbeat;
   inbox: RuntimeInbox;
+  mediaCacheWorker?: RuntimeMediaCacheWorker;
   poller: RuntimePoller;
   reconciliationRunner: RuntimeReconciliationRunner;
   reconciliationSchedule: RuntimeReconciliationSchedule;
@@ -94,6 +115,7 @@ const RECONCILIATION_INTERVAL_SECONDS = 3_600;
 const RECONCILIATION_LEASE_DURATION_MS = 120_000;
 const RECONCILIATION_POLL_INTERVAL_MS = 30_000;
 const RECONCILIATION_RENEWAL_INTERVAL_MS = 40_000;
+const MEDIA_CACHE_ACCESS_FLUSH_INTERVAL_MS = 5 * 60_000;
 
 function deferred(): {
   promise: Promise<void>;
@@ -134,11 +156,58 @@ export class ServerRuntime implements StoppableRuntime {
     readonly done: Promise<void>,
     private readonly closeHttp: () => Promise<void>,
     private readonly closeDatabase: () => Promise<void>,
+    private readonly closeMediaCache: () => Promise<void> = async () => {},
   ) {}
 
   stop(): Promise<void> {
-    this.stopPromise ??= runAll([this.closeHttp, this.closeDatabase]);
+    this.stopPromise ??= runAll([this.closeHttp, this.closeMediaCache, this.closeDatabase]);
     return this.stopPromise;
+  }
+}
+
+export class MediaCacheAccessRuntime {
+  private closePromise: Promise<void> | undefined;
+  private closed = false;
+  private timer: NodeJS.Timeout | undefined;
+
+  constructor(
+    private readonly flusher: RuntimeMediaCacheAccessFlusher,
+    private readonly flushIntervalMs = MEDIA_CACHE_ACCESS_FLUSH_INTERVAL_MS,
+  ) {
+    if (!Number.isSafeInteger(flushIntervalMs) || flushIntervalMs <= 0) {
+      throw new TypeError('Media cache access flush interval must be a positive integer');
+    }
+    this.schedule();
+  }
+
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    await this.flusher.flush();
+  }
+
+  private schedule(): void {
+    if (this.closed) {
+      return;
+    }
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.flusher
+        .flush()
+        .catch(() => {
+          // Access observations are retryable bookkeeping; keep them pending for the next flush.
+        })
+        .finally(() => this.schedule());
+    }, this.flushIntervalMs);
+    this.timer.unref();
   }
 }
 
@@ -193,10 +262,20 @@ export class WorkerRuntime implements StoppableRuntime {
       if (this.stopping) {
         throw new Error('Worker stopped during startup');
       }
+      await this.dependencies.mediaCacheWorker?.initialize();
+      if (this.stopping) {
+        throw new Error('Worker stopped during startup');
+      }
       const reconciliationLifetime = this.dependencies.reconciliationRunner.start();
       const pollerLifetime = this.dependencies.poller.start();
       const workerLifetime = this.dependencies.workers.start();
-      this.monitorLifetime(pollerLifetime, workerLifetime, reconciliationLifetime);
+      const mediaCacheLifetime = this.dependencies.mediaCacheWorker?.start();
+      this.monitorLifetime([
+        pollerLifetime,
+        workerLifetime,
+        reconciliationLifetime,
+        ...(mediaCacheLifetime ? [mediaCacheLifetime] : []),
+      ]);
       await this.dependencies.heartbeat.markRunning(this.instanceId);
       this.scheduleHeartbeat();
     } catch (error) {
@@ -210,15 +289,11 @@ export class WorkerRuntime implements StoppableRuntime {
     }
   }
 
-  private monitorLifetime(
-    pollerLifetime: Promise<void>,
-    workerLifetime: Promise<void>,
-    reconciliationLifetime: Promise<void>,
-  ): void {
-    void Promise.race([pollerLifetime, workerLifetime, reconciliationLifetime]).then(
+  private monitorLifetime(lifetimes: Promise<void>[]): void {
+    void Promise.race(lifetimes).then(
       () => {
         if (!this.stopping) {
-          const error = new Error('Telegram worker runtime stopped unexpectedly');
+          const error = new Error('Worker runtime stopped unexpectedly');
           this.rejectDone(error);
           void this.stop().catch(() => {});
         }
@@ -268,6 +343,9 @@ export class WorkerRuntime implements StoppableRuntime {
         () => this.dependencies.reconciliationRunner.stop(),
         () => this.dependencies.poller.stop(),
         () => this.dependencies.workers.stop(),
+        ...(this.dependencies.mediaCacheWorker
+          ? [() => this.dependencies.mediaCacheWorker?.stop() ?? Promise.resolve()]
+          : []),
         () => this.dependencies.inbox.close(),
         this.dependencies.closeMainDatabase,
       ]);
@@ -296,33 +374,75 @@ export class WorkerRuntime implements StoppableRuntime {
   }
 }
 
-export function startServerRuntime(config: ServerRuntimeConfig): ServerRuntime {
+export async function startServerRuntime(config: ServerRuntimeConfig): Promise<ServerRuntime> {
+  const blobStore = config.mediaCache.enabled
+    ? new LocalMediaBlobStore(config.mediaCache.root)
+    : undefined;
+  await blobStore?.initializeReadOnly();
+
   const mainConnection = createDatabaseConnection(config.databaseUrl);
-  const repository = new PostgresMessageRepository(mainConnection.db);
-  const app = createApp({
-    admin: new PostgresAdminRepository(mainConnection.db),
-    adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
-    auth: new BetterAuthRuntime(mainConnection.db, config.auth),
-    messages: repository,
-    operations: new PostgresAdminOperations(mainConnection.db),
-    publicApi: config.publicApi,
-    reconciliation: new PostgresReconciliationPersistenceRepository(mainConnection.db),
-    repair: new DeterministicRepairService(
-      new PostgresDeterministicRepairRepository(mainConnection.db),
-    ),
-    tombstone: new MessageTombstoneService(
-      new PostgresMessageTombstoneRepository(mainConnection.db),
-    ),
-    readiness: async () => {
-      await mainConnection.db.execute(sql`select 1`);
-    },
+  const repository = new PostgresMessageRepository(mainConnection.db, {
+    mediaCacheEnabled: config.mediaCache.enabled,
   });
-  const server = startServer(app, config.port);
-  const done = new Promise<void>((resolveDone, rejectDone) => {
-    server.once('close', resolveDone);
-    server.once('error', rejectDone);
+  const accessCoalescer = blobStore
+    ? new MediaCacheAccessCoalescer(createPostgresMediaCacheAccessWriter(mainConnection.db))
+    : undefined;
+  const accessRuntime = accessCoalescer ? new MediaCacheAccessRuntime(accessCoalescer) : undefined;
+  const mediaCacheAdmin = new PostgresMediaCacheAdminRepository(mainConnection.db, {
+    enabled: config.mediaCache.enabled,
+    maxBytes: config.mediaCache.maxBytes,
   });
-  return new ServerRuntime(done, () => closeServer(server), mainConnection.close);
+  const mediaCacheMutations = blobStore
+    ? new PostgresMediaCacheAdminService(mainConnection.db)
+    : undefined;
+
+  try {
+    const app = createApp({
+      admin: new PostgresAdminRepository(mainConnection.db),
+      adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
+      auth: new BetterAuthRuntime(mainConnection.db, config.auth),
+      ...(blobStore && accessCoalescer
+        ? {
+            media: new LocalPublicMediaReader(
+              new PostgresPublicMediaObjectRepository(mainConnection.db),
+              blobStore,
+              accessCoalescer,
+            ),
+          }
+        : {}),
+      mediaCacheAdmin,
+      ...(mediaCacheMutations ? { mediaCacheMutations } : {}),
+      messages: repository,
+      operations: new PostgresAdminOperations(mainConnection.db),
+      publicApi: config.publicApi,
+      reconciliation: new PostgresReconciliationPersistenceRepository(mainConnection.db),
+      repair: new DeterministicRepairService(
+        new PostgresDeterministicRepairRepository(mainConnection.db),
+      ),
+      tombstone: new MessageTombstoneService(
+        new PostgresMessageTombstoneRepository(mainConnection.db),
+      ),
+      readiness: async () => {
+        await mainConnection.db.execute(sql`select 1`);
+      },
+    });
+    const server = startServer(app, config.port);
+    const done = new Promise<void>((resolveDone, rejectDone) => {
+      server.once('close', resolveDone);
+      server.once('error', rejectDone);
+    });
+    return new ServerRuntime(
+      done,
+      () => closeServer(server),
+      mainConnection.close,
+      () => accessRuntime?.close() ?? Promise.resolve(),
+    );
+  } catch (error) {
+    await runAll([() => accessRuntime?.close() ?? Promise.resolve(), mainConnection.close]).catch(
+      () => {},
+    );
+    throw error;
+  }
 }
 
 export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime {
@@ -353,11 +473,22 @@ export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime 
     onTelegramSuccess: () => heartbeat.recordTelegramSuccess(config.instanceId),
   });
   const workers = new TelegramWorkerPool(mainConnection.db, repository, config.workerConcurrency);
+  const mediaCacheWorker = config.mediaCache.enabled
+    ? createMediaCacheWorkerRuntime({
+        ...(config.apiRoot ? { apiRoot: config.apiRoot } : {}),
+        botToken: config.botToken,
+        config: config.mediaCache,
+        database: mainConnection.db,
+        leaseOwner: config.instanceId,
+        telegramApi: api,
+      })
+    : undefined;
 
   return new WorkerRuntime(config.instanceId, {
     closeMainDatabase: mainConnection.close,
     heartbeat,
     inbox,
+    ...(mediaCacheWorker ? { mediaCacheWorker } : {}),
     poller,
     reconciliationRunner,
     reconciliationSchedule,
