@@ -442,6 +442,7 @@ describe('PostgreSQL media cache Admin service', () => {
       .where(eq(mediaCacheCommands.id, result.commandId));
     expect(command).toMatchObject({
       initiatorId: 'owner-user-id',
+      initiatorKind: 'owner_session',
       objectId: fixture.objectIds[0],
       operation: 'evict',
       reason: 'free local cache space',
@@ -462,6 +463,7 @@ describe('PostgreSQL media cache Admin service', () => {
     const queue = new PostgresMediaCacheCommandQueue(connection.db);
     const receipt = await queue.enqueue({
       initiatorId: 'owner-user-id',
+      initiatorKind: 'local_operator',
       operation: 'prune',
       reason: 'enforce the configured S3 capacity',
       targetBackendId: 's3-default',
@@ -472,6 +474,7 @@ describe('PostgreSQL media cache Admin service', () => {
 
     expect(command).toMatchObject({
       id: receipt.commandId,
+      initiatorKind: 'local_operator',
       objectId: null,
       operation: 'prune',
       sourceBackendId: null,

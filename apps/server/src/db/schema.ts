@@ -1500,6 +1500,10 @@ export const mediaCacheCommands = pgTable(
       { onDelete: 'restrict' },
     ),
     targetBytes: bigint('target_bytes', { mode: 'bigint' }),
+    initiatorKind: varchar('initiator_kind', { length: 32 })
+      .$type<'local_operator' | 'owner_session'>()
+      .notNull()
+      .default('owner_session'),
     initiatorId: text('initiator_id').notNull(),
     reason: text('reason').notNull(),
     attemptCount: integer('attempt_count').notNull().default(0),
@@ -1561,6 +1565,10 @@ export const mediaCacheCommands = pgTable(
       'media_cache_commands_initiator_check',
       sql`length(btrim(${table.initiatorId})) between 1 and 255
         and length(btrim(${table.reason})) between 1 and 500`,
+    ),
+    check(
+      'media_cache_commands_initiator_kind_check',
+      sql`${table.initiatorKind} in ('local_operator', 'owner_session')`,
     ),
     check('media_cache_commands_attempt_check', sql`${table.attemptCount} between 0 and 100`),
     check(

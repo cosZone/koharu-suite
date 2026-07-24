@@ -378,6 +378,14 @@ describe('G2.4 media storage schema', () => {
     await expect(
       database.insert(mediaCacheCommands).values({
         initiatorId: 'owner-user-id',
+        initiatorKind: 'worker' as never,
+        operation: 'reconcile',
+        reason: 'Invalid worker command initiator',
+      }),
+    ).rejects.toThrow();
+    await expect(
+      database.insert(mediaCacheCommands).values({
+        initiatorId: 'owner-user-id',
         operation: 'migrate',
         reason: 'Invalid same-backend copy',
         sourceBackendId: 'local',
@@ -445,6 +453,17 @@ describe('G2.4 media storage schema', () => {
             'ready'
           )
         `;
+        await legacyClient`
+          insert into media_cache_commands (
+            operation,
+            initiator_id,
+            reason
+          ) values (
+            'reconcile',
+            'legacy-owner-user-id',
+            'Upgrade the existing command safely'
+          )
+        `;
       } finally {
         await legacyClient.end();
       }
@@ -457,7 +476,9 @@ describe('G2.4 media storage schema', () => {
             blobCount: string;
             compositeForeignKey: string | null;
             evictedPolicyDefault: string | null;
+            initiatorKindDefault: string | null;
             locationTable: string | null;
+            upgradedInitiatorKind: string | null;
           }>
         >`
           select
@@ -471,16 +492,30 @@ describe('G2.4 media storage schema', () => {
                 and column_name = 'evicted_policy'
             ) as "evictedPolicyDefault",
             (
+              select column_default
+              from information_schema.columns
+              where table_schema = 'public'
+                and table_name = 'media_cache_commands'
+                and column_name = 'initiator_kind'
+            ) as "initiatorKindDefault",
+            (
               select conname
               from pg_constraint
               where conname = 'media_blob_locations_verified_identity_fk'
-            ) as "compositeForeignKey"
+            ) as "compositeForeignKey",
+            (
+              select initiator_kind
+              from media_cache_commands
+              where initiator_id = 'legacy-owner-user-id'
+            ) as "upgradedInitiatorKind"
         `;
         expect(result).toEqual({
           blobCount: '1',
           compositeForeignKey: 'media_blob_locations_verified_identity_fk',
           evictedPolicyDefault: "'recache_on_access'::character varying",
+          initiatorKindDefault: "'owner_session'::character varying",
           locationTable: 'media_blob_locations',
+          upgradedInitiatorKind: 'owner_session',
         });
       } finally {
         await upgradedClient.end();

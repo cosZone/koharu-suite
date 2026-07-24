@@ -107,8 +107,44 @@ describe('media cache command payloads', () => {
     expect(harness.values).toHaveBeenCalledWith({
       ...expected,
       initiatorId: 'owner',
+      initiatorKind: 'owner_session',
       reason: 'requested',
     });
+  });
+
+  it('preserves an explicit local operator initiator', async () => {
+    const harness = createEnqueueHarness();
+    const queue = new PostgresMediaCacheCommandQueue(harness.database);
+
+    await expect(
+      queue.enqueue({
+        initiatorId: 'desktop-cli:42',
+        initiatorKind: 'local_operator',
+        operation: 'reconcile',
+        reason: 'requested locally',
+      }),
+    ).resolves.toMatchObject({ operation: 'reconcile', state: 'pending' });
+    expect(harness.values).toHaveBeenCalledWith({
+      initiatorId: 'desktop-cli:42',
+      initiatorKind: 'local_operator',
+      operation: 'reconcile',
+      reason: 'requested locally',
+    });
+  });
+
+  it('rejects an invalid initiator kind before touching PostgreSQL', async () => {
+    const harness = createEnqueueHarness();
+    const queue = new PostgresMediaCacheCommandQueue(harness.database);
+
+    await expect(
+      queue.enqueue({
+        initiatorId: 'owner',
+        initiatorKind: 'worker',
+        operation: 'reconcile',
+        reason: 'requested',
+      } as never),
+    ).rejects.toThrow(TypeError);
+    expect(harness.insert).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -158,6 +194,7 @@ function claimed(operation: ClaimedMediaCacheCommand['operation']): ClaimedMedia
   const common = {
     id: COMMAND_ID,
     initiatorId: 'owner',
+    initiatorKind: 'owner_session' as const,
     reason: 'requested',
     token: '00000000-0000-4000-8000-000000000002',
   };

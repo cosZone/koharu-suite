@@ -14,6 +14,7 @@ const EVICTION_LEASE_MS = 2 * 60_000;
 
 export type MediaCacheCommandOperation = 'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore';
 export type MediaCacheCommandState = 'failed' | 'pending' | 'running' | 'succeeded';
+export type MediaCacheCommandInitiatorKind = 'local_operator' | 'owner_session';
 
 export interface MediaCacheCommandReceipt {
   commandId: string;
@@ -23,6 +24,7 @@ export interface MediaCacheCommandReceipt {
 
 interface MediaCacheCommandInputBase {
   initiatorId: string;
+  initiatorKind?: MediaCacheCommandInitiatorKind;
   reason: string;
 }
 
@@ -68,6 +70,7 @@ export type MediaCacheCommandInput = MediaCacheCommandInputBase &
 interface ClaimedMediaCacheCommandBase {
   id: string;
   initiatorId: string;
+  initiatorKind: MediaCacheCommandInitiatorKind;
   reason: string;
   token: string;
 }
@@ -171,6 +174,7 @@ export class PostgresMediaCacheCommandQueue {
 
   async enqueue(input: MediaCacheCommandInput): Promise<MediaCacheCommandReceipt> {
     const initiatorId = input.initiatorId.trim();
+    const initiatorKind = normalizeInitiatorKind(input.initiatorKind);
     const reason = input.reason.trim();
     if (!initiatorId || initiatorId.length > 255 || !reason || reason.length > 500) {
       throw new TypeError('Invalid media cache command initiator or reason');
@@ -180,6 +184,7 @@ export class PostgresMediaCacheCommandQueue {
       .insert(mediaCacheCommands)
       .values({
         initiatorId,
+        initiatorKind,
         operation: input.operation,
         ...payload,
         reason,
@@ -223,6 +228,7 @@ export class PostgresMediaCacheCommandQueue {
         .select({
           id: mediaCacheCommands.id,
           initiatorId: mediaCacheCommands.initiatorId,
+          initiatorKind: mediaCacheCommands.initiatorKind,
           objectId: mediaCacheCommands.objectId,
           operation: mediaCacheCommands.operation,
           reason: mediaCacheCommands.reason,
@@ -422,7 +428,7 @@ export class MediaCacheCommandProcessor {
       evictionToken: randomUUID(),
       initiator: {
         initiatorId: command.initiatorId,
-        kind: 'owner_session',
+        kind: command.initiatorKind,
         reason: command.reason,
       },
       selection: { kind: 'specific_blob', sha256: object.blobSha256 },
@@ -462,7 +468,7 @@ export class MediaCacheCommandProcessor {
         ...(cursor ? { cursor } : {}),
         initiator: {
           id: command.initiatorId,
-          kind: 'owner_session',
+          kind: command.initiatorKind,
           reason: command.reason,
         },
       });
@@ -527,6 +533,7 @@ function hydrateClaimedCommand(
   candidate: {
     id: string;
     initiatorId: string;
+    initiatorKind: MediaCacheCommandInitiatorKind;
     objectId: string | null;
     operation: MediaCacheCommandOperation;
     reason: string;
@@ -539,6 +546,7 @@ function hydrateClaimedCommand(
   const common = {
     id: candidate.id,
     initiatorId: candidate.initiatorId,
+    initiatorKind: candidate.initiatorKind,
     reason: candidate.reason,
     token,
   };
@@ -636,6 +644,12 @@ function hydrateClaimedCommand(
 
 function invalidClaimedPayload(): never {
   throw new Error('PostgreSQL returned an invalid media cache command payload');
+}
+
+function normalizeInitiatorKind(value: unknown): MediaCacheCommandInitiatorKind {
+  if (value === undefined) return 'owner_session';
+  if (value === 'local_operator' || value === 'owner_session') return value;
+  throw new TypeError('Invalid media cache command initiator kind');
 }
 
 function normalizeCommandPayload(input: MediaCacheCommandInput): {
