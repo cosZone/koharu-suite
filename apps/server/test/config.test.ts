@@ -1,8 +1,10 @@
+import { inspect } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import {
   resolveAuthConfig,
   resolveDatabaseUrl,
   resolveMediaCacheConfig,
+  resolveMediaS3Config,
   resolvePort,
   resolvePublicApiConfig,
   resolveTelegramConfig,
@@ -234,6 +236,111 @@ describe('configuration', () => {
     { MEDIA_CACHE_ROOT: 'relative/cache' },
   ])('rejects unsafe media cache configuration: %j', (environment) => {
     expect(() => resolveMediaCacheConfig(environment)).toThrow();
+  });
+
+  it('does not enable or expose S3 credentials when the four core settings are absent', () => {
+    expect(
+      resolveMediaS3Config({
+        S3_ALLOW_INSECURE: 'invalid',
+        S3_CONNECT_TIMEOUT_MS: 'invalid',
+        S3_FORCE_PATH_STYLE: 'invalid',
+        S3_PREFIX: '../ignored-while-disabled',
+        S3_REGION: '',
+      }),
+    ).toEqual({ enabled: false });
+  });
+
+  it('enables bounded S3-compatible storage only when all core settings are present', () => {
+    expect(
+      resolveMediaS3Config({
+        S3_BUCKET: 'koharu-media',
+        S3_ALLOW_INSECURE: 'true',
+        S3_CONNECT_TIMEOUT_MS: '2500',
+        S3_ENDPOINT: 'http://minio:9000/',
+        S3_KEY: 'access-key',
+        S3_PREFIX: '/suite/blobs/',
+        S3_REGION: 'us-east-1',
+        S3_REQUEST_TIMEOUT_MS: '45000',
+        S3_SECRET: 'private-secret',
+      }),
+    ).toEqual({
+      accessKeyId: 'access-key',
+      bucket: 'koharu-media',
+      connectTimeoutMs: 2500,
+      enabled: true,
+      endpoint: 'http://minio:9000',
+      forcePathStyle: true,
+      prefix: 'suite/blobs',
+      region: 'us-east-1',
+      requestTimeoutMs: 45000,
+      secretAccessKey: 'private-secret',
+    });
+  });
+
+  it('rejects partial or unsafe S3-compatible storage configuration without echoing secrets', () => {
+    const secret = 'do-not-echo-this-secret';
+    const invalidConfigurations = [
+      {
+        S3_ENDPOINT: 'https://s3.example.com',
+        S3_SECRET: secret,
+      },
+      {
+        S3_BUCKET: 'bucket/path',
+        S3_ENDPOINT: 'https://s3.example.com',
+        S3_KEY: 'key',
+        S3_SECRET: secret,
+      },
+      {
+        S3_BUCKET: 'bucket',
+        S3_ENDPOINT: 'http://remote.example.com',
+        S3_KEY: 'key',
+        S3_SECRET: secret,
+      },
+      {
+        S3_BUCKET: 'bucket',
+        S3_ENDPOINT: 'https://s3.example.com/private-path',
+        S3_KEY: 'key',
+        S3_SECRET: secret,
+      },
+      {
+        S3_BUCKET: 'bucket',
+        S3_ENDPOINT: 'https://s3.example.com',
+        S3_KEY: 'key',
+        S3_PREFIX: '../escape',
+        S3_SECRET: secret,
+      },
+    ];
+
+    for (const environment of invalidConfigurations) {
+      let configurationError: unknown;
+      try {
+        resolveMediaS3Config(environment);
+      } catch (error) {
+        configurationError = error;
+      }
+      expect(configurationError).toBeDefined();
+      expect(String(configurationError)).not.toContain(secret);
+      expect(inspect(configurationError)).not.toContain(secret);
+    }
+  });
+
+  it('redacts malformed S3 endpoints that embed credentials', () => {
+    const secret = 'super-secret-in-endpoint';
+    let configurationError: unknown;
+    try {
+      resolveMediaS3Config({
+        S3_BUCKET: 'bucket',
+        S3_ENDPOINT: `https://access:${secret}@[bad`,
+        S3_KEY: 'key',
+        S3_SECRET: 'separate-secret',
+      });
+    } catch (error) {
+      configurationError = error;
+    }
+
+    expect(configurationError).toBeDefined();
+    expect(inspect(configurationError)).not.toContain(secret);
+    expect(configurationError).not.toHaveProperty('input');
   });
 
   it('parses exact public origins, rate-limit bounds, and explicit proxy trust', () => {
