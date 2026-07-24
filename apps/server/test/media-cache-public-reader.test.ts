@@ -52,6 +52,7 @@ async function fixture(content = '0123456789') {
     ),
   };
   const accessObserver = { observe: vi.fn() };
+  const recacheObserver = { observe: vi.fn() };
   const committedReader = {
     read: vi.fn(async (identity, options?: { observeBackend?: (backendId: string) => void }) => {
       const handle = await blobStore.read(identity);
@@ -64,7 +65,13 @@ async function fixture(content = '0123456789') {
     blobStore,
     objectId,
     published,
-    reader: new LocalPublicMediaReader(repository, committedReader, accessObserver),
+    reader: new LocalPublicMediaReader(
+      repository,
+      committedReader,
+      accessObserver,
+      recacheObserver,
+    ),
+    recacheObserver,
     repository,
   };
 }
@@ -79,7 +86,7 @@ async function read(stream: ReadableStream<Uint8Array>): Promise<string> {
 
 describe('LocalPublicMediaReader', () => {
   it('opens verified content by opaque object ID and observes shared blob access', async () => {
-    const { accessObserver, objectId, published, reader } = await fixture();
+    const { accessObserver, objectId, published, reader, recacheObserver } = await fixture();
 
     const opened = await reader.open(objectId);
 
@@ -90,6 +97,7 @@ describe('LocalPublicMediaReader', () => {
       variant: 'original',
     });
     expect(accessObserver.observe).toHaveBeenCalledWith('local', published.sha256);
+    expect(recacheObserver.observe).toHaveBeenCalledWith(objectId, 'local');
     await expect(read(opened?.stream() as ReadableStream<Uint8Array>)).resolves.toBe('0123456789');
   });
 

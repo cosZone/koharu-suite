@@ -22,6 +22,7 @@ import {
   messages,
   telegramChannels,
 } from '../../src/db/schema.js';
+import { PostgresMediaCacheCommandQueue } from '../../src/media-cache/command-queue.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const SHA256 = 'a'.repeat(64);
@@ -401,6 +402,128 @@ describe('G2.4 media storage schema', () => {
         targetBytes: -1n,
       }),
     ).rejects.toThrow();
+  }, 30_000);
+
+  it('durably deduplicates bounded recache-on-access restores', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const database = connection.db;
+    const object = await insertObjectFixture(connection);
+    const fingerprint = 'f'.repeat(64);
+    await database.insert(mediaCacheBlobs).values({
+      byteLength: 128n,
+      detectedMime: 'image/jpeg',
+      relativeKey: STORAGE_KEY,
+      sha256: SHA256,
+      state: 'ready',
+    });
+    await database
+      .update(mediaCacheObjects)
+      .set({ actualBytes: 128n, blobSha256: SHA256, state: 'ready' })
+      .where(eq(mediaCacheObjects.id, object.id));
+    await database.insert(mediaStorageBackends).values([
+      {
+        configFingerprint: fingerprint,
+        id: 'local',
+        kind: 'local',
+        label: 'Local hot cache',
+        maxBytes: 5_368_709_120n,
+      },
+      {
+        configFingerprint: fingerprint,
+        id: 's3-default',
+        kind: 's3',
+        label: 'S3 durable cache',
+        maxBytes: 5_368_709_120n,
+      },
+    ]);
+    await database.insert(mediaBlobLocations).values({
+      backendId: 's3-default',
+      blobSha256: SHA256,
+      state: 'ready',
+      storageKey: STORAGE_KEY,
+      verifiedAt: new Date(),
+      verifiedByteLength: 128n,
+      verifiedSha256: SHA256,
+    });
+    const queue = new PostgresMediaCacheCommandQueue(database);
+    const request = {
+      objectId: object.id,
+      sourceBackendId: 's3-default',
+    };
+
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(true);
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(false);
+    await expect(
+      database
+        .select({
+          initiatorKind: mediaCacheCommands.initiatorKind,
+          operation: mediaCacheCommands.operation,
+          state: mediaCacheCommands.state,
+          targetBackendId: mediaCacheCommands.targetBackendId,
+        })
+        .from(mediaCacheCommands),
+    ).resolves.toEqual([
+      {
+        initiatorKind: 'worker',
+        operation: 'restore',
+        state: 'pending',
+        targetBackendId: 'local',
+      },
+    ]);
+
+    await database
+      .update(mediaCacheCommands)
+      .set({
+        completedAt: sql`clock_timestamp()`,
+        errorCode: 'storage_operation_failed',
+        state: 'failed',
+        updatedAt: sql`clock_timestamp()`,
+      })
+      .where(eq(mediaCacheCommands.objectId, object.id));
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(false);
+    await database
+      .update(mediaCacheCommands)
+      .set({ updatedAt: sql`clock_timestamp() - interval '6 minutes'` })
+      .where(eq(mediaCacheCommands.objectId, object.id));
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(true);
+
+    await database.delete(mediaCacheCommands);
+    await database
+      .update(mediaCacheObjects)
+      .set({ evictedPolicy: 'stay_evicted' })
+      .where(eq(mediaCacheObjects.id, object.id));
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(false);
+
+    const [plan] = await database
+      .select({ messageId: mediaCachePostPlans.messageId })
+      .from(mediaCacheObjects)
+      .innerJoin(mediaCachePostPlans, eq(mediaCachePostPlans.id, mediaCacheObjects.postPlanId))
+      .where(eq(mediaCacheObjects.id, object.id));
+    if (!plan) throw new Error('Fixture plan was not found');
+    await database
+      .update(mediaCacheObjects)
+      .set({ evictedPolicy: 'recache_on_access' })
+      .where(eq(mediaCacheObjects.id, object.id));
+    await database
+      .update(messages)
+      .set({ tombstonedAt: new Date() })
+      .where(eq(messages.id, plan.messageId));
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(false);
+
+    await database
+      .update(messages)
+      .set({ tombstonedAt: null })
+      .where(eq(messages.id, plan.messageId));
+    await database.insert(mediaBlobLocations).values({
+      backendId: 'local',
+      blobSha256: SHA256,
+      state: 'ready',
+      storageKey: STORAGE_KEY,
+      verifiedAt: new Date(),
+      verifiedByteLength: 128n,
+      verifiedSha256: SHA256,
+    });
+    await expect(queue.enqueueRecacheOnAccess(request)).resolves.toBe(false);
   }, 30_000);
 
   it('upgrades a populated G2.3 database before adding the verified identity FK', async () => {

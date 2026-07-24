@@ -1501,7 +1501,7 @@ export const mediaCacheCommands = pgTable(
     ),
     targetBytes: bigint('target_bytes', { mode: 'bigint' }),
     initiatorKind: varchar('initiator_kind', { length: 32 })
-      .$type<'local_operator' | 'owner_session'>()
+      .$type<'local_operator' | 'owner_session' | 'worker'>()
       .notNull()
       .default('owner_session'),
     initiatorId: text('initiator_id').notNull(),
@@ -1522,6 +1522,13 @@ export const mediaCacheCommands = pgTable(
       .where(sql`${table.state} in ('pending', 'running')`),
     index('media_cache_commands_object_idx').on(table.objectId, table.createdAt, table.id),
     index('media_cache_commands_backend_idx').on(table.targetBackendId, table.createdAt, table.id),
+    uniqueIndex('media_cache_commands_active_restore_unique')
+      .on(table.objectId, table.targetBackendId)
+      .where(
+        sql`${table.operation} = 'restore'
+          and ${table.initiatorKind} = 'worker'
+          and ${table.state} in ('pending', 'running')`,
+      ),
     check(
       'media_cache_commands_operation_check',
       sql`${table.operation} in ('evict', 'migrate', 'prune', 'reconcile', 'restore')`,
@@ -1568,7 +1575,10 @@ export const mediaCacheCommands = pgTable(
     ),
     check(
       'media_cache_commands_initiator_kind_check',
-      sql`${table.initiatorKind} in ('local_operator', 'owner_session')`,
+      sql`(
+        ${table.initiatorKind} in ('local_operator', 'owner_session')
+        or (${table.initiatorKind} = 'worker' and ${table.operation} = 'restore')
+      )`,
     ),
     check('media_cache_commands_attempt_check', sql`${table.attemptCount} between 0 and 100`),
     check(

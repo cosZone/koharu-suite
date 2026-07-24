@@ -21,16 +21,19 @@ import {
   PostgresCommittedBlobLocationRepository,
 } from './media-cache/backend-aware-reader.js';
 import { LocalMediaBlobStore } from './media-cache/blob-store.js';
+import { PostgresMediaCacheCommandQueue } from './media-cache/command-queue.js';
 import { createPostgresMediaCacheAccessWriter } from './media-cache/eviction-repository.js';
 import {
   LocalPublicMediaReader,
   PostgresPublicMediaObjectRepository,
 } from './media-cache/public-reader.js';
+import { DurableMediaRecacheObserver } from './media-cache/recache-on-access.js';
 import {
   createMediaCacheWorkerRuntime,
   createPersistentBlobBackendRegistry,
 } from './media-cache/runtime.js';
 import { StorageLedgerRepository } from './media-cache/storage-ledger-repository.js';
+import { PostgresStoragePruneService } from './media-cache/storage-prune-service.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
 import { DeterministicRepairService } from './reconciliation/repair.js';
@@ -417,19 +420,24 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
     enabled: config.mediaCache.enabled,
     maxBytes: config.mediaCache.maxBytes,
   });
-  const mediaCacheMutations = blobStore
-    ? new PostgresMediaCacheAdminService(mainConnection.db)
-    : undefined;
 
   try {
     const persistentBackends = blobStore
       ? createPersistentBlobBackendRegistry(blobStore, config.mediaS3)
+      : undefined;
+    const mediaCacheMutations = persistentBackends
+      ? new PostgresMediaCacheAdminService(mainConnection.db, {
+          storagePrune: new PostgresStoragePruneService(mainConnection.db, persistentBackends),
+        })
       : undefined;
     const committedBlobReader = persistentBackends
       ? new BackendAwareCommittedBlobReader(
           new PostgresCommittedBlobLocationRepository(mainConnection.db),
           persistentBackends,
         )
+      : undefined;
+    const mediaRecache = committedBlobReader
+      ? new DurableMediaRecacheObserver(new PostgresMediaCacheCommandQueue(mainConnection.db))
       : undefined;
     const app = createApp({
       admin: new PostgresAdminRepository(mainConnection.db),
@@ -441,6 +449,7 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
               new PostgresPublicMediaObjectRepository(mainConnection.db),
               committedBlobReader,
               accessCoalescer,
+              mediaRecache,
             ),
           }
         : {}),

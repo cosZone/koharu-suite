@@ -13,6 +13,7 @@ import {
   MediaBlobStoreError,
 } from './blob-store.js';
 import type { MediaByteRange } from './http-range.js';
+import type { MediaRecacheObserver } from './recache-on-access.js';
 
 type PublicMediaMime =
   | 'image/avif'
@@ -111,6 +112,7 @@ export class LocalPublicMediaReader implements PublicMediaReader {
     private readonly repository: PublicMediaObjectRepository,
     private readonly blobStore: PublicMediaBlobReader,
     private readonly accessObserver: MediaAccessObserver,
+    private readonly recacheObserver?: MediaRecacheObserver,
   ) {}
 
   async open(objectId: string): Promise<OpenedPublicMedia | null> {
@@ -121,7 +123,10 @@ export class LocalPublicMediaReader implements PublicMediaReader {
     let blob: MediaBlobReadHandle;
     try {
       blob = await this.blobStore.read(blobIdentity(object), {
-        observeBackend: (backendId) => this.accessObserver.observe(backendId, object.sha256),
+        observeBackend: (backendId) => {
+          this.accessObserver.observe(backendId, object.sha256);
+          this.recacheObserver?.observe(objectId, backendId);
+        },
       });
     } catch (error) {
       if (error instanceof MediaBlobStoreError || hasFilesystemErrorCode(error)) {

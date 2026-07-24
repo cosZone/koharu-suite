@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, lt, lte, or, sql } from 'drizzle-orm';
+import { and, asc, eq, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { mediaCacheCommands, mediaCacheObjects } from '../db/schema.js';
+import {
+  mediaBlobLocations,
+  mediaCacheBlobs,
+  mediaCacheCommands,
+  mediaCacheObjects,
+  mediaStorageBackends,
+  messageMedia,
+  messageRevisions,
+  messages,
+} from '../db/schema.js';
 import type { MediaCacheEvictionService } from './eviction-repository.js';
 import type {
   MediaCacheMaintenanceService,
@@ -15,6 +24,7 @@ const EVICTION_LEASE_MS = 2 * 60_000;
 export type MediaCacheCommandOperation = 'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore';
 export type MediaCacheCommandState = 'failed' | 'pending' | 'running' | 'succeeded';
 export type MediaCacheCommandInitiatorKind = 'local_operator' | 'owner_session';
+type InternalMediaCacheCommandInitiatorKind = MediaCacheCommandInitiatorKind | 'worker';
 
 export interface MediaCacheCommandReceipt {
   commandId: string;
@@ -70,7 +80,7 @@ export type MediaCacheCommandInput = MediaCacheCommandInputBase &
 interface ClaimedMediaCacheCommandBase {
   id: string;
   initiatorId: string;
-  initiatorKind: MediaCacheCommandInitiatorKind;
+  initiatorKind: InternalMediaCacheCommandInitiatorKind;
   reason: string;
   token: string;
 }
@@ -194,6 +204,122 @@ export class PostgresMediaCacheCommandQueue {
       throw new Error('Media cache command was not enqueued');
     }
     return { commandId: command.id, operation: input.operation, state: 'pending' };
+  }
+
+  /**
+   * Records a best-effort restore request after a public read succeeds from durable storage.
+   * Eligibility is re-checked in PostgreSQL so stale public requests cannot revive tombstoned
+   * content or override an object's explicit stay-evicted policy.
+   */
+  async enqueueRecacheOnAccess(input: {
+    objectId: string;
+    sourceBackendId: string;
+  }): Promise<boolean> {
+    const objectId = input.objectId.trim();
+    const sourceBackendId = input.sourceBackendId.trim();
+    if (!objectId || !sourceBackendId || sourceBackendId === 'local') {
+      return false;
+    }
+
+    return this.database.transaction(async (transaction) => {
+      const [eligible] = await transaction
+        .select({ objectId: mediaCacheObjects.id })
+        .from(mediaCacheObjects)
+        .innerJoin(mediaCacheBlobs, eq(mediaCacheBlobs.sha256, mediaCacheObjects.blobSha256))
+        .innerJoin(messageMedia, eq(messageMedia.id, mediaCacheObjects.canonicalMediaId))
+        .innerJoin(messageRevisions, eq(messageRevisions.id, mediaCacheObjects.revisionId))
+        .innerJoin(
+          messages,
+          and(
+            eq(messages.id, messageRevisions.messageId),
+            eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
+            isNull(messages.tombstonedAt),
+          ),
+        )
+        .innerJoin(
+          mediaBlobLocations,
+          and(
+            eq(mediaBlobLocations.backendId, sourceBackendId),
+            eq(mediaBlobLocations.blobSha256, mediaCacheObjects.blobSha256),
+            eq(mediaBlobLocations.storageKey, mediaCacheBlobs.relativeKey),
+            eq(mediaBlobLocations.state, 'ready'),
+            eq(mediaBlobLocations.verifiedByteLength, mediaCacheBlobs.byteLength),
+            eq(mediaBlobLocations.verifiedSha256, mediaCacheBlobs.sha256),
+          ),
+        )
+        .innerJoin(
+          mediaStorageBackends,
+          and(
+            eq(mediaStorageBackends.id, mediaBlobLocations.backendId),
+            eq(mediaStorageBackends.enabled, true),
+            eq(mediaStorageBackends.readable, true),
+          ),
+        )
+        .where(
+          and(
+            eq(mediaCacheObjects.id, objectId),
+            eq(mediaCacheObjects.state, 'ready'),
+            eq(mediaCacheObjects.evictedPolicy, 'recache_on_access'),
+            ne(mediaBlobLocations.backendId, 'local'),
+            sql`exists (
+              select 1
+              from media_storage_backends local_backend
+              where local_backend.id = 'local'
+                and local_backend.enabled = true
+                and local_backend.writable = true
+            )`,
+            sql`not exists (
+              select 1
+              from media_blob_locations local_location
+              where local_location.backend_id = 'local'
+                and local_location.blob_sha256 = ${mediaCacheObjects.blobSha256}
+                and local_location.storage_key = ${mediaCacheBlobs.relativeKey}
+                and local_location.state = 'ready'
+                and local_location.verified_byte_length = ${mediaCacheBlobs.byteLength}
+                and local_location.verified_sha256 = ${mediaCacheBlobs.sha256}
+            )`,
+            sql`not exists (
+              select 1
+              from media_cache_commands recent_restore
+              where recent_restore.object_id = ${mediaCacheObjects.id}
+                and recent_restore.operation = 'restore'
+                and recent_restore.target_backend_id = 'local'
+                and (
+                  recent_restore.state in ('pending', 'running')
+                  or (
+                    recent_restore.state = 'failed'
+                    and recent_restore.updated_at > clock_timestamp() - interval '5 minutes'
+                  )
+                  or (
+                    recent_restore.state = 'succeeded'
+                    and recent_restore.updated_at > clock_timestamp() - interval '30 seconds'
+                  )
+                )
+            )`,
+          ),
+        )
+        .limit(1);
+      if (!eligible) return false;
+
+      const inserted = await transaction
+        .insert(mediaCacheCommands)
+        .values({
+          initiatorId: 'media-recache-scheduler',
+          initiatorKind: 'worker',
+          objectId: eligible.objectId,
+          operation: 'restore',
+          reason: 'Restore local hot copy after durable public read',
+          targetBackendId: 'local',
+        })
+        .onConflictDoNothing({
+          target: [mediaCacheCommands.objectId, mediaCacheCommands.targetBackendId],
+          where: sql`${mediaCacheCommands.operation} = 'restore'
+            and ${mediaCacheCommands.initiatorKind} = 'worker'
+            and ${mediaCacheCommands.state} in ('pending', 'running')`,
+        })
+        .returning({ id: mediaCacheCommands.id });
+      return inserted.length === 1;
+    });
   }
 
   async claim(input: { leaseOwner: string }): Promise<ClaimedMediaCacheCommand | null> {
@@ -468,7 +594,7 @@ export class MediaCacheCommandProcessor {
         ...(cursor ? { cursor } : {}),
         initiator: {
           id: command.initiatorId,
-          kind: command.initiatorKind,
+          kind: externalCommandInitiatorKind(command),
           reason: command.reason,
         },
       });
@@ -533,7 +659,7 @@ function hydrateClaimedCommand(
   candidate: {
     id: string;
     initiatorId: string;
-    initiatorKind: MediaCacheCommandInitiatorKind;
+    initiatorKind: InternalMediaCacheCommandInitiatorKind;
     objectId: string | null;
     operation: MediaCacheCommandOperation;
     reason: string;
@@ -543,6 +669,9 @@ function hydrateClaimedCommand(
   },
   token: string,
 ): ClaimedMediaCacheCommand {
+  if (candidate.initiatorKind === 'worker' && candidate.operation !== 'restore') {
+    return invalidClaimedPayload();
+  }
   const common = {
     id: candidate.id,
     initiatorId: candidate.initiatorId,
@@ -640,6 +769,15 @@ function hydrateClaimedCommand(
     default:
       return assertNever(candidate.operation);
   }
+}
+
+function externalCommandInitiatorKind(
+  command: ClaimedMediaCacheCommand,
+): MediaCacheCommandInitiatorKind {
+  if (command.initiatorKind === 'worker') {
+    throw new Error('invalid_media_cache_command_payload');
+  }
+  return command.initiatorKind;
 }
 
 function invalidClaimedPayload(): never {
