@@ -1,10 +1,11 @@
 import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   MediaContentTypeError,
   validateMediaContentType,
+  validateMediaContentTypeStream,
 } from '../src/media-cache/content-type.js';
 
 const temporaryDirectories: string[] = [];
@@ -38,6 +39,27 @@ afterEach(async () => {
 });
 
 describe('media cache content type validation', () => {
+  it('validates a bounded stream prefix and cancels unread input', async () => {
+    const cancelled = vi.fn(() => new Promise<void>(() => undefined));
+    const stream = new ReadableStream<Uint8Array>({
+      cancel: cancelled,
+      pull(controller) {
+        controller.enqueue(
+          Buffer.concat([
+            Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]),
+            Buffer.alloc(8 * 1024),
+          ]),
+        );
+      },
+    });
+
+    await expect(validateMediaContentTypeStream(stream, 'photo')).resolves.toEqual({
+      extension: 'jpg',
+      mimeType: 'image/jpeg',
+    });
+    expect(cancelled).toHaveBeenCalledOnce();
+  });
+
   it('returns the canonical MIME and extension for an allowed JPEG photo', async () => {
     const file = await openFixture(
       Uint8Array.from([

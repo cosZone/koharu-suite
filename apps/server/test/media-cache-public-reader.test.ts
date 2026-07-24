@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { LocalMediaBlobStore } from '../src/media-cache/blob-store.js';
+import { LocalMediaBlobStore, type MediaBlobReadHandle } from '../src/media-cache/blob-store.js';
 import {
   LocalPublicMediaReader,
   type PublicMediaObjectRepository,
@@ -113,4 +113,74 @@ describe('LocalPublicMediaReader', () => {
     await expect(opened?.close()).resolves.toBeUndefined();
     expect(() => opened?.stream()).toThrow('already consumed');
   });
+
+  it('closes and sanitizes a backend stream creation failure', async () => {
+    const objectId = randomUUID();
+    const close = vi.fn(async () => undefined);
+    const reader = new LocalPublicMediaReader(
+      readyRepository(objectId),
+      {
+        read: vi.fn(async () => ({
+          byteLength: 10,
+          close,
+          stream() {
+            throw new Error('private S3 endpoint detail');
+          },
+        })),
+      },
+      { observe: vi.fn() },
+    );
+    const opened = await reader.open(objectId);
+
+    await expect(read(opened?.stream() as ReadableStream<Uint8Array>)).rejects.toThrow(
+      'Public media stream became unavailable',
+    );
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('propagates public stream cancellation and closes the backend handle', async () => {
+    const objectId = randomUUID();
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const close = vi.fn(async () => undefined);
+    const handle: MediaBlobReadHandle = {
+      byteLength: 10,
+      close,
+      stream: () =>
+        new ReadableStream<Uint8Array>({
+          cancel,
+          pull(controller) {
+            controller.enqueue(Buffer.from('chunk'));
+          },
+        }),
+    };
+    const reader = new LocalPublicMediaReader(
+      readyRepository(objectId),
+      { read: vi.fn(async () => handle) },
+      { observe: vi.fn() },
+    );
+    const opened = await reader.open(objectId);
+    const stream = opened?.stream();
+    const streamReader = stream?.getReader();
+
+    await expect(streamReader?.read()).resolves.toMatchObject({ done: false });
+    await expect(streamReader?.cancel('client disconnected')).resolves.toBeUndefined();
+    expect(cancel).toHaveBeenCalledWith('client disconnected');
+    expect(close).toHaveBeenCalledOnce();
+  });
 });
+
+function readyRepository(objectId: string): PublicMediaObjectRepository {
+  return {
+    findReadyObject: vi.fn<PublicMediaObjectRepository['findReadyObject']>(async (requestedId) =>
+      requestedId === objectId
+        ? {
+            byteLength: 10,
+            detectedMime: 'image/jpeg',
+            relativeKey: `blobs/${'a'.repeat(2)}/${'a'.repeat(2)}/${'a'.repeat(64)}`,
+            sha256: 'a'.repeat(64),
+            variant: 'original',
+          }
+        : null,
+    ),
+  };
+}

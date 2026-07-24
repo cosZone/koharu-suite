@@ -1,7 +1,7 @@
-import type { FileHandle } from 'node:fs/promises';
-import { PassThrough, type Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import sharp, { type OutputInfo, type Sharp } from 'sharp';
+import type { MediaBlobReadHandle } from './blob-store.js';
 
 const THUMBNAIL_INPUT_PIXEL_LIMIT = 33_554_432;
 const THUMBNAIL_INPUT_CHANNEL_LIMIT = 4;
@@ -46,7 +46,7 @@ export interface ThumbnailSource {
 }
 
 export function createThumbnailSource(
-  input: FileHandle,
+  input: MediaBlobReadHandle,
   options: ThumbnailSourceOptions,
 ): ThumbnailSource {
   if (!isThumbnailInputMime(options.mimeType)) {
@@ -71,8 +71,9 @@ export function createThumbnailSource(
     .timeout({ seconds: 5 });
   const output = new PassThrough();
   const info = sharpOutputInfo(transformer);
+  const source = Readable.from(input.stream());
   const processing = pipeline(
-    input.createReadStream({ autoClose: false, start: 0 }),
+    source,
     transformer,
     output,
     ...(options.signal ? [{ signal: options.signal }] : []),
@@ -82,7 +83,7 @@ export function createThumbnailSource(
     .catch((error: unknown) => {
       throw normalizeThumbnailError(error, options.signal);
     })
-    .finally(() => input.close());
+    .finally(() => input.close().catch(() => undefined));
 
   return {
     result,

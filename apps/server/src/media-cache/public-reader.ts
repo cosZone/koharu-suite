@@ -1,5 +1,3 @@
-import type { FileHandle } from 'node:fs/promises';
-import type { Readable } from 'node:stream';
 import { and, eq, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
@@ -10,8 +8,8 @@ import {
   messages,
 } from '../db/schema.js';
 import {
-  type LocalMediaBlobStore,
   type MediaBlobIdentity,
+  type MediaBlobReadHandle,
   MediaBlobStoreError,
 } from './blob-store.js';
 import type { MediaByteRange } from './http-range.js';
@@ -52,6 +50,10 @@ export interface OpenedPublicMedia {
 
 export interface PublicMediaReader {
   open(objectId: string): Promise<OpenedPublicMedia | null>;
+}
+
+export interface PublicMediaBlobReader {
+  read(blob: MediaBlobIdentity): Promise<MediaBlobReadHandle>;
 }
 
 export class PostgresPublicMediaObjectRepository implements PublicMediaObjectRepository {
@@ -110,7 +112,7 @@ export class PostgresPublicMediaObjectRepository implements PublicMediaObjectRep
 export class LocalPublicMediaReader implements PublicMediaReader {
   constructor(
     private readonly repository: PublicMediaObjectRepository,
-    private readonly blobStore: LocalMediaBlobStore,
+    private readonly blobStore: PublicMediaBlobReader,
     private readonly accessObserver: MediaAccessObserver,
   ) {}
 
@@ -119,9 +121,9 @@ export class LocalPublicMediaReader implements PublicMediaReader {
     if (!object) {
       return null;
     }
-    let file: FileHandle;
+    let blob: MediaBlobReadHandle;
     try {
-      file = await this.blobStore.open(blobIdentity(object));
+      blob = await this.blobStore.read(blobIdentity(object));
     } catch (error) {
       if (error instanceof MediaBlobStoreError || hasFilesystemErrorCode(error)) {
         return null;
@@ -129,36 +131,32 @@ export class LocalPublicMediaReader implements PublicMediaReader {
       throw error;
     }
     this.accessObserver.observe(object.sha256);
-    return openedPublicMedia(file, object, objectId);
+    return openedPublicMedia(blob, object, objectId);
   }
 }
 
 function openedPublicMedia(
-  file: FileHandle,
+  blob: MediaBlobReadHandle,
   object: ReadyPublicMediaObject,
   objectId: string,
 ): OpenedPublicMedia {
-  let availableFile: FileHandle | undefined = file;
+  let availableBlob: MediaBlobReadHandle | undefined = blob;
   return {
     byteLength: object.byteLength,
     close: async () => {
-      const closing = availableFile;
-      availableFile = undefined;
+      const closing = availableBlob;
+      availableBlob = undefined;
       await closing?.close();
     },
     contentType: object.detectedMime,
     etag: `"media-${objectId}"`,
     stream: (range) => {
-      const streaming = availableFile;
+      const streaming = availableBlob;
       if (!streaming) {
-        throw new Error('Public media file handle was already consumed');
+        throw new Error('Public media blob was already consumed');
       }
-      availableFile = undefined;
-      const input = streaming.createReadStream({
-        autoClose: true,
-        ...(range ? { end: range.end, start: range.start } : { start: 0 }),
-      });
-      return nodeReadableToByteStream(input);
+      availableBlob = undefined;
+      return publicMediaStream(streaming, range);
     },
     variant: object.variant,
   };
@@ -172,27 +170,46 @@ function blobIdentity(object: ReadyPublicMediaObject): MediaBlobIdentity {
   };
 }
 
-function nodeReadableToByteStream(input: Readable): ReadableStream<Uint8Array> {
-  const iterator = input[Symbol.asyncIterator]();
+function publicMediaStream(
+  blob: MediaBlobReadHandle,
+  range: MediaByteRange | undefined,
+): ReadableStream<Uint8Array> {
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = blob.stream(range ? { end: range.end, start: range.start } : undefined).getReader();
+  } catch {
+    return closeThenError(blob);
+  }
   return new ReadableStream<Uint8Array>({
     async cancel(reason) {
-      input.destroy(reason instanceof Error ? reason : undefined);
-      await iterator.return?.();
+      void reader.cancel(reason).catch(() => undefined);
+      await blob.close().catch(() => undefined);
     },
     async pull(controller) {
       try {
-        const result = await iterator.next();
+        const result = await reader.read();
         if (result.done) {
+          await blob.close();
           controller.close();
           return;
         }
         if (!(result.value instanceof Uint8Array)) {
-          throw new Error('Public media stream returned a non-binary chunk');
+          throw new TypeError('Public media backend returned a non-binary chunk');
         }
         controller.enqueue(result.value);
       } catch {
+        await blob.close().catch(() => undefined);
         controller.error(new Error('Public media stream became unavailable'));
       }
+    },
+  });
+}
+
+function closeThenError(blob: MediaBlobReadHandle): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      await blob.close().catch(() => undefined);
+      controller.error(new Error('Public media stream became unavailable'));
     },
   });
 }

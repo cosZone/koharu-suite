@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type {
   MediaBlobIdentity,
   MediaBlobLease,
+  MediaBlobReadHandle,
   PublishedMediaBlob,
   StagedMediaBlob,
 } from './blob-store.js';
@@ -9,7 +10,7 @@ import { MediaBlobTooLargeError } from './blob-store.js';
 import {
   type CacheableMediaKind,
   MediaContentTypeError,
-  validateMediaContentType,
+  validateMediaContentTypeStream,
 } from './content-type.js';
 import type { MediaCacheDiscoveryResult } from './discovery-repository.js';
 import {
@@ -98,9 +99,9 @@ export interface MediaCacheWorkerWorkRepository {
 
 export interface MediaCacheWorkerBlobStore {
   discardPartialLease: (lease: MediaBlobLease) => Promise<unknown>;
-  open: (blob: MediaBlobIdentity) => Promise<import('node:fs/promises').FileHandle>;
-  openStaged: (staged: StagedMediaBlob) => Promise<import('node:fs/promises').FileHandle>;
   publish: (staged: StagedMediaBlob) => Promise<PublishedMediaBlob>;
+  read: (blob: MediaBlobIdentity) => Promise<MediaBlobReadHandle>;
+  readStaged: (staged: StagedMediaBlob) => Promise<MediaBlobReadHandle>;
   recoverLease: (lease: MediaBlobLease) => Promise<readonly StagedMediaBlob[]>;
   settle: (staged: StagedMediaBlob, settlement: 'db_committed' | 'db_rolled_back') => Promise<void>;
   stage: (input: {
@@ -149,7 +150,7 @@ export interface MediaCacheWorkerRunResult {
 }
 
 interface StagedOriginal {
-  contentType: Awaited<ReturnType<typeof validateMediaContentType>>;
+  contentType: Awaited<ReturnType<typeof validateMediaContentTypeStream>>;
   staged: StagedMediaBlob;
 }
 
@@ -284,12 +285,12 @@ export class MediaCacheWorker {
       await this.blobStore.settle(staged, 'db_committed');
       return;
     }
-    const file = await this.blobStore.open({
+    const blob = await this.blobStore.read({
       byteLength: Number(snapshot.actualBytes),
       relativeKey: relativeKey(snapshot.blobSha256),
       sha256: snapshot.blobSha256,
     });
-    await verifyOpenBlob(file, snapshot.blobSha256);
+    await verifyOpenBlob(blob, snapshot.blobSha256);
   }
 
   private async processNextThumbnail(
@@ -322,9 +323,10 @@ export class MediaCacheWorker {
     signal?: AbortSignal,
   ): Promise<'completed' | 'skipped'> {
     const lease = { leaseToken, planId: claimed.planId };
+    let original: MediaBlobReadHandle | undefined;
     let staged: StagedMediaBlob | undefined;
     try {
-      const original = await this.blobStore.open({
+      original = await this.blobStore.read({
         byteLength: Number(claimed.original.byteLength),
         relativeKey: claimed.original.relativeKey,
         sha256: claimed.original.sha256,
@@ -333,6 +335,7 @@ export class MediaCacheWorker {
         mimeType: claimed.original.detectedMime,
         ...(signal ? { signal } : {}),
       });
+      original = undefined;
       const [stageResult, recipeResult] = await Promise.allSettled([
         this.blobStore.stage({
           lease,
@@ -377,6 +380,8 @@ export class MediaCacheWorker {
         objectId: claimed.objectId,
       });
       return 'skipped';
+    } finally {
+      await original?.close();
     }
     if (!staged) {
       throw new Error('Thumbnail publication completed without staging provenance');
@@ -528,14 +533,17 @@ export class MediaCacheWorker {
           ...(signal ? { signal } : {}),
           source: opened.stream,
         });
-        const file = await this.blobStore.openStaged(staged);
+        const blob = await this.blobStore.readStaged(staged);
         try {
           return {
-            contentType: await validateMediaContentType(file, original.kind),
+            contentType: await validateMediaContentTypeStream(
+              blob.byteLength > 4100 ? blob.stream({ end: 4099, start: 0 }) : blob.stream(),
+              original.kind,
+            ),
             staged,
           };
         } finally {
-          await file.close();
+          await blob.close();
         }
       } catch (error) {
         if (staged) {
@@ -620,12 +628,12 @@ export class MediaCacheWorker {
         await this.blobStore.settle(item, 'db_committed');
         continue;
       }
-      const file = await this.blobStore.open({
+      const blob = await this.blobStore.read({
         byteLength: Number(object.actualBytes),
         relativeKey: relativeKey(object.blobSha256),
         sha256: object.blobSha256,
       });
-      await verifyOpenBlob(file, object.blobSha256);
+      await verifyOpenBlob(blob, object.blobSha256);
     }
   }
 }
@@ -711,17 +719,14 @@ function thumbnailErrorCode(error: unknown): string {
   return 'thumbnail_unavailable';
 }
 
-async function verifyOpenBlob(
-  file: import('node:fs/promises').FileHandle,
-  expectedSha256: string,
-): Promise<void> {
+async function verifyOpenBlob(blob: MediaBlobReadHandle, expectedSha256: string): Promise<void> {
   const hash = createHash('sha256');
   try {
-    for await (const chunk of file.createReadStream({ autoClose: false, start: 0 })) {
+    for await (const chunk of blob.stream()) {
       hash.update(chunk);
     }
   } finally {
-    await file.close();
+    await blob.close();
   }
   if (hash.digest('hex') !== expectedSha256) {
     throw new Error('Recovered media blob checksum does not match the ledger');
