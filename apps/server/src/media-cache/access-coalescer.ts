@@ -1,5 +1,6 @@
 const SHA256 = /^[0-9a-f]{64}$/u;
 const DEFAULT_COALESCE_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_ACCESS_BATCH = 100;
 
 export interface MediaCacheBlobAccess {
   observedAt: Date;
@@ -64,13 +65,16 @@ export class MediaCacheAccessCoalescer {
       return;
     }
 
-    await this.#writer.writeAccesses(snapshot);
-    for (const access of snapshot) {
-      const pending = this.#pending.get(access.sha256);
-      if (pending?.getTime() === access.observedAt.getTime()) {
-        this.#pending.delete(access.sha256);
+    for (let offset = 0; offset < snapshot.length; offset += MAX_ACCESS_BATCH) {
+      const batch = snapshot.slice(offset, offset + MAX_ACCESS_BATCH);
+      await this.#writer.writeAccesses(batch);
+      for (const access of batch) {
+        const pending = this.#pending.get(access.sha256);
+        if (pending?.getTime() === access.observedAt.getTime()) {
+          this.#pending.delete(access.sha256);
+        }
+        this.#lastWrittenAt.set(access.sha256, nowMs);
       }
-      this.#lastWrittenAt.set(access.sha256, nowMs);
     }
     this.#pruneHistory(nowMs);
   }

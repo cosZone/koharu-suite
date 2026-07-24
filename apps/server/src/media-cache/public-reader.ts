@@ -129,11 +129,15 @@ export class LocalPublicMediaReader implements PublicMediaReader {
       throw error;
     }
     this.accessObserver.observe(object.sha256);
-    return openedPublicMedia(file, object);
+    return openedPublicMedia(file, object, objectId);
   }
 }
 
-function openedPublicMedia(file: FileHandle, object: ReadyPublicMediaObject): OpenedPublicMedia {
+function openedPublicMedia(
+  file: FileHandle,
+  object: ReadyPublicMediaObject,
+  objectId: string,
+): OpenedPublicMedia {
   let availableFile: FileHandle | undefined = file;
   return {
     byteLength: object.byteLength,
@@ -143,7 +147,7 @@ function openedPublicMedia(file: FileHandle, object: ReadyPublicMediaObject): Op
       await closing?.close();
     },
     contentType: object.detectedMime,
-    etag: `"${object.sha256}"`,
+    etag: `"media-${objectId}"`,
     stream: (range) => {
       const streaming = availableFile;
       if (!streaming) {

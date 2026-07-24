@@ -83,6 +83,27 @@ docker compose exec worker node dist/cli.js health worker
 its heartbeat every 10 seconds, and a heartbeat older than 30 seconds is stale. A reverse proxy should route
 traffic only to the server's port 3000.
 
+## Optional local media cache
+
+The media cache is disabled by default. To enable it, add:
+
+```dotenv
+MEDIA_CACHE_ENABLED=true
+MEDIA_CACHE_MAX_BYTES=5368709120
+MEDIA_CACHE_DOWNLOAD_CONCURRENCY=2
+```
+
+Compose mounts the same `media-cache-data` volume read-write in the worker and read-only in the server; both
+roles use `/var/lib/koharu/media-cache`. Do not make the server mount writable in an override, and do not
+share this Preview volume between two workers. The image seeds `.tmp/` and `blobs/` into a newly created named
+volume; the server validates that layout without creating directories. A non-Compose deployment must prepare
+the complete layout and permissions before starting the server, or a cache-enabled server fails closed.
+
+An upgrade backup requires PostgreSQL only; source evidence can rebuild cache bytes. To preserve a warm
+cache, stop server and worker and snapshot both the database and complete volume in the same downtime window.
+See the [media cache operations guide](../media-cache/README.en.md) for volume loss or deletion, permissions,
+dry-run pruning, reconciliation, and Telegram fallback.
+
 ## Reproducible local smoke
 
 The repository smoke uses a synthetic message and a local Telegram fixture, so it needs no real secret:

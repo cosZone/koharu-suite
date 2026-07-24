@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -72,6 +82,28 @@ describe('DesktopMediaSource', () => {
     await expect(opened).rejects.toMatchObject({ code: 'desktop_media_source_unavailable' });
     await expect(opened).rejects.not.toHaveProperty('message', expect.stringContaining(root));
     await expect(opened).rejects.not.toHaveProperty('message', expect.stringContaining(outside));
+  });
+
+  it('fails closed when a contained parent is replaced after the path identity check', async () => {
+    const { outside, root } = await createFixture();
+    await writeFile(join(outside, 'photo 1.jpg'), 'outside secret');
+    const source = new DesktopMediaSource({
+      open: async (path, flags) => {
+        await rename(join(root, 'photos'), join(root, 'photos-before-race'));
+        await symlink(outside, join(root, 'photos'), 'dir');
+        return open(path, flags);
+      },
+      realpath,
+      stat: (path) => stat(path, { bigint: true }),
+    });
+
+    await expect(
+      source.open({
+        desktopRoot: root,
+        maxBytes: 1024,
+        sourcePath: 'photos/photo 1.jpg',
+      }),
+    ).rejects.toBeInstanceOf(DesktopMediaSourceUnavailableError);
   });
 
   it.each([

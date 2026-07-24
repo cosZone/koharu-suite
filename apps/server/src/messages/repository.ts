@@ -46,6 +46,10 @@ export interface MessageWriter {
   ): Promise<SourceWriteDecision>;
 }
 
+export interface PostgresMessageRepositoryOptions {
+  mediaCacheEnabled?: boolean;
+}
+
 type MessageRow = Awaited<ReturnType<PostgresMessageRepository['selectMessages']>>[number];
 type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 type SourceMediaAvailability = typeof messageSourceMediaObservations.$inferInsert.availability;
@@ -224,7 +228,14 @@ function publicMessage(row: MessageRow, media: PublicMedia[]): PublicMessage {
 }
 
 export class PostgresMessageRepository implements MessageReader, MessageWriter {
-  constructor(private readonly database: Database) {}
+  private readonly mediaCacheEnabled: boolean;
+
+  constructor(
+    private readonly database: Database,
+    options: PostgresMessageRepositoryOptions = {},
+  ) {
+    this.mediaCacheEnabled = options.mediaCacheEnabled ?? false;
+  }
 
   async ingest(post: NormalizedChannelPost): Promise<IngestResult> {
     return this.database.transaction((transaction) => this.ingestInTransaction(transaction, post));
@@ -916,7 +927,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       .orderBy(messageMedia.position);
 
     const cacheRows =
-      mediaRows.length === 0
+      !this.mediaCacheEnabled || mediaRows.length === 0
         ? []
         : await this.database
             .select({

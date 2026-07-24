@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -78,7 +78,7 @@ describe('LocalPublicMediaReader', () => {
     expect(opened).toMatchObject({
       byteLength: 10,
       contentType: 'image/jpeg',
-      etag: `"${createHash('sha256').update('0123456789').digest('hex')}"`,
+      etag: `"media-${objectId}"`,
       variant: 'original',
     });
     expect(accessObserver.observe).toHaveBeenCalledOnce();

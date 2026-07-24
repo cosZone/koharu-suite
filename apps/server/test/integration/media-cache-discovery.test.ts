@@ -14,10 +14,16 @@ import {
   messageSourceMediaObservations,
   messageSourceObservations,
   messages,
+  telegramChannelAllowlist,
   telegramChannels,
   telegramUpdates,
 } from '../../src/db/schema.js';
-import { PostgresMediaCacheDiscoveryRepository } from '../../src/media-cache/discovery-repository.js';
+import {
+  MediaCacheDiscoveryScopeError,
+  PostgresMediaCacheDiscoveryRepository,
+} from '../../src/media-cache/discovery-repository.js';
+import { PostgresMediaCacheLedgerRepository } from '../../src/media-cache/ledger-repository.js';
+import { PostgresMediaCacheWorkerRepository } from '../../src/media-cache/worker-repository.js';
 import { lockSourceEvidenceDiscovery } from '../../src/messages/source-evidence-coordination.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
@@ -31,6 +37,7 @@ interface RevisionFixture {
   media: Array<{ id: string; kind: MediaKind; position: number }>;
   messageId: string;
   revisionId: string;
+  telegramChatId: bigint;
 }
 
 let fixtureSequence = 0;
@@ -41,10 +48,11 @@ async function createRevision(
   options: { currentRevisionNumber?: number; revisionNumber?: number; tombstoned?: boolean } = {},
 ): Promise<RevisionFixture> {
   fixtureSequence += 1;
+  const telegramChatId = -1_004_000_000_000n - BigInt(fixtureSequence);
   const [channel] = await connection.db
     .insert(telegramChannels)
     .values({
-      telegramChatId: -1_004_000_000_000n - BigInt(fixtureSequence),
+      telegramChatId,
       title: `Discovery ${fixtureSequence}`,
     })
     .returning({ id: telegramChannels.id });
@@ -104,7 +112,20 @@ async function createRevision(
     media: canonicalMedia as RevisionFixture['media'],
     messageId: message.id,
     revisionId: revision.id,
+    telegramChatId,
   };
+}
+
+async function configureChannels(
+  connection: DatabaseConnection,
+  fixtures: readonly RevisionFixture[],
+): Promise<void> {
+  await connection.db.insert(telegramChannelAllowlist).values(
+    fixtures.map((fixture) => ({
+      telegramChatId: fixture.telegramChatId,
+      title: `Configured ${fixture.telegramChatId}`,
+    })),
+  );
 }
 
 async function addEvidence(
@@ -265,6 +286,139 @@ describe('media cache discovery repository', () => {
     expect(runtime).toMatchObject({
       discoveryCursorCreatedAt: new Date('2026-07-24T00:00:01.000Z'),
       discoveryCursorId: validId,
+    });
+  });
+
+  it('scans only configured selected channels without consuming the global cursor', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const selected = await createRevision(connection, [
+      { bytes: 1n * MEBIBYTE, kind: 'photo', position: 0 },
+    ]);
+    const excluded = await createRevision(connection, [
+      { bytes: 1n * MEBIBYTE, kind: 'photo', position: 0 },
+    ]);
+    await configureChannels(connection, [selected, excluded]);
+    const selectedEvidenceId = await addEvidence(connection, selected, {
+      createdAt: new Date('2026-07-24T00:00:02.000Z'),
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    await addEvidence(connection, excluded, {
+      createdAt: new Date('2026-07-24T00:00:03.000Z'),
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+
+    const repository = new PostgresMediaCacheDiscoveryRepository(connection.db);
+    await expect(repository.discoverScopedBatch([selected.telegramChatId])).resolves.toMatchObject({
+      cursor: { id: selectedEvidenceId },
+      hasMore: false,
+      objectsCreated: 1,
+      plansCreated: 1,
+      scanned: 1,
+      sourcesCreated: 1,
+    });
+    expect(await connection.db.select().from(mediaCacheRuntime)).toEqual([]);
+    expect(
+      await connection.db
+        .select({ revisionId: mediaCachePostPlans.revisionId })
+        .from(mediaCachePostPlans),
+    ).toEqual([{ revisionId: selected.revisionId }]);
+
+    await expect(repository.discoverBatch()).resolves.toMatchObject({
+      objectsCreated: 1,
+      plansCreated: 1,
+      scanned: 2,
+      sourcesCreated: 1,
+    });
+    const plans = await connection.db
+      .select({ revisionId: mediaCachePostPlans.revisionId })
+      .from(mediaCachePostPlans);
+    expect(plans).toEqual(
+      expect.arrayContaining([
+        { revisionId: selected.revisionId },
+        { revisionId: excluded.revisionId },
+      ]),
+    );
+    expect(plans).toHaveLength(2);
+  });
+
+  it('rejects empty, non-canonical, or unconfigured scoped channel IDs', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const repository = new PostgresMediaCacheDiscoveryRepository(connection.db);
+    await expect(repository.discoverScopedBatch([])).rejects.toThrow(MediaCacheDiscoveryScopeError);
+    await expect(repository.discoverScopedBatch([1n])).rejects.toThrow(
+      'canonical negative Telegram channel ID',
+    );
+    await expect(repository.discoverScopedBatch([-1_002_234_260_754n])).rejects.toThrow(
+      'must exist in the Telegram allowlist',
+    );
+  });
+
+  it('keeps scoped microsecond timestamps and UUID keysets lossless across pages', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createRevision(connection, [
+      { bytes: 1n * MEBIBYTE, kind: 'photo', position: 0 },
+    ]);
+    await configureChannels(connection, [fixture]);
+    const firstId = await addEvidence(connection, fixture, {
+      createdAt: new Date('2026-07-24T00:00:04.123Z'),
+      id: '00000000-0000-4000-8000-000000000021',
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    const secondId = await addEvidence(connection, fixture, {
+      createdAt: new Date('2026-07-24T00:00:04.123Z'),
+      id: '00000000-0000-4000-8000-000000000022',
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    await connection.db.execute(sql`
+      update ${messageSourceMediaObservations}
+      set created_at = timestamp with time zone '2026-07-24 00:00:04.123456+00'
+      where ${messageSourceMediaObservations.id} in (${firstId}, ${secondId})
+    `);
+
+    const repository = new PostgresMediaCacheDiscoveryRepository(connection.db, { batchSize: 1 });
+    const first = await repository.discoverScopedBatch([fixture.telegramChatId]);
+    expect(first).toMatchObject({
+      cursor: { id: firstId },
+      hasMore: true,
+      scanned: 1,
+    });
+    if (!first.cursor) {
+      throw new Error('First scoped cursor was not returned');
+    }
+    expect(first.cursor.createdAt.toISOString()).toBe('2026-07-24T00:00:04.123Z');
+
+    const second = await repository.discoverScopedBatch([fixture.telegramChatId], first.cursor);
+    expect(second).toMatchObject({
+      cursor: { id: secondId },
+      hasMore: false,
+      objectsCreated: 0,
+      plansCreated: 0,
+      scanned: 1,
+      sourcesCreated: 0,
+    });
+    if (!second.cursor) {
+      throw new Error('Second scoped cursor was not returned');
+    }
+    await expect(
+      repository.discoverScopedBatch([fixture.telegramChatId], second.cursor),
+    ).resolves.toMatchObject({
+      cursor: { id: secondId },
+      hasMore: false,
+      scanned: 0,
     });
   });
 
@@ -804,5 +958,76 @@ describe('media cache discovery repository', () => {
         state: 'skipped',
       });
     }
+  });
+
+  it('resolves a claimed plan only from current non-tombstoned Bot evidence in stable priority order', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createRevision(connection, [
+      { bytes: 1n * MEBIBYTE, kind: 'photo', position: 0 },
+    ]);
+    const firstSourceId = await addEvidence(connection, fixture, {
+      createdAt: new Date('2026-07-24T00:06:01.000Z'),
+      id: '00000000-0000-4000-8000-000000000011',
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    const secondSourceId = await addEvidence(connection, fixture, {
+      createdAt: new Date('2026-07-24T00:06:02.000Z'),
+      id: '00000000-0000-4000-8000-000000000012',
+      kind: 'photo',
+      position: 0,
+      sourceKind: 'telegram_bot_update',
+    });
+    await new PostgresMediaCacheDiscoveryRepository(connection.db).discoverBatch();
+    const [plan] = await connection.db
+      .select({ id: mediaCachePostPlans.id })
+      .from(mediaCachePostPlans);
+    if (!plan) {
+      throw new Error('Discovered plan was not created');
+    }
+    const work = new PostgresMediaCacheWorkerRepository(connection.db);
+    await expect(work.listRunnablePostPlanIds(2)).resolves.toEqual([plan.id]);
+    const leaseToken = randomUUID();
+    const claim = await new PostgresMediaCacheLedgerRepository(connection.db).claimPostPlan({
+      leaseExpiresAt: new Date(Date.now() + 30_000),
+      leaseOwner: 'worker-source-test',
+      leaseToken,
+      planId: plan.id,
+    });
+    const sourceRows = await connection.db
+      .select({
+        fileId: messageSourceMediaObservations.telegramFileId,
+        id: messageSourceMediaObservations.id,
+      })
+      .from(messageSourceMediaObservations)
+      .orderBy(asc(messageSourceMediaObservations.createdAt));
+    const expectedSources = sourceRows
+      .filter(({ id }) => id === firstSourceId || id === secondSourceId)
+      .map(({ fileId }) => ({ fileId }));
+
+    await expect(work.loadClaimedOriginals(plan.id, leaseToken)).resolves.toEqual([
+      {
+        kind: 'photo',
+        objectId: claim?.objectIds[0],
+        position: 0,
+        sources: expectedSources,
+      },
+    ]);
+
+    await connection.db
+      .update(messages)
+      .set({ tombstonedAt: new Date() })
+      .where(eq(messages.id, fixture.messageId));
+    await expect(work.loadClaimedOriginals(plan.id, leaseToken)).resolves.toEqual([
+      {
+        kind: 'photo',
+        objectId: claim?.objectIds[0],
+        position: 0,
+        sources: [],
+      },
+    ]);
   });
 });

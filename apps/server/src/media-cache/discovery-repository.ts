@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, isNotNull, isNull, or } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   mediaCacheObjectSources,
@@ -10,6 +10,8 @@ import {
   messageSourceMediaObservations,
   messageSourceObservations,
   messages,
+  telegramChannelAllowlist,
+  telegramChannels,
 } from '../db/schema.js';
 import { lockSourceEvidenceDiscovery } from '../messages/source-evidence-coordination.js';
 import { type OriginalMediaPlanItem, planOriginalMediaCache } from './policy.js';
@@ -19,6 +21,8 @@ const MAX_BATCH_SIZE = 500;
 const ORIGINAL_RECIPE_VERSION = 1;
 const BOT_SOURCE_PRIORITY = 0;
 const DESKTOP_SOURCE_PRIORITY = 1;
+const TELEGRAM_ID_LOWER_BOUND = -((1n << 52n) - 1n);
+export const MEDIA_CACHE_SCOPED_DISCOVERY_CHANNEL_LIMIT = 100;
 
 export interface MediaCacheDiscoveryCursor {
   createdAt: Date;
@@ -27,10 +31,15 @@ export interface MediaCacheDiscoveryCursor {
 
 export interface MediaCacheDiscoveryResult {
   cursor: MediaCacheDiscoveryCursor | null;
+  hasMore?: boolean;
   objectsCreated: number;
   plansCreated: number;
   scanned: number;
   sourcesCreated: number;
+}
+
+export interface MediaCacheScopedDiscoveryResult extends MediaCacheDiscoveryResult {
+  hasMore: boolean;
 }
 
 interface DiscoveryOptions {
@@ -84,7 +93,7 @@ export class PostgresMediaCacheDiscoveryRepository {
 
       const cursor =
         runtime.createdAt && runtime.id ? { createdAt: runtime.createdAt, id: runtime.id } : null;
-      const batch = await transaction
+      const rows = await transaction
         .select({
           createdAt: messageSourceMediaObservations.createdAt,
           id: messageSourceMediaObservations.id,
@@ -92,24 +101,27 @@ export class PostgresMediaCacheDiscoveryRepository {
         .from(messageSourceMediaObservations)
         .where(
           cursor
-            ? or(
-                gt(messageSourceMediaObservations.createdAt, cursor.createdAt),
-                and(
-                  eq(messageSourceMediaObservations.createdAt, cursor.createdAt),
-                  gt(messageSourceMediaObservations.id, cursor.id),
-                ),
-              )
+            ? sql`(${messageSourceMediaObservations.createdAt}, ${messageSourceMediaObservations.id})
+                > (
+                  select ${mediaCacheRuntime.discoveryCursorCreatedAt},
+                    ${mediaCacheRuntime.discoveryCursorId}
+                  from ${mediaCacheRuntime}
+                  where ${mediaCacheRuntime.singletonKey} = 'local'
+                )`
             : undefined,
         )
         .orderBy(
           asc(messageSourceMediaObservations.createdAt),
           asc(messageSourceMediaObservations.id),
         )
-        .limit(this.batchSize);
+        .limit(this.batchSize + 1);
+      const hasMore = rows.length > this.batchSize;
+      const batch = rows.slice(0, this.batchSize);
 
       if (batch.length === 0) {
         return {
           cursor,
+          hasMore: false,
           objectsCreated: 0,
           plansCreated: 0,
           scanned: 0,
@@ -117,56 +129,7 @@ export class PostgresMediaCacheDiscoveryRepository {
         };
       }
 
-      const revisionRows = await transaction
-        .selectDistinct({ revisionId: messageSourceObservations.revisionId })
-        .from(messageSourceMediaObservations)
-        .innerJoin(
-          messageSourceObservations,
-          and(
-            eq(messageSourceObservations.id, messageSourceMediaObservations.observationId),
-            eq(messageSourceObservations.sourceKind, messageSourceMediaObservations.sourceKind),
-          ),
-        )
-        .innerJoin(
-          messageRevisions,
-          and(
-            eq(messageRevisions.id, messageSourceObservations.revisionId),
-            eq(messageRevisions.messageId, messageSourceObservations.messageId),
-          ),
-        )
-        .innerJoin(
-          messages,
-          and(
-            eq(messages.id, messageRevisions.messageId),
-            eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
-            isNull(messages.tombstonedAt),
-          ),
-        )
-        .where(
-          and(
-            inArray(
-              messageSourceMediaObservations.id,
-              batch.map(({ id }) => id),
-            ),
-            eq(messageSourceMediaObservations.availability, 'available'),
-            inArray(messageSourceMediaObservations.mediaKind, ['photo', 'animation', 'video']),
-            inArray(messageSourceObservations.resolution, ['created', 'matched']),
-            isNotNull(messageSourceObservations.revisionId),
-          ),
-        );
-
-      let plansCreated = 0;
-      let objectsCreated = 0;
-      let sourcesCreated = 0;
-      for (const { revisionId } of revisionRows) {
-        if (!revisionId) {
-          continue;
-        }
-        const created = await discoverRevision(transaction, revisionId);
-        plansCreated += created.plans;
-        objectsCreated += created.objects;
-        sourcesCreated += created.sources;
-      }
+      const created = await discoverBatchRevisions(transaction, batch);
 
       const last = batch.at(-1);
       if (!last) {
@@ -175,7 +138,11 @@ export class PostgresMediaCacheDiscoveryRepository {
       await transaction
         .update(mediaCacheRuntime)
         .set({
-          discoveryCursorCreatedAt: last.createdAt,
+          discoveryCursorCreatedAt: sql`(
+            select ${messageSourceMediaObservations.createdAt}
+            from ${messageSourceMediaObservations}
+            where ${messageSourceMediaObservations.id} = ${last.id}
+          )`,
           discoveryCursorId: last.id,
           updatedAt: new Date(),
         })
@@ -183,13 +150,217 @@ export class PostgresMediaCacheDiscoveryRepository {
 
       return {
         cursor: last,
-        objectsCreated,
-        plansCreated,
+        hasMore,
+        objectsCreated: created.objects,
+        plansCreated: created.plans,
         scanned: batch.length,
-        sourcesCreated,
+        sourcesCreated: created.sources,
       };
     });
   }
+
+  /**
+   * Discovers one explicitly scoped page without reading or advancing the durable
+   * runtime cursor. The caller owns the returned keyset cursor.
+   *
+   * Cursor comparisons resolve the source row by UUID inside PostgreSQL. This
+   * preserves timestamp microseconds that are not representable by JavaScript
+   * `Date` and keeps identical-timestamp UUID ordering lossless.
+   */
+  async discoverScopedBatch(
+    telegramChatIds: readonly bigint[],
+    cursor: MediaCacheDiscoveryCursor | null = null,
+  ): Promise<MediaCacheScopedDiscoveryResult> {
+    const scope = normalizeScopedTelegramChannelIds(telegramChatIds);
+    return this.database.transaction(async (transaction) => {
+      await lockSourceEvidenceDiscovery(transaction);
+      const configured = await transaction
+        .select({ telegramChatId: telegramChannelAllowlist.telegramChatId })
+        .from(telegramChannelAllowlist)
+        .where(inArray(telegramChannelAllowlist.telegramChatId, scope));
+      if (configured.length !== scope.length) {
+        throw new MediaCacheDiscoveryScopeError(
+          'Every media-cache scan channel must exist in the Telegram allowlist',
+        );
+      }
+
+      if (cursor) {
+        const [cursorRow] = await transaction
+          .select({ id: messageSourceMediaObservations.id })
+          .from(messageSourceMediaObservations)
+          .innerJoin(
+            messageSourceObservations,
+            and(
+              eq(messageSourceObservations.id, messageSourceMediaObservations.observationId),
+              eq(messageSourceObservations.sourceKind, messageSourceMediaObservations.sourceKind),
+            ),
+          )
+          .innerJoin(telegramChannels, eq(telegramChannels.id, messageSourceObservations.channelId))
+          .where(
+            and(
+              eq(messageSourceMediaObservations.id, cursor.id),
+              inArray(telegramChannels.telegramChatId, scope),
+            ),
+          )
+          .limit(1);
+        if (!cursorRow) {
+          throw new MediaCacheDiscoveryCursorError(
+            'Media-cache scan cursor does not belong to the selected channel scope',
+          );
+        }
+      }
+
+      const rows = await transaction
+        .select({
+          createdAt: messageSourceMediaObservations.createdAt,
+          id: messageSourceMediaObservations.id,
+        })
+        .from(messageSourceMediaObservations)
+        .innerJoin(
+          messageSourceObservations,
+          and(
+            eq(messageSourceObservations.id, messageSourceMediaObservations.observationId),
+            eq(messageSourceObservations.sourceKind, messageSourceMediaObservations.sourceKind),
+          ),
+        )
+        .innerJoin(telegramChannels, eq(telegramChannels.id, messageSourceObservations.channelId))
+        .where(
+          and(
+            inArray(telegramChannels.telegramChatId, scope),
+            cursor
+              ? sql`(${messageSourceMediaObservations.createdAt}, ${messageSourceMediaObservations.id})
+                  > (
+                    select ${messageSourceMediaObservations.createdAt},
+                      ${messageSourceMediaObservations.id}
+                    from ${messageSourceMediaObservations}
+                    where ${messageSourceMediaObservations.id} = ${cursor.id}
+                  )`
+              : undefined,
+          ),
+        )
+        .orderBy(
+          asc(messageSourceMediaObservations.createdAt),
+          asc(messageSourceMediaObservations.id),
+        )
+        .limit(this.batchSize + 1);
+      const hasMore = rows.length > this.batchSize;
+      const batch = rows.slice(0, this.batchSize);
+      if (batch.length === 0) {
+        return {
+          cursor,
+          hasMore: false,
+          objectsCreated: 0,
+          plansCreated: 0,
+          scanned: 0,
+          sourcesCreated: 0,
+        };
+      }
+
+      const created = await discoverBatchRevisions(transaction, batch);
+      const last = batch.at(-1);
+      if (!last) {
+        throw new Error('Scoped discovery batch unexpectedly had no final cursor');
+      }
+      return {
+        cursor: last,
+        hasMore,
+        objectsCreated: created.objects,
+        plansCreated: created.plans,
+        scanned: batch.length,
+        sourcesCreated: created.sources,
+      };
+    });
+  }
+}
+
+export class MediaCacheDiscoveryScopeError extends Error {}
+
+export class MediaCacheDiscoveryCursorError extends Error {}
+
+function normalizeScopedTelegramChannelIds(values: readonly bigint[]): bigint[] {
+  if (
+    values.some(
+      (telegramChatId) =>
+        typeof telegramChatId !== 'bigint' ||
+        telegramChatId >= 0n ||
+        telegramChatId < TELEGRAM_ID_LOWER_BOUND,
+    )
+  ) {
+    throw new MediaCacheDiscoveryScopeError(
+      'Every media-cache scan channel must be a canonical negative Telegram channel ID',
+    );
+  }
+  const scope = [...new Set(values)].sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  if (scope.length === 0) {
+    throw new MediaCacheDiscoveryScopeError(
+      'At least one Telegram channel ID is required for a scoped media-cache scan',
+    );
+  }
+  if (scope.length > MEDIA_CACHE_SCOPED_DISCOVERY_CHANNEL_LIMIT) {
+    throw new MediaCacheDiscoveryScopeError(
+      `A media-cache scan may include at most ${MEDIA_CACHE_SCOPED_DISCOVERY_CHANNEL_LIMIT} channels`,
+    );
+  }
+  return scope;
+}
+
+async function discoverBatchRevisions(
+  transaction: DiscoveryTransaction,
+  batch: ReadonlyArray<MediaCacheDiscoveryCursor>,
+): Promise<{ objects: number; plans: number; sources: number }> {
+  const revisionRows = await transaction
+    .selectDistinct({ revisionId: messageSourceObservations.revisionId })
+    .from(messageSourceMediaObservations)
+    .innerJoin(
+      messageSourceObservations,
+      and(
+        eq(messageSourceObservations.id, messageSourceMediaObservations.observationId),
+        eq(messageSourceObservations.sourceKind, messageSourceMediaObservations.sourceKind),
+      ),
+    )
+    .innerJoin(
+      messageRevisions,
+      and(
+        eq(messageRevisions.id, messageSourceObservations.revisionId),
+        eq(messageRevisions.messageId, messageSourceObservations.messageId),
+      ),
+    )
+    .innerJoin(
+      messages,
+      and(
+        eq(messages.id, messageRevisions.messageId),
+        eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
+        isNull(messages.tombstonedAt),
+      ),
+    )
+    .where(
+      and(
+        inArray(
+          messageSourceMediaObservations.id,
+          batch.map(({ id }) => id),
+        ),
+        eq(messageSourceMediaObservations.availability, 'available'),
+        inArray(messageSourceMediaObservations.mediaKind, ['photo', 'animation', 'video']),
+        inArray(messageSourceObservations.resolution, ['created', 'matched']),
+        isNotNull(messageSourceObservations.revisionId),
+      ),
+    );
+
+  let plans = 0;
+  let objects = 0;
+  let sources = 0;
+  for (const { revisionId } of revisionRows) {
+    if (!revisionId) {
+      continue;
+    }
+    const created = await discoverRevision(transaction, revisionId);
+    plans += created.plans;
+    objects += created.objects;
+    sources += created.sources;
+  }
+  return { objects, plans, sources };
 }
 
 async function discoverRevision(

@@ -1276,6 +1276,89 @@ export const mediaCacheObjects = pgTable(
   ],
 );
 
+export const mediaCacheCommands = pgTable(
+  'media_cache_commands',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    operation: varchar('operation', { length: 16 }).$type<'evict' | 'reconcile'>().notNull(),
+    state: varchar('state', { length: 16 })
+      .$type<'failed' | 'pending' | 'running' | 'succeeded'>()
+      .notNull()
+      .default('pending'),
+    objectId: uuid('object_id').references(() => mediaCacheObjects.id, {
+      onDelete: 'restrict',
+    }),
+    initiatorId: text('initiator_id').notNull(),
+    reason: text('reason').notNull(),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    leaseOwner: text('lease_owner'),
+    leaseToken: uuid('lease_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    result: jsonb('result').$type<Record<string, unknown>>(),
+    errorCode: varchar('error_code', { length: 64 }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('media_cache_commands_claim_idx')
+      .on(table.state, table.leaseExpiresAt, table.createdAt, table.id)
+      .where(sql`${table.state} in ('pending', 'running')`),
+    index('media_cache_commands_object_idx').on(table.objectId, table.createdAt, table.id),
+    check(
+      'media_cache_commands_operation_check',
+      sql`${table.operation} in ('evict', 'reconcile')`,
+    ),
+    check(
+      'media_cache_commands_target_check',
+      sql`(${table.operation} = 'evict' and ${table.objectId} is not null)
+        or (${table.operation} = 'reconcile' and ${table.objectId} is null)`,
+    ),
+    check(
+      'media_cache_commands_initiator_check',
+      sql`length(btrim(${table.initiatorId})) between 1 and 255
+        and length(btrim(${table.reason})) between 1 and 500`,
+    ),
+    check('media_cache_commands_attempt_check', sql`${table.attemptCount} between 0 and 100`),
+    check(
+      'media_cache_commands_lease_check',
+      sql`(
+          ${table.state} = 'running'
+          and ${table.leaseOwner} is not null
+          and length(btrim(${table.leaseOwner})) between 1 and 255
+          and ${table.leaseToken} is not null
+          and ${table.leaseExpiresAt} is not null
+          and ${table.completedAt} is null
+        ) or (
+          ${table.state} <> 'running'
+          and ${table.leaseOwner} is null
+          and ${table.leaseToken} is null
+          and ${table.leaseExpiresAt} is null
+        )`,
+    ),
+    check(
+      'media_cache_commands_terminal_check',
+      sql`(
+          ${table.state} = 'succeeded'
+          and ${table.result} is not null
+          and jsonb_typeof(${table.result}) = 'object'
+          and ${table.errorCode} is null
+          and ${table.completedAt} is not null
+        ) or (
+          ${table.state} = 'failed'
+          and ${table.result} is null
+          and ${table.errorCode} is not null
+          and ${table.completedAt} is not null
+        ) or (
+          ${table.state} in ('pending', 'running')
+          and ${table.result} is null
+          and ${table.errorCode} is null
+          and ${table.completedAt} is null
+        )`,
+    ),
+  ],
+);
+
 export const mediaCacheObjectSources = pgTable(
   'media_cache_object_sources',
   {

@@ -28,7 +28,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run --exclude \"test/integration/**\"",
-    "test:integration": "vitest run test/integration",
+    "test:integration": "vitest run test/integration --maxWorkers=2 --testTimeout=15000 --hookTimeout=30000",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

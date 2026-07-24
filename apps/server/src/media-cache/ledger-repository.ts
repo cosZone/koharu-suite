@@ -1,11 +1,14 @@
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
+  mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
   messageMedia,
+  messageRevisions,
+  messages,
 } from '../db/schema.js';
 
 export const MEDIA_CACHE_ADVISORY_LOCK = 6_309_648_946_926_691;
@@ -39,6 +42,7 @@ type DetectedMediaMime =
   | 'video/webm';
 
 export interface ClaimMediaCachePostPlanInput {
+  allowAwaitingLocalSource?: boolean;
   leaseExpiresAt: Date;
   leaseOwner: string;
   leaseToken: string;
@@ -71,12 +75,46 @@ export interface CompleteMediaCacheSettlementInput {
   planId: string;
 }
 
+export interface FailClaimedMediaCachePostPlanInput {
+  cleanup: () => Promise<void>;
+  conflictingObjectId?: string;
+  disposition?: 'await_local_source' | 'integrity_conflict' | 'retry' | 'skip';
+  errorClass: string;
+  errorCode: string;
+  leaseToken: string;
+  planId: string;
+  reasonCode?: string;
+}
+
+export interface FailedClaimedMediaCachePostPlan {
+  attemptCount: number;
+  availableAt: Date;
+  nextState: 'awaiting_local_source' | 'blocked' | 'retry_wait' | 'skipped';
+  planId: string;
+  releasedReservationBytes: bigint;
+}
+
+export interface SkipClaimedMediaCacheObjectInput {
+  cleanup: () => Promise<void>;
+  leaseToken: string;
+  objectId: string;
+  planId: string;
+  reasonCode: string;
+}
+
 export interface RecoverExpiredMediaCachePostPlanInput {
   leaseExpiresAt: Date;
   leaseOwner: string;
   leaseToken: string;
   planId: string;
   recover: (snapshot: ExpiredMediaCachePostPlanSnapshot) => Promise<void>;
+}
+
+export interface MarkMediaCacheRecoveryFailedInput {
+  leaseExpiresAt: Date;
+  leaseOwner: string;
+  leaseToken: string;
+  planId: string;
 }
 
 export interface ExpiredMediaCachePostPlanSnapshot {
@@ -92,7 +130,7 @@ export interface ExpiredMediaCachePostPlanSnapshot {
 
 export type RecoveredMediaCachePostPlan =
   | {
-      nextState: 'retry_wait';
+      nextState: 'awaiting_local_source' | 'blocked' | 'retry_wait';
       planId: string;
       releasedReservationBytes: bigint;
     }
@@ -114,6 +152,7 @@ export class MediaCacheLedgerError extends Error {
       | 'stale_lease'
       | 'sticky_hash_conflict',
     message: string,
+    readonly objectId?: string,
   ) {
     super(message);
     this.name = 'MediaCacheLedgerError';
@@ -122,6 +161,76 @@ export class MediaCacheLedgerError extends Error {
 
 export class PostgresMediaCacheLedgerRepository {
   constructor(private readonly database: Database) {}
+
+  async requiredHeadroomBytes(): Promise<bigint> {
+    return this.database.transaction(async (transaction) => {
+      await lockLedger(transaction);
+      const runtime = await lockRuntime(transaction);
+      const configuredExcess =
+        runtime.readyBytes > runtime.maxBytes ? runtime.readyBytes - runtime.maxBytes : 0n;
+      const [plan] = await transaction
+        .select({
+          id: mediaCachePostPlans.id,
+          readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes,
+        })
+        .from(mediaCachePostPlans)
+        .where(
+          and(
+            inArray(mediaCachePostPlans.state, ['discovered', 'retry_wait']),
+            sql`${mediaCachePostPlans.availableAt} <= clock_timestamp()`,
+            sql`${mediaCachePostPlans.attemptCount} < 10`,
+            eq(mediaCachePostPlans.reservedOriginalBytes, 0n),
+          ),
+        )
+        .orderBy(asc(mediaCachePostPlans.availableAt), asc(mediaCachePostPlans.id))
+        .limit(1);
+      if (!plan) {
+        return configuredExcess;
+      }
+      const objects = await transaction
+        .select({
+          actualBytes: mediaCacheObjects.actualBytes,
+          blobSha256: mediaCacheObjects.blobSha256,
+          kind: messageMedia.kind,
+          state: mediaCacheObjects.state,
+        })
+        .from(mediaCacheObjects)
+        .innerJoin(messageMedia, eq(mediaCacheObjects.canonicalMediaId, messageMedia.id))
+        .where(
+          and(eq(mediaCacheObjects.postPlanId, plan.id), eq(mediaCacheObjects.variant, 'original')),
+        )
+        .orderBy(asc(mediaCacheObjects.id));
+      const reservable = objects.flatMap((object) => {
+        if (isInactiveOriginalState(object.state)) {
+          return [];
+        }
+        const limit = ORIGINAL_LIMITS[object.kind as keyof typeof ORIGINAL_LIMITS];
+        if (!limit || (object.state !== 'discovered' && object.state !== 'retry_wait')) {
+          return [];
+        }
+        const reservation =
+          object.blobSha256 && object.actualBytes !== null ? object.actualBytes : limit;
+        return reservation > 0n && reservation <= limit ? [reservation] : [];
+      });
+      if (
+        reservable.length === 0 ||
+        reservable.length !==
+          objects.filter((object) => !isInactiveOriginalState(object.state)).length
+      ) {
+        return configuredExcess;
+      }
+      const remainingPostBytes = POST_MAX_BYTES - plan.readyOriginalBytes;
+      if (remainingPostBytes <= 0n) {
+        return configuredExcess;
+      }
+      const requested = reservable.reduce((total, bytes) => total + bytes, 0n);
+      const reservation = requested > remainingPostBytes ? remainingPostBytes : requested;
+      const admissionTotal = runtime.readyBytes + runtime.reservedBytes + reservation;
+      const admissionExcess =
+        admissionTotal > runtime.maxBytes ? admissionTotal - runtime.maxBytes : 0n;
+      return admissionExcess > configuredExcess ? admissionExcess : configuredExcess;
+    });
+  }
 
   async claimPostPlan(
     input: ClaimMediaCachePostPlanInput,
@@ -135,13 +244,20 @@ export class PostgresMediaCacheLedgerRepository {
       const runtime = await lockRuntime(transaction);
       const [plan] = await transaction
         .select({
+          attemptCount: mediaCachePostPlans.attemptCount,
           id: mediaCachePostPlans.id,
+          readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes,
         })
         .from(mediaCachePostPlans)
         .where(
           and(
             eq(mediaCachePostPlans.id, input.planId),
-            inArray(mediaCachePostPlans.state, ['discovered', 'retry_wait']),
+            inArray(
+              mediaCachePostPlans.state,
+              input.allowAwaitingLocalSource
+                ? ['awaiting_local_source', 'discovered', 'retry_wait']
+                : ['discovered', 'retry_wait'],
+            ),
             eq(mediaCachePostPlans.reservedOriginalBytes, 0n),
           ),
         )
@@ -152,6 +268,8 @@ export class PostgresMediaCacheLedgerRepository {
 
       const objects = await transaction
         .select({
+          actualBytes: mediaCacheObjects.actualBytes,
+          blobSha256: mediaCacheObjects.blobSha256,
           id: mediaCacheObjects.id,
           kind: messageMedia.kind,
           position: messageMedia.position,
@@ -166,27 +284,45 @@ export class PostgresMediaCacheLedgerRepository {
         .orderBy(asc(messageMedia.position), asc(mediaCacheObjects.id))
         .for('update', { of: mediaCacheObjects });
       const reservable = objects.flatMap((object) => {
-        if (object.state === 'skipped') {
+        if (isInactiveOriginalState(object.state)) {
           return [];
         }
         const limit = ORIGINAL_LIMITS[object.kind as keyof typeof ORIGINAL_LIMITS];
-        return limit ? [{ ...object, limit }] : [];
+        if (!limit) {
+          return [];
+        }
+        const reservation =
+          object.blobSha256 && object.actualBytes !== null ? object.actualBytes : limit;
+        return [{ ...object, limit, reservation }];
       });
       if (
         reservable.length === 0 ||
-        reservable.length !== objects.filter((object) => object.state !== 'skipped').length ||
+        reservable.length !==
+          objects.filter((object) => !isInactiveOriginalState(object.state)).length ||
+        objects.some(
+          (object) =>
+            !isInactiveOriginalState(object.state) &&
+            object.state !== 'discovered' &&
+            object.state !== 'retry_wait' &&
+            (!input.allowAwaitingLocalSource || object.state !== 'awaiting_local_source'),
+        ) ||
         reservable.some(
           (object) =>
-            (object.state !== 'discovered' && object.state !== 'retry_wait') ||
-            object.availableAt > now,
+            object.availableAt > now ||
+            object.reservation <= 0n ||
+            object.reservation > object.limit,
         )
       ) {
         return null;
       }
 
-      const requestedBytes = reservable.reduce((total, object) => total + object.limit, 0n);
+      const requestedBytes = reservable.reduce((total, object) => total + object.reservation, 0n);
+      const remainingPostBytes = POST_MAX_BYTES - plan.readyOriginalBytes;
+      if (remainingPostBytes <= 0n) {
+        return null;
+      }
       const cappedRequestedBytes =
-        requestedBytes > POST_MAX_BYTES ? POST_MAX_BYTES : requestedBytes;
+        requestedBytes > remainingPostBytes ? remainingPostBytes : requestedBytes;
       if (runtime.readyBytes + runtime.reservedBytes + cappedRequestedBytes > runtime.maxBytes) {
         return null;
       }
@@ -224,7 +360,7 @@ export class PostgresMediaCacheLedgerRepository {
             leaseExpiresAt: input.leaseExpiresAt,
             leaseOwner: input.leaseOwner.trim(),
             leaseToken: input.leaseToken,
-            reservedBytes: object.limit,
+            reservedBytes: object.reservation,
             state: 'downloading',
             updatedAt: now,
           })
@@ -271,21 +407,31 @@ export class PostgresMediaCacheLedgerRepository {
         })
         .from(mediaCacheObjects)
         .innerJoin(messageMedia, eq(mediaCacheObjects.canonicalMediaId, messageMedia.id))
+        .innerJoin(messageRevisions, eq(messageRevisions.id, mediaCacheObjects.revisionId))
+        .innerJoin(
+          messages,
+          and(
+            eq(messages.id, messageRevisions.messageId),
+            eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
+            isNull(messages.tombstonedAt),
+          ),
+        )
         .where(
           and(eq(mediaCacheObjects.postPlanId, plan.id), eq(mediaCacheObjects.variant, 'original')),
         )
         .orderBy(asc(mediaCacheObjects.id))
         .for('update', { of: mediaCacheObjects });
-      const claimedObjects = objects.filter((object) => object.state !== 'skipped');
+      const claimedObjects = objects.filter((object) => object.state === 'downloading');
       if (
         claimedObjects.length === 0 ||
         objects.some(
+          (object) => !isInactiveOriginalState(object.state) && object.state !== 'downloading',
+        ) ||
+        claimedObjects.some(
           (object) =>
-            object.state !== 'skipped' &&
-            (object.state !== 'downloading' ||
-              object.leaseToken !== input.leaseToken ||
-              !object.leaseExpiresAt ||
-              object.leaseExpiresAt <= now),
+            object.leaseToken !== input.leaseToken ||
+            !object.leaseExpiresAt ||
+            object.leaseExpiresAt <= now,
         )
       ) {
         throw new MediaCacheLedgerError(
@@ -310,6 +456,13 @@ export class PostgresMediaCacheLedgerRepository {
         if (!published) {
           throw new MediaCacheLedgerError('invalid_transition', 'Published object is missing');
         }
+        if (object.blobSha256 && object.blobSha256 !== published.sha256) {
+          throw new MediaCacheLedgerError(
+            'sticky_hash_conflict',
+            `Media cache object ${object.id} is already bound to another blob`,
+            object.id,
+          );
+        }
         const kindLimit = ORIGINAL_LIMITS[object.kind as keyof typeof ORIGINAL_LIMITS];
         if (
           !kindLimit ||
@@ -321,12 +474,16 @@ export class PostgresMediaCacheLedgerRepository {
             `Published object ${object.id} exceeds its reserved or kind byte limit`,
           );
         }
-        if (object.blobSha256 && object.blobSha256 !== published.sha256) {
-          throw new MediaCacheLedgerError(
-            'sticky_hash_conflict',
-            `Media cache object ${object.id} is already bound to another blob`,
-          );
-        }
+      }
+      const publishedLogicalBytes = publishedObjects.reduce(
+        (total, object) => total + object.byteLength,
+        0n,
+      );
+      if (plan.readyOriginalBytes + publishedLogicalBytes > POST_MAX_BYTES) {
+        throw new MediaCacheLedgerError(
+          'ledger_invariant',
+          'Publishing would exceed the per-post media cache limit',
+        );
       }
 
       const uniqueBlobs = collapsePublishedBlobs(publishedObjects);
@@ -430,6 +587,26 @@ export class PostgresMediaCacheLedgerRepository {
         }
       }
 
+      const pendingOriginalBytesByPlan = new Map<string, bigint>();
+      for (const object of claimedObjects) {
+        const published = inputByObjectId.get(object.id);
+        if (!published) {
+          throw new MediaCacheLedgerError('invalid_transition', 'Published object is missing');
+        }
+        pendingOriginalBytesByPlan.set(
+          plan.id,
+          (pendingOriginalBytesByPlan.get(plan.id) ?? 0n) + published.byteLength,
+        );
+      }
+      await restoreRelatedBlobObjects(
+        transaction,
+        uniqueBlobs
+          .filter((blob) => existingBlobs.get(blob.sha256)?.state !== 'ready')
+          .map((blob) => blob.sha256),
+        pendingOriginalBytesByPlan,
+        postPublishNow,
+      );
+
       for (const object of claimedObjects) {
         const published = inputByObjectId.get(object.id);
         if (!published) {
@@ -509,18 +686,19 @@ export class PostgresMediaCacheLedgerRepository {
         )
         .orderBy(asc(mediaCacheObjects.id))
         .for('update');
-      const settlingObjects = objects.filter((object) => object.state !== 'skipped');
+      const settlingObjects = objects.filter((object) => object.state === 'staging');
       if (
         settlingObjects.length === 0 ||
         objects.some(
+          (object) => !isInactiveOriginalState(object.state) && object.state !== 'staging',
+        ) ||
+        settlingObjects.some(
           (object) =>
-            object.state !== 'skipped' &&
-            (object.state !== 'staging' ||
-              object.leaseToken !== input.leaseToken ||
-              !object.leaseExpiresAt ||
-              object.leaseExpiresAt <= now ||
-              object.actualBytes === null ||
-              object.blobSha256 === null),
+            object.leaseToken !== input.leaseToken ||
+            !object.leaseExpiresAt ||
+            object.leaseExpiresAt <= now ||
+            object.actualBytes === null ||
+            object.blobSha256 === null,
         )
       ) {
         throw new MediaCacheLedgerError(
@@ -545,10 +723,9 @@ export class PostgresMediaCacheLedgerRepository {
         );
       }
 
-      const logicalReadyBytes = settlingObjects.reduce(
-        (total, object) => total + (object.actualBytes ?? 0n),
-        0n,
-      );
+      const logicalReadyBytes =
+        plan.readyOriginalBytes +
+        settlingObjects.reduce((total, object) => total + (object.actualBytes ?? 0n), 0n);
       if (logicalReadyBytes > POST_MAX_BYTES) {
         throw new MediaCacheLedgerError(
           'ledger_invariant',
@@ -613,6 +790,239 @@ export class PostgresMediaCacheLedgerRepository {
     });
   }
 
+  async failClaimedPostPlan(
+    input: FailClaimedMediaCachePostPlanInput,
+  ): Promise<FailedClaimedMediaCachePostPlan> {
+    assertPlanAndToken(input.planId, input.leaseToken);
+    assertFailureInput(input);
+
+    return this.database.transaction(async (transaction) => {
+      await lockLedger(transaction);
+      const now = await readDatabaseClock(transaction);
+      const runtime = await lockRuntime(transaction);
+      const plan = await lockFencedPlan(
+        transaction,
+        input.planId,
+        input.leaseToken,
+        now,
+        'staging',
+      );
+      const objects = await transaction
+        .select({
+          id: mediaCacheObjects.id,
+          leaseExpiresAt: mediaCacheObjects.leaseExpiresAt,
+          leaseToken: mediaCacheObjects.leaseToken,
+          state: mediaCacheObjects.state,
+        })
+        .from(mediaCacheObjects)
+        .where(
+          and(eq(mediaCacheObjects.postPlanId, plan.id), eq(mediaCacheObjects.variant, 'original')),
+        )
+        .orderBy(asc(mediaCacheObjects.id))
+        .for('update');
+      const activeObjects = objects.filter((object) => object.state === 'downloading');
+      if (
+        activeObjects.length === 0 ||
+        objects.some(
+          (object) => !isInactiveOriginalState(object.state) && object.state !== 'downloading',
+        ) ||
+        activeObjects.some(
+          (object) =>
+            object.leaseToken !== input.leaseToken ||
+            !object.leaseExpiresAt ||
+            object.leaseExpiresAt <= now,
+        )
+      ) {
+        throw new MediaCacheLedgerError(
+          'invalid_transition',
+          'Failed plan does not have a complete fenced original object set',
+        );
+      }
+      if (
+        input.disposition === 'integrity_conflict' &&
+        !activeObjects.some((object) => object.id === input.conflictingObjectId)
+      ) {
+        throw new MediaCacheLedgerError(
+          'invalid_transition',
+          'Integrity conflict must identify an object held by the live plan lease',
+        );
+      }
+
+      await input.cleanup();
+      const postCleanupNow = await readDatabaseClock(transaction);
+      assertFencedRowsRemainLive(plan, activeObjects, input.leaseToken, postCleanupNow);
+      if (runtime.reservedBytes < plan.reservedOriginalBytes) {
+        throw new MediaCacheLedgerError(
+          'ledger_invariant',
+          'Global media cache reservation is smaller than the failed plan reservation',
+        );
+      }
+
+      const attemptCount =
+        input.disposition === 'await_local_source'
+          ? plan.attemptCount
+          : Math.min(plan.attemptCount + 1, 10);
+      const nextState =
+        input.disposition === 'await_local_source'
+          ? 'awaiting_local_source'
+          : input.disposition === 'integrity_conflict'
+            ? 'blocked'
+            : input.disposition === 'skip'
+              ? 'skipped'
+              : attemptCount >= 10
+                ? 'blocked'
+                : 'retry_wait';
+      const availableAt =
+        nextState === 'retry_wait'
+          ? new Date(postCleanupNow.getTime() + retryDelayMs(attemptCount))
+          : postCleanupNow;
+      const reasonCode =
+        input.disposition === 'integrity_conflict'
+          ? 'integrity_conflict'
+          : nextState === 'skipped'
+            ? (input.reasonCode ?? input.errorCode)
+            : null;
+
+      if (activeObjects.length > 0) {
+        await transaction
+          .update(mediaCacheObjects)
+          .set({
+            attemptCount,
+            availableAt,
+            lastErrorClass: input.errorClass,
+            lastErrorCode: input.errorCode,
+            leaseExpiresAt: null,
+            leaseOwner: null,
+            leaseToken: null,
+            reasonCode: input.disposition === 'integrity_conflict' ? null : reasonCode,
+            reservedBytes: 0n,
+            state: nextState,
+            updatedAt: postCleanupNow,
+          })
+          .where(
+            inArray(
+              mediaCacheObjects.id,
+              activeObjects.map((object) => object.id),
+            ),
+          );
+        if (input.disposition === 'integrity_conflict') {
+          await transaction
+            .update(mediaCacheObjects)
+            .set({
+              reasonCode: 'integrity_conflict',
+              state: 'integrity_conflict',
+              updatedAt: postCleanupNow,
+            })
+            .where(eq(mediaCacheObjects.id, input.conflictingObjectId as string));
+        }
+      }
+      await transaction
+        .update(mediaCachePostPlans)
+        .set({
+          attemptCount,
+          availableAt,
+          lastErrorClass: input.errorClass,
+          lastErrorCode: input.errorCode,
+          leaseExpiresAt: null,
+          leaseOwner: null,
+          leaseToken: null,
+          reasonCode,
+          reservedOriginalBytes: 0n,
+          state: nextState,
+          updatedAt: postCleanupNow,
+        })
+        .where(eq(mediaCachePostPlans.id, plan.id));
+      await transaction
+        .update(mediaCacheRuntime)
+        .set({
+          reservedBytes: runtime.reservedBytes - plan.reservedOriginalBytes,
+          updatedAt: postCleanupNow,
+        })
+        .where(eq(mediaCacheRuntime.singletonKey, 'local'));
+
+      return {
+        attemptCount,
+        availableAt,
+        nextState,
+        planId: plan.id,
+        releasedReservationBytes: plan.reservedOriginalBytes,
+      };
+    });
+  }
+
+  async skipClaimedObject(input: SkipClaimedMediaCacheObjectInput): Promise<boolean> {
+    assertPlanAndToken(input.planId, input.leaseToken);
+    if (!UUID.test(input.objectId) || !/^[a-z][a-z0-9_]{0,63}$/u.test(input.reasonCode)) {
+      throw new MediaCacheLedgerError('invalid_input', 'Skipped object input is invalid');
+    }
+    if (typeof input.cleanup !== 'function') {
+      throw new MediaCacheLedgerError('invalid_input', 'A staging cleanup callback is required');
+    }
+
+    return this.database.transaction(async (transaction) => {
+      await lockLedger(transaction);
+      const now = await readDatabaseClock(transaction);
+      await lockRuntime(transaction);
+      const plan = await lockFencedPlan(
+        transaction,
+        input.planId,
+        input.leaseToken,
+        now,
+        'staging',
+      );
+      const [object] = await transaction
+        .select({
+          id: mediaCacheObjects.id,
+          leaseExpiresAt: mediaCacheObjects.leaseExpiresAt,
+          leaseToken: mediaCacheObjects.leaseToken,
+          state: mediaCacheObjects.state,
+        })
+        .from(mediaCacheObjects)
+        .where(
+          and(
+            eq(mediaCacheObjects.id, input.objectId),
+            eq(mediaCacheObjects.postPlanId, plan.id),
+            eq(mediaCacheObjects.variant, 'original'),
+          ),
+        )
+        .for('update');
+      if (
+        object?.state !== 'downloading' ||
+        object.leaseToken !== input.leaseToken ||
+        !object.leaseExpiresAt ||
+        object.leaseExpiresAt <= now
+      ) {
+        throw new MediaCacheLedgerError(
+          'stale_lease',
+          'Media cache object is not held by the supplied live plan lease',
+        );
+      }
+
+      await input.cleanup();
+      const postCleanupNow = await readDatabaseClock(transaction);
+      assertFencedRowsRemainLive(plan, [object], input.leaseToken, postCleanupNow);
+      const updated = await transaction
+        .update(mediaCacheObjects)
+        .set({
+          leaseExpiresAt: null,
+          leaseOwner: null,
+          leaseToken: null,
+          reasonCode: input.reasonCode,
+          reservedBytes: 0n,
+          state: 'skipped',
+          updatedAt: postCleanupNow,
+        })
+        .where(
+          and(
+            eq(mediaCacheObjects.id, object.id),
+            eq(mediaCacheObjects.leaseToken, input.leaseToken),
+          ),
+        )
+        .returning({ id: mediaCacheObjects.id });
+      return updated.length === 1;
+    });
+  }
+
   /**
    * Recovers one expired plan while the old lease provenance and the global
    * ledger lock remain held. The callback must settle or remove the old token's
@@ -634,8 +1044,10 @@ export class PostgresMediaCacheLedgerRepository {
       const runtime = await lockRuntime(transaction);
       const [plan] = await transaction
         .select({
+          attemptCount: mediaCachePostPlans.attemptCount,
           id: mediaCachePostPlans.id,
           leaseExpiresAt: mediaCachePostPlans.leaseExpiresAt,
+          leaseOwner: mediaCachePostPlans.leaseOwner,
           leaseToken: mediaCachePostPlans.leaseToken,
           reservedOriginalBytes: mediaCachePostPlans.reservedOriginalBytes,
           state: mediaCachePostPlans.state,
@@ -645,7 +1057,7 @@ export class PostgresMediaCacheLedgerRepository {
         .for('update');
       if (
         !plan ||
-        (plan.state !== 'staging' && plan.state !== 'settling') ||
+        (plan.state !== 'staging' && plan.state !== 'settling' && plan.state !== 'recovering') ||
         !plan.leaseToken ||
         !plan.leaseExpiresAt ||
         plan.leaseExpiresAt > now
@@ -671,18 +1083,32 @@ export class PostgresMediaCacheLedgerRepository {
         )
         .orderBy(asc(mediaCacheObjects.id))
         .for('update');
-      const expectedObjectState = plan.state === 'staging' ? 'downloading' : 'staging';
-      const recoveringObjects = objects.filter((object) => object.state !== 'skipped');
+      const expectedObjectState =
+        plan.state === 'staging'
+          ? 'downloading'
+          : plan.state === 'settling'
+            ? 'staging'
+            : objects.find((object) => object.state === 'downloading' || object.state === 'staging')
+                ?.state;
+      if (expectedObjectState !== 'downloading' && expectedObjectState !== 'staging') {
+        throw new MediaCacheLedgerError(
+          'ledger_invariant',
+          'Recovering plan has no consistent original object phase',
+        );
+      }
+      const recoveringObjects = objects.filter((object) => object.state === expectedObjectState);
       if (
         recoveringObjects.length === 0 ||
         objects.some(
           (object) =>
-            object.state !== 'skipped' &&
-            (object.state !== expectedObjectState ||
-              object.leaseToken !== plan.leaseToken ||
-              object.reservedBytes <= 0n ||
-              (plan.state === 'settling' &&
-                (object.actualBytes === null || object.blobSha256 === null))),
+            !isInactiveOriginalState(object.state) && object.state !== expectedObjectState,
+        ) ||
+        recoveringObjects.some(
+          (object) =>
+            object.leaseToken !== plan.leaseToken ||
+            object.reservedBytes <= 0n ||
+            (expectedObjectState === 'staging' &&
+              (object.actualBytes === null || object.blobSha256 === null)),
         )
       ) {
         throw new MediaCacheLedgerError(
@@ -697,28 +1123,41 @@ export class PostgresMediaCacheLedgerRepository {
           blobSha256: object.blobSha256,
           objectId: object.id,
         })),
-        phase: plan.state === 'staging' ? 'precommit' : 'postcommit',
+        phase: expectedObjectState === 'downloading' ? 'precommit' : 'postcommit',
         planId: plan.id,
         previousLeaseToken: plan.leaseToken,
       });
 
       const postRecoveryNow = await readDatabaseClock(transaction);
       assertLiveLeaseExpiry(input.leaseExpiresAt, postRecoveryNow);
-      if (plan.state === 'staging') {
+      if (expectedObjectState === 'downloading') {
         if (runtime.reservedBytes < plan.reservedOriginalBytes) {
           throw new MediaCacheLedgerError(
             'ledger_invariant',
             'Global media cache reservation is smaller than the recovered plan reservation',
           );
         }
+        const localSource = plan.leaseOwner?.startsWith('desktop-cli:') === true;
+        const attemptCount = localSource ? plan.attemptCount : Math.min(plan.attemptCount + 1, 10);
+        const nextState = localSource
+          ? 'awaiting_local_source'
+          : attemptCount >= 10
+            ? 'blocked'
+            : 'retry_wait';
+        const availableAt =
+          nextState === 'retry_wait'
+            ? new Date(postRecoveryNow.getTime() + retryDelayMs(attemptCount))
+            : postRecoveryNow;
         await transaction
           .update(mediaCacheObjects)
           .set({
+            attemptCount,
+            availableAt,
             leaseExpiresAt: null,
             leaseOwner: null,
             leaseToken: null,
             reservedBytes: 0n,
-            state: 'retry_wait',
+            state: nextState,
             updatedAt: postRecoveryNow,
           })
           .where(
@@ -730,12 +1169,13 @@ export class PostgresMediaCacheLedgerRepository {
         await transaction
           .update(mediaCachePostPlans)
           .set({
-            availableAt: postRecoveryNow,
+            attemptCount,
+            availableAt,
             leaseExpiresAt: null,
             leaseOwner: null,
             leaseToken: null,
             reservedOriginalBytes: 0n,
-            state: 'retry_wait',
+            state: nextState,
             updatedAt: postRecoveryNow,
           })
           .where(eq(mediaCachePostPlans.id, plan.id));
@@ -747,7 +1187,7 @@ export class PostgresMediaCacheLedgerRepository {
           })
           .where(eq(mediaCacheRuntime.singletonKey, 'local'));
         return {
-          nextState: 'retry_wait',
+          nextState,
           planId: plan.id,
           releasedReservationBytes: plan.reservedOriginalBytes,
         };
@@ -784,6 +1224,94 @@ export class PostgresMediaCacheLedgerRepository {
       };
     });
   }
+
+  async markExpiredRecoveryFailed(input: MarkMediaCacheRecoveryFailedInput): Promise<boolean> {
+    assertLeaseInput(input);
+    return this.database.transaction(async (transaction) => {
+      await lockLedger(transaction);
+      const now = await readDatabaseClock(transaction);
+      assertLiveLeaseExpiry(input.leaseExpiresAt, now);
+      const [plan] = await transaction
+        .select({
+          attemptCount: mediaCachePostPlans.attemptCount,
+          id: mediaCachePostPlans.id,
+          leaseExpiresAt: mediaCachePostPlans.leaseExpiresAt,
+          state: mediaCachePostPlans.state,
+        })
+        .from(mediaCachePostPlans)
+        .where(eq(mediaCachePostPlans.id, input.planId))
+        .for('update');
+      if (
+        !plan ||
+        !inRecoveryState(plan.state) ||
+        !plan.leaseExpiresAt ||
+        plan.leaseExpiresAt > now
+      ) {
+        return false;
+      }
+      const attemptCount = Math.min(plan.attemptCount + 1, 10);
+      const availableAt = new Date(now.getTime() + retryDelayMs(attemptCount));
+      const activeObjects = await transaction
+        .select({ id: mediaCacheObjects.id, state: mediaCacheObjects.state })
+        .from(mediaCacheObjects)
+        .where(
+          and(
+            eq(mediaCacheObjects.postPlanId, plan.id),
+            eq(mediaCacheObjects.variant, 'original'),
+            inArray(mediaCacheObjects.state, ['downloading', 'staging']),
+          ),
+        )
+        .for('update');
+      if (activeObjects.length === 0) {
+        throw new MediaCacheLedgerError(
+          'ledger_invariant',
+          'Failed recovery plan has no active provenance',
+        );
+      }
+      await transaction
+        .update(mediaCacheObjects)
+        .set({
+          lastErrorClass: 'recovery',
+          lastErrorCode: 'temp_cleanup_failed',
+          attemptCount,
+          availableAt,
+          updatedAt: now,
+        })
+        .where(
+          inArray(
+            mediaCacheObjects.id,
+            activeObjects.map(({ id }) => id),
+          ),
+        );
+      await transaction
+        .update(mediaCachePostPlans)
+        .set({
+          lastErrorClass: 'recovery',
+          lastErrorCode: 'temp_cleanup_failed',
+          attemptCount,
+          availableAt,
+          state: 'recovering',
+          updatedAt: now,
+        })
+        .where(eq(mediaCachePostPlans.id, plan.id));
+      return true;
+    });
+  }
+}
+
+function inRecoveryState(state: string): boolean {
+  return state === 'staging' || state === 'settling' || state === 'recovering';
+}
+
+function isInactiveOriginalState(state: string): boolean {
+  return (
+    state === 'blocked' ||
+    state === 'evicted' ||
+    state === 'integrity_conflict' ||
+    state === 'missing' ||
+    state === 'ready' ||
+    state === 'skipped'
+  );
 }
 
 async function lockLedger(transaction: MediaCacheTransaction): Promise<void> {
@@ -831,8 +1359,10 @@ async function lockFencedPlan(
   const [plan] = await transaction
     .select({
       id: mediaCachePostPlans.id,
+      attemptCount: mediaCachePostPlans.attemptCount,
       leaseExpiresAt: mediaCachePostPlans.leaseExpiresAt,
       leaseToken: mediaCachePostPlans.leaseToken,
+      readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes,
       reservedOriginalBytes: mediaCachePostPlans.reservedOriginalBytes,
       state: mediaCachePostPlans.state,
     })
@@ -852,6 +1382,209 @@ async function lockFencedPlan(
     );
   }
   return plan;
+}
+
+function assertFailureInput(input: FailClaimedMediaCachePostPlanInput): void {
+  if (typeof input.cleanup !== 'function') {
+    throw new MediaCacheLedgerError('invalid_input', 'A staging cleanup callback is required');
+  }
+  if (
+    input.disposition === 'integrity_conflict' &&
+    (!input.conflictingObjectId || !UUID.test(input.conflictingObjectId))
+  ) {
+    throw new MediaCacheLedgerError(
+      'invalid_input',
+      'An integrity conflict must identify the conflicting object',
+    );
+  }
+  for (const [label, value] of [
+    ['errorClass', input.errorClass],
+    ['errorCode', input.errorCode],
+    ...(input.reasonCode === undefined ? [] : [['reasonCode', input.reasonCode]]),
+  ] as const) {
+    if (!/^[a-z][a-z0-9_]{0,63}$/u.test(value)) {
+      throw new MediaCacheLedgerError('invalid_input', `${label} must be a stable bounded code`);
+    }
+  }
+}
+
+function retryDelayMs(attemptCount: number): number {
+  return Math.min(1_000 * 2 ** Math.max(0, attemptCount - 1), 5 * 60_000);
+}
+
+async function restoreRelatedBlobObjects(
+  transaction: MediaCacheTransaction,
+  blobHashes: readonly string[],
+  pendingOriginalBytesByPlan: ReadonlyMap<string, bigint>,
+  now: Date,
+): Promise<void> {
+  if (blobHashes.length === 0) {
+    return;
+  }
+  const candidates = await transaction
+    .select({
+      actualBytes: mediaCacheObjects.actualBytes,
+      id: mediaCacheObjects.id,
+      planId: mediaCacheObjects.postPlanId,
+      state: mediaCacheObjects.state,
+      variant: mediaCacheObjects.variant,
+    })
+    .from(mediaCacheObjects)
+    .innerJoin(messageRevisions, eq(messageRevisions.id, mediaCacheObjects.revisionId))
+    .innerJoin(
+      messages,
+      and(
+        eq(messages.id, messageRevisions.messageId),
+        eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
+        isNull(messages.tombstonedAt),
+      ),
+    )
+    .where(
+      and(
+        inArray(mediaCacheObjects.blobSha256, [...blobHashes]),
+        inArray(mediaCacheObjects.state, ['blocked', 'evicted', 'missing', 'retry_wait']),
+      ),
+    )
+    .orderBy(asc(mediaCacheObjects.postPlanId), asc(mediaCacheObjects.id))
+    .for('update', { of: mediaCacheObjects });
+  if (candidates.length === 0) {
+    return;
+  }
+
+  const originalBytesByPlan = new Map<string, bigint>();
+  for (const candidate of candidates) {
+    if (candidate.actualBytes === null || candidate.actualBytes <= 0n) {
+      throw new MediaCacheLedgerError(
+        'ledger_invariant',
+        `Restorable media cache object ${candidate.id} has no positive byte length`,
+      );
+    }
+    if (candidate.variant === 'original') {
+      originalBytesByPlan.set(
+        candidate.planId,
+        (originalBytesByPlan.get(candidate.planId) ?? 0n) + candidate.actualBytes,
+      );
+    }
+  }
+
+  const planIds = [...originalBytesByPlan.keys()].sort();
+  const plans =
+    planIds.length === 0
+      ? []
+      : await transaction
+          .select({
+            id: mediaCachePostPlans.id,
+            readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes,
+          })
+          .from(mediaCachePostPlans)
+          .where(inArray(mediaCachePostPlans.id, planIds))
+          .orderBy(asc(mediaCachePostPlans.id))
+          .for('update');
+  if (plans.length !== planIds.length) {
+    throw new MediaCacheLedgerError(
+      'ledger_invariant',
+      'A restorable media cache object references a missing post plan',
+    );
+  }
+
+  const restorablePlanIds = new Set<string>();
+  for (const plan of plans) {
+    const restoring = originalBytesByPlan.get(plan.id) ?? 0n;
+    const pending = pendingOriginalBytesByPlan.get(plan.id) ?? 0n;
+    if (plan.readyOriginalBytes + restoring + pending <= POST_MAX_BYTES) {
+      restorablePlanIds.add(plan.id);
+    }
+  }
+  const restorable = candidates.filter(
+    (candidate) => candidate.variant === 'thumbnail' || restorablePlanIds.has(candidate.planId),
+  );
+  if (restorable.length === 0) {
+    return;
+  }
+
+  await transaction
+    .update(mediaCacheObjects)
+    .set({ state: 'ready', updatedAt: now })
+    .where(
+      inArray(
+        mediaCacheObjects.id,
+        restorable.map(({ id }) => id),
+      ),
+    );
+  for (const plan of plans) {
+    if (!restorablePlanIds.has(plan.id)) {
+      continue;
+    }
+    const restoring = originalBytesByPlan.get(plan.id) ?? 0n;
+    await transaction
+      .update(mediaCachePostPlans)
+      .set({
+        readyOriginalBytes: plan.readyOriginalBytes + restoring,
+        updatedAt: now,
+      })
+      .where(eq(mediaCachePostPlans.id, plan.id));
+  }
+  for (const plan of plans) {
+    if (!restorablePlanIds.has(plan.id)) {
+      continue;
+    }
+    const originals = await transaction
+      .select({
+        actualBytes: mediaCacheObjects.actualBytes,
+        state: mediaCacheObjects.state,
+      })
+      .from(mediaCacheObjects)
+      .where(
+        and(eq(mediaCacheObjects.postPlanId, plan.id), eq(mediaCacheObjects.variant, 'original')),
+      )
+      .orderBy(asc(mediaCacheObjects.id))
+      .for('update');
+    const allReadyOrSkipped =
+      originals.length > 0 &&
+      originals.every((object) => object.state === 'ready' || object.state === 'skipped');
+    if (!allReadyOrSkipped) {
+      continue;
+    }
+    const readyOriginalBytes = originals.reduce(
+      (total, object) =>
+        object.state === 'ready' && object.actualBytes !== null
+          ? total + object.actualBytes
+          : total,
+      0n,
+    );
+    if (readyOriginalBytes > POST_MAX_BYTES) {
+      throw new MediaCacheLedgerError(
+        'ledger_invariant',
+        `Restored media cache plan ${plan.id} exceeds its logical byte limit`,
+      );
+    }
+    await transaction
+      .update(mediaCachePostPlans)
+      .set({
+        attemptCount: 0,
+        availableAt: now,
+        lastErrorClass: null,
+        lastErrorCode: null,
+        leaseExpiresAt: null,
+        leaseOwner: null,
+        leaseToken: null,
+        readyOriginalBytes,
+        reasonCode: null,
+        reservedOriginalBytes: 0n,
+        state: 'ready',
+        updatedAt: now,
+      })
+      .where(eq(mediaCachePostPlans.id, plan.id));
+  }
+  await transaction.insert(mediaCacheActions).values(
+    restorable.map((candidate) => ({
+      actionKind: 'restore_missing' as const,
+      afterState: { state: 'ready', variant: candidate.variant },
+      beforeState: { state: candidate.state, variant: candidate.variant },
+      initiatorKind: 'worker' as const,
+      objectId: candidate.id,
+    })),
+  );
 }
 
 function collapsePublishedBlobs(

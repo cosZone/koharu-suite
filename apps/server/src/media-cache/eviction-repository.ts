@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, notExists, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, lte, notExists, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   mediaCacheActions,
@@ -8,6 +8,7 @@ import {
   mediaCacheRuntime,
 } from '../db/schema.js';
 import type { MediaCacheAccessWriter, MediaCacheBlobAccess } from './access-coalescer.js';
+import type { MediaBlobEvictionResult, MediaBlobIdentity } from './blob-store.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
 
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -32,14 +33,14 @@ export type MediaCacheEvictionSelection =
   | { kind: 'least_recently_used' }
   | { kind: 'specific_blob'; sha256: string };
 
-export interface ClaimMediaCacheEvictionInput {
+interface ClaimMediaCacheEvictionInput {
   evictionExpiresAt: Date;
   evictionOwner: string;
   evictionToken: string;
   selection: MediaCacheEvictionSelection;
 }
 
-export interface ClaimedMediaCacheEviction {
+interface ClaimedMediaCacheEviction {
   byteLength: bigint;
   detectedMime: string;
   evictionExpiresAt: Date;
@@ -49,20 +50,20 @@ export interface ClaimedMediaCacheEviction {
   sha256: string;
 }
 
-export interface CompleteMediaCacheEvictionInput {
+interface CompleteMediaCacheEvictionInput {
   evictionToken: string;
   initiator: MediaCacheEvictionInitiator;
   sha256: string;
 }
 
-export interface CompletedMediaCacheEviction {
+interface CompletedMediaCacheEviction {
   evictedObjectIds: string[];
   physicalBytesRemoved: bigint;
   planLogicalBytesRemoved: ReadonlyArray<{ bytes: bigint; planId: string }>;
   readyBytes: bigint;
 }
 
-export interface RestoreMediaCacheEvictionInput {
+interface RestoreMediaCacheEvictionInput {
   evictionToken: string;
   sha256: string;
 }
@@ -77,7 +78,7 @@ export class MediaCacheEvictionError extends Error {
   }
 }
 
-export class PostgresMediaCacheEvictionRepository implements MediaCacheAccessWriter {
+class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
   constructor(private readonly database: Database) {}
 
   async writeAccesses(accesses: readonly MediaCacheBlobAccess[]): Promise<void> {
@@ -134,6 +135,10 @@ export class PostgresMediaCacheEvictionRepository implements MediaCacheAccessWri
         input.selection.kind === 'specific_blob'
           ? eq(mediaCacheBlobs.sha256, input.selection.sha256)
           : undefined;
+      const claimableState = or(
+        eq(mediaCacheBlobs.state, 'ready'),
+        and(eq(mediaCacheBlobs.state, 'deleting'), lte(mediaCacheBlobs.evictionExpiresAt, now)),
+      );
       const [blob] = await transaction
         .select({
           byteLength: mediaCacheBlobs.byteLength,
@@ -143,14 +148,12 @@ export class PostgresMediaCacheEvictionRepository implements MediaCacheAccessWri
           sha256: mediaCacheBlobs.sha256,
         })
         .from(mediaCacheBlobs)
-        .where(
-          and(
-            eq(mediaCacheBlobs.state, 'ready'),
-            selectionCondition,
-            notExists(pinnedBySettlement),
-          ),
+        .where(and(claimableState, selectionCondition, notExists(pinnedBySettlement)))
+        .orderBy(
+          sql`case when ${mediaCacheBlobs.state} = 'deleting' then 0 else 1 end`,
+          asc(mediaCacheBlobs.lastAccessedAt),
+          asc(mediaCacheBlobs.sha256),
         )
-        .orderBy(asc(mediaCacheBlobs.lastAccessedAt), asc(mediaCacheBlobs.sha256))
         .limit(1)
         .for('update');
       if (!blob) {
@@ -166,7 +169,7 @@ export class PostgresMediaCacheEvictionRepository implements MediaCacheAccessWri
           state: 'deleting',
           updatedAt: now,
         })
-        .where(and(eq(mediaCacheBlobs.sha256, blob.sha256), eq(mediaCacheBlobs.state, 'ready')))
+        .where(and(eq(mediaCacheBlobs.sha256, blob.sha256), claimableState))
         .returning({ sha256: mediaCacheBlobs.sha256 });
       if (!claimed) {
         throw new MediaCacheEvictionError(
@@ -377,6 +380,97 @@ export class PostgresMediaCacheEvictionRepository implements MediaCacheAccessWri
         .where(eq(mediaCacheBlobs.sha256, input.sha256));
     });
   }
+}
+
+export interface MediaCacheBlobEvictor {
+  evict(blob: MediaBlobIdentity): Promise<MediaBlobEvictionResult>;
+}
+
+export interface EvictMediaCacheInput extends ClaimMediaCacheEvictionInput {
+  initiator: MediaCacheEvictionInitiator;
+}
+
+export interface EvictedMediaCacheResult extends CompletedMediaCacheEviction {
+  fileOutcome: MediaBlobEvictionResult;
+}
+
+export function createPostgresMediaCacheAccessWriter(database: Database): MediaCacheAccessWriter {
+  return new PostgresMediaCacheEvictionProtocol(database);
+}
+
+/**
+ * The only exported mutation path for cache eviction. Callers provide one
+ * intent; the claim, durable unlink, rollback, and final accounting protocol
+ * stay inside this module.
+ */
+export class MediaCacheEvictionService {
+  readonly #protocol: PostgresMediaCacheEvictionProtocol;
+
+  constructor(
+    database: Database,
+    private readonly blobStore: MediaCacheBlobEvictor,
+  ) {
+    this.#protocol = new PostgresMediaCacheEvictionProtocol(database);
+  }
+
+  async evict(input: EvictMediaCacheInput): Promise<EvictedMediaCacheResult | null> {
+    const claim = await this.#protocol.claimEviction(input);
+    if (!claim) {
+      return null;
+    }
+
+    let fileOutcome: MediaBlobEvictionResult;
+    try {
+      fileOutcome = await this.blobStore.evict(blobIdentity(claim));
+    } catch (unlinkError) {
+      try {
+        await this.#protocol.restoreEviction(evictionIdentity(claim));
+      } catch (restoreError) {
+        throw new AggregateError(
+          [unlinkError, restoreError],
+          'Media cache unlink failed and its eviction lease could not be restored',
+        );
+      }
+      throw unlinkError;
+    }
+
+    const completed = await this.#protocol.completeEviction(
+      completionInput(claim, input.initiator),
+    );
+    return {
+      ...completed,
+      fileOutcome,
+    };
+  }
+}
+
+function blobIdentity(claim: ClaimedMediaCacheEviction): MediaBlobIdentity {
+  const byteLength = Number(claim.byteLength);
+  if (!Number.isSafeInteger(byteLength) || byteLength <= 0) {
+    throw new TypeError('Claimed media cache blob byte length is not safely representable');
+  }
+  return {
+    byteLength,
+    relativeKey: claim.relativeKey,
+    sha256: claim.sha256,
+  };
+}
+
+function evictionIdentity(claim: ClaimedMediaCacheEviction): RestoreMediaCacheEvictionInput {
+  return {
+    evictionToken: claim.evictionToken,
+    sha256: claim.sha256,
+  };
+}
+
+function completionInput(
+  claim: ClaimedMediaCacheEviction,
+  initiator: MediaCacheEvictionInitiator,
+): CompleteMediaCacheEvictionInput {
+  return {
+    ...evictionIdentity(claim),
+    initiator,
+  };
 }
 
 async function lockLedger(transaction: MediaCacheTransaction): Promise<void> {

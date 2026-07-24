@@ -7,6 +7,7 @@ import { runMigrations } from '../../src/db/migrate.js';
 import {
   mediaCacheActions,
   mediaCacheBlobs,
+  mediaCacheCommands,
   mediaCacheObjectSources,
   mediaCacheObjects,
   mediaCachePostPlans,
@@ -176,6 +177,7 @@ describe('G2.3 media cache schema', () => {
       [
         mediaCacheActions,
         mediaCacheBlobs,
+        mediaCacheCommands,
         mediaCacheObjects,
         mediaCacheObjectSources,
         mediaCachePostPlans,

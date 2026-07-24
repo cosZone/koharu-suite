@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { asc, eq, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
@@ -16,9 +19,12 @@ import {
   messages,
   telegramChannels,
 } from '../../src/db/schema.js';
+import { LocalMediaBlobStore, type PublishedMediaBlob } from '../../src/media-cache/blob-store.js';
 import {
+  createPostgresMediaCacheAccessWriter,
+  type MediaCacheBlobEvictor,
   type MediaCacheEvictionError,
-  PostgresMediaCacheEvictionRepository,
+  MediaCacheEvictionService,
 } from '../../src/media-cache/eviction-repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
@@ -34,6 +40,89 @@ interface ReadyPlanFixture {
 }
 
 let fixtureSequence = 0;
+const temporaryRoots: string[] = [];
+
+async function publishLocalBlob(content: string): Promise<{
+  published: PublishedMediaBlob;
+  root: string;
+  store: LocalMediaBlobStore;
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'koharu-media-eviction-'));
+  temporaryRoots.push(root);
+  const store = new LocalMediaBlobStore(root);
+  await store.initialize();
+  const staged = await store.stage({
+    lease: {
+      leaseToken: randomUUID(),
+      planId: randomUUID(),
+    },
+    maxBytes: Buffer.byteLength(content),
+    objectId: randomUUID(),
+    source: new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Buffer.from(content));
+        controller.close();
+      },
+    }),
+  });
+  const published = await store.publish(staged);
+  await store.settle(staged, 'db_committed');
+  return { published, root, store };
+}
+
+async function createBackedReadyBlob(
+  connection: DatabaseConnection,
+  content: string,
+): Promise<{
+  published: PublishedMediaBlob;
+  root: string;
+  service: MediaCacheEvictionService;
+  store: LocalMediaBlobStore;
+}> {
+  const local = await publishLocalBlob(content);
+  await insertBlob(
+    connection,
+    local.published.sha256,
+    BigInt(local.published.byteLength),
+    new Date('2026-07-24T01:00:00.000Z'),
+  );
+  await createReadyPlan(connection, {
+    blobSha256: local.published.sha256,
+    byteLength: BigInt(local.published.byteLength),
+  });
+  await connection.db
+    .insert(mediaCacheRuntime)
+    .values({ readyBytes: BigInt(local.published.byteLength) });
+  return {
+    ...local,
+    service: new MediaCacheEvictionService(connection.db, local.store),
+  };
+}
+
+async function markDeleting(
+  connection: DatabaseConnection,
+  sha256: string,
+  evictionToken: string,
+  evictionExpiresAt = new Date('2000-01-01T00:00:00.000Z'),
+): Promise<void> {
+  await connection.db
+    .update(mediaCacheBlobs)
+    .set({
+      evictionExpiresAt,
+      evictionOwner: 'crashed-worker',
+      evictionToken,
+      state: 'deleting',
+    })
+    .where(eq(mediaCacheBlobs.sha256, sha256));
+}
+
+function createDatabaseService(connection: DatabaseConnection): MediaCacheEvictionService {
+  return new MediaCacheEvictionService(connection.db, {
+    async evict() {
+      return 'removed';
+    },
+  });
+}
 
 async function createReadyPlan(
   connection: DatabaseConnection,
@@ -215,6 +304,12 @@ describe('PostgreSQL media cache eviction repository', () => {
     await container?.stop();
   }, 30_000);
 
+  afterEach(async () => {
+    await Promise.all(
+      temporaryRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })),
+    );
+  });
+
   beforeEach(async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
@@ -239,13 +334,13 @@ describe('PostgreSQL media cache eviction repository', () => {
     const initial = new Date('2026-07-24T01:00:00.000Z');
     const newest = new Date('2026-07-24T03:00:00.000Z');
     await insertBlob(connection, SHA_A, 100n, initial);
-    const repository = new PostgresMediaCacheEvictionRepository(connection.db);
+    const writer = createPostgresMediaCacheAccessWriter(connection.db);
 
-    await repository.writeAccesses([
+    await writer.writeAccesses([
       { observedAt: newest, sha256: SHA_A },
       { observedAt: new Date('2026-07-24T02:00:00.000Z'), sha256: SHA_A },
     ]);
-    await repository.writeAccesses([
+    await writer.writeAccesses([
       { observedAt: new Date('2026-07-24T00:00:00.000Z'), sha256: SHA_A },
     ]);
 
@@ -255,7 +350,7 @@ describe('PostgreSQL media cache eviction repository', () => {
       .where(eq(mediaCacheBlobs.sha256, SHA_A));
     expect(blob?.lastAccessedAt).toEqual(newest);
     await expect(
-      repository.writeAccesses(
+      writer.writeAccesses(
         Array.from({ length: 101 }, (_, index) => ({
           observedAt: newest,
           sha256: index % 2 === 0 ? SHA_A : SHA_B,
@@ -283,19 +378,32 @@ describe('PostgreSQL media cache eviction repository', () => {
       planState: 'recovering',
     });
     await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 300n });
-    const repository = new PostgresMediaCacheEvictionRepository(connection.db);
+    const evictedHashes: string[] = [];
+    const service = new MediaCacheEvictionService(connection.db, {
+      async evict(blob) {
+        evictedHashes.push(blob.sha256);
+        return 'removed';
+      },
+    });
 
-    const lruClaim = await repository.claimEviction(claimInput());
-    expect(lruClaim?.sha256).toBe(SHA_B);
+    const lru = await service.evict({
+      ...claimInput(),
+      initiator: { kind: 'worker' },
+    });
+    expect(evictedHashes).toEqual([SHA_B]);
+    expect(lru?.readyBytes).toBe(200n);
     await expect(
-      repository.claimEviction(claimInput({ kind: 'specific_blob', sha256: SHA_A })),
+      service.evict({
+        ...claimInput({ kind: 'specific_blob', sha256: SHA_A }),
+        initiator: { kind: 'worker' },
+      }),
     ).resolves.toBeNull();
     await expect(
-      repository.claimEviction(claimInput({ kind: 'specific_blob', sha256: SHA_C })),
+      service.evict({
+        ...claimInput({ kind: 'specific_blob', sha256: SHA_C }),
+        initiator: { kind: 'worker' },
+      }),
     ).resolves.toBeNull();
-
-    const [runtime] = await connection.db.select().from(mediaCacheRuntime);
-    expect(runtime?.readyBytes).toBe(300n);
   });
 
   it('evicts one shared physical blob and subtracts every original plan exactly once', async () => {
@@ -313,22 +421,21 @@ describe('PostgreSQL media cache eviction repository', () => {
     });
     const thumbnailId = await addReadyThumbnail(connection, second, SHA_A, 100n);
     await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 100n });
-    const repository = new PostgresMediaCacheEvictionRepository(connection.db);
+    const service = createDatabaseService(connection);
     const claim = claimInput({ kind: 'specific_blob', sha256: SHA_A });
 
-    await expect(repository.claimEviction(claim)).resolves.toMatchObject({ sha256: SHA_A });
-    const completed = await repository.completeEviction({
-      evictionToken: claim.evictionToken,
+    const completed = await service.evict({
+      ...claim,
       initiator: {
         initiatorId: 'owner-1',
         kind: 'owner_session',
         reason: 'Remove cached copies from this device',
       },
-      sha256: SHA_A,
     });
 
     expect(completed).toEqual({
       evictedObjectIds: [first.objectId, second.objectId, thumbnailId].sort(),
+      fileOutcome: 'removed',
       physicalBytesRemoved: 100n,
       planLogicalBytesRemoved: [
         { bytes: 100n, planId: first.planId },
@@ -366,43 +473,31 @@ describe('PostgreSQL media cache eviction repository', () => {
     });
   });
 
-  it('restores a failed unlink only for its token and rejects stale completion', async () => {
+  it('takes over an expired deleting lease with a fresh token', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
     }
     await insertBlob(connection, SHA_A, 100n, new Date('2026-07-24T01:00:00.000Z'));
     await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 100n });
-    const repository = new PostgresMediaCacheEvictionRepository(connection.db);
-    const firstClaim = claimInput({ kind: 'specific_blob', sha256: SHA_A });
-    await repository.claimEviction(firstClaim);
-    const staleToken = randomUUID();
+    const crashedToken = randomUUID();
+    await markDeleting(connection, SHA_A, crashedToken);
+    const service = createDatabaseService(connection);
+    const takeover = claimInput({ kind: 'specific_blob', sha256: SHA_A });
 
     await expect(
-      repository.restoreEviction({ evictionToken: staleToken, sha256: SHA_A }),
-    ).rejects.toMatchObject({ code: 'stale_lease' } satisfies Partial<MediaCacheEvictionError>);
-    await expect(
-      repository.completeEviction({
-        evictionToken: staleToken,
+      service.evict({
+        ...takeover,
         initiator: { kind: 'worker' },
-        sha256: SHA_A,
       }),
-    ).rejects.toMatchObject({ code: 'stale_lease' } satisfies Partial<MediaCacheEvictionError>);
-    await repository.restoreEviction({
-      evictionToken: firstClaim.evictionToken,
-      sha256: SHA_A,
-    });
-
-    const secondClaim = claimInput({ kind: 'specific_blob', sha256: SHA_A });
-    await repository.claimEviction(secondClaim);
-    await expect(
-      repository.completeEviction({
-        evictionToken: firstClaim.evictionToken,
-        initiator: { kind: 'worker' },
-        sha256: SHA_A,
-      }),
-    ).rejects.toMatchObject({ code: 'stale_lease' } satisfies Partial<MediaCacheEvictionError>);
-    const [runtime] = await connection.db.select().from(mediaCacheRuntime);
-    expect(runtime?.readyBytes).toBe(100n);
+    ).resolves.toMatchObject({ fileOutcome: 'removed', readyBytes: 0n });
+    const [blob] = await connection.db
+      .select({
+        evictionToken: mediaCacheBlobs.evictionToken,
+        state: mediaCacheBlobs.state,
+      })
+      .from(mediaCacheBlobs)
+      .where(eq(mediaCacheBlobs.sha256, SHA_A));
+    expect(blob).toEqual({ evictionToken: null, state: 'evicted' });
   });
 
   it('uses a fixed audit reason for worker LRU eviction', async () => {
@@ -411,17 +506,199 @@ describe('PostgreSQL media cache eviction repository', () => {
     }
     await insertBlob(connection, SHA_A, 100n, new Date('2026-07-24T01:00:00.000Z'));
     await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 100n });
-    const repository = new PostgresMediaCacheEvictionRepository(connection.db);
+    const service = createDatabaseService(connection);
     const claim = claimInput();
-    await repository.claimEviction(claim);
 
-    await repository.completeEviction({
-      evictionToken: claim.evictionToken,
+    await service.evict({
+      ...claim,
       initiator: { kind: 'worker' },
-      sha256: SHA_A,
     });
 
     const [action] = await connection.db.select().from(mediaCacheActions);
     expect(action?.reason).toBe('lru_capacity_pressure');
+  });
+
+  it('uses the supported service path to unlink and complete a PostgreSQL eviction', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const { published, root, service } = await createBackedReadyBlob(
+      connection,
+      'service-owned eviction',
+    );
+    const claim = claimInput({ kind: 'specific_blob', sha256: published.sha256 });
+
+    const result = await service.evict({
+      ...claim,
+      initiator: { kind: 'worker' },
+    });
+
+    expect(result).toMatchObject({
+      fileOutcome: 'removed',
+      physicalBytesRemoved: BigInt(published.byteLength),
+      readyBytes: 0n,
+    });
+    await expect(readFile(join(root, published.relativeKey))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('restores the ready database state when the supported service cannot unlink', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const { published, root, service } = await createBackedReadyBlob(
+      connection,
+      'unlink failure is recoverable',
+    );
+    const blobPath = join(root, published.relativeKey);
+    const replacementTarget = join(root, 'replacement-target');
+    await rm(blobPath);
+    await writeFile(replacementTarget, 'must survive');
+    await symlink(replacementTarget, blobPath);
+    const claim = claimInput({ kind: 'specific_blob', sha256: published.sha256 });
+
+    await expect(
+      service.evict({
+        ...claim,
+        initiator: { kind: 'worker' },
+      }),
+    ).rejects.toThrow('symbolic link');
+
+    const [blob] = await connection.db
+      .select({
+        evictionToken: mediaCacheBlobs.evictionToken,
+        state: mediaCacheBlobs.state,
+      })
+      .from(mediaCacheBlobs)
+      .where(eq(mediaCacheBlobs.sha256, published.sha256));
+    expect(blob).toEqual({ evictionToken: null, state: 'ready' });
+    await expect(readFile(replacementTarget, 'utf8')).resolves.toBe('must survive');
+  });
+
+  it('takes over a crash before unlink and completes through the supported service', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const { published, root, service } = await createBackedReadyBlob(
+      connection,
+      'crash before unlink',
+    );
+    await markDeleting(connection, published.sha256, randomUUID());
+    const takeover = claimInput({
+      kind: 'specific_blob',
+      sha256: published.sha256,
+    });
+
+    const result = await service.evict({
+      ...takeover,
+      initiator: { kind: 'worker' },
+    });
+
+    expect(result).toMatchObject({ fileOutcome: 'removed', readyBytes: 0n });
+    await expect(readFile(join(root, published.relativeKey))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('takes over a crash after unlink and treats the absent file as success', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const { published, service, store } = await createBackedReadyBlob(
+      connection,
+      'crash after unlink',
+    );
+    await markDeleting(connection, published.sha256, randomUUID());
+    await expect(store.evict(published)).resolves.toBe('removed');
+    const takeover = claimInput({
+      kind: 'specific_blob',
+      sha256: published.sha256,
+    });
+
+    const result = await service.evict({
+      ...takeover,
+      initiator: { kind: 'worker' },
+    });
+
+    expect(result).toMatchObject({ fileOutcome: 'absent', readyBytes: 0n });
+    const [blob] = await connection.db
+      .select({ state: mediaCacheBlobs.state })
+      .from(mediaCacheBlobs)
+      .where(eq(mediaCacheBlobs.sha256, published.sha256));
+    expect(blob?.state).toBe('evicted');
+  });
+
+  it('keeps the blob evicted when two workers cross during an expired-lease takeover', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const {
+      published,
+      root,
+      service: secondWorker,
+      store,
+    } = await createBackedReadyBlob(connection, 'controlled two-worker takeover');
+    let releaseFirstWorker: (() => void) | undefined;
+    let firstWorkerReached: (() => void) | undefined;
+    const firstWorkerOpened = new Promise<void>((resolve) => {
+      firstWorkerReached = resolve;
+    });
+    const firstWorkerRelease = new Promise<void>((resolve) => {
+      releaseFirstWorker = resolve;
+    });
+    const controlledEvictor: MediaCacheBlobEvictor = {
+      async evict(blob) {
+        const opened = await store.open(blob);
+        firstWorkerReached?.();
+        await firstWorkerRelease;
+        try {
+          return await store.evict(blob);
+        } finally {
+          await opened.close();
+        }
+      },
+    };
+    const firstWorker = new MediaCacheEvictionService(connection.db, controlledEvictor);
+    const firstClaim = claimInput({
+      kind: 'specific_blob',
+      sha256: published.sha256,
+    });
+    const firstEviction = firstWorker.evict({
+      ...firstClaim,
+      initiator: { kind: 'worker' },
+    });
+    await firstWorkerOpened;
+    await connection.db
+      .update(mediaCacheBlobs)
+      .set({ evictionExpiresAt: new Date('2000-01-01T00:00:00.000Z') })
+      .where(eq(mediaCacheBlobs.sha256, published.sha256));
+    const takeover = claimInput({
+      kind: 'specific_blob',
+      sha256: published.sha256,
+    });
+
+    await expect(
+      secondWorker.evict({
+        ...takeover,
+        initiator: { kind: 'worker' },
+      }),
+    ).resolves.toMatchObject({ fileOutcome: 'removed', readyBytes: 0n });
+    releaseFirstWorker?.();
+    await expect(firstEviction).rejects.toMatchObject({
+      code: 'stale_lease',
+    } satisfies Partial<MediaCacheEvictionError>);
+
+    const [blob] = await connection.db
+      .select({
+        evictionToken: mediaCacheBlobs.evictionToken,
+        state: mediaCacheBlobs.state,
+      })
+      .from(mediaCacheBlobs)
+      .where(eq(mediaCacheBlobs.sha256, published.sha256));
+    expect(blob).toEqual({ evictionToken: null, state: 'evicted' });
+    await expect(readFile(join(root, published.relativeKey))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 });

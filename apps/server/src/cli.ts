@@ -15,6 +15,7 @@ import {
   parseTelegramChannelId,
   resolveAuthConfig,
   resolveDatabaseUrl,
+  resolveMediaCacheConfig,
   resolvePort,
   resolvePublicApiConfig,
   resolveTelegramConfig,
@@ -33,6 +34,7 @@ import {
 } from './imports/report.js';
 import { TelegramDesktopInputError } from './imports/telegram-desktop-parser.js';
 import { TelegramDesktopImportService } from './imports/telegram-desktop-service.js';
+import { runMediaCacheCli } from './media-cache/cli.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import {
   doctorHasFailures,
@@ -67,6 +69,7 @@ Commands:
   token       Create, list, or revoke scoped service tokens
   channel     Add, list, enable, or disable Telegram channels
   import      Import historical content
+  media       Inspect or maintain the optional local media cache
   reconcile   Inspect scoped Telegram archive consistency
   doctor      Run read-only deployment diagnostics
   health      Run a container-local health check
@@ -85,10 +88,13 @@ Options:
       --expires-in <duration>  Optional token expiry in whole days, for example 30d
       --id <id>                Service token ID
       --input <path>           Telegram Desktop result.json
+      --import-run <uuid>      Exact completed Desktop import run for media cache
+      --desktop-root <path>    Process-local Telegram Desktop export root
       --channel <id>           Repeatable canonical Telegram channel ID
       --complete-range <range> Explicit complete channel:start:end coverage; repeatable, apply only
       --apply                  Apply a supported operation (default: dry-run)
       --reason <text>          Required operator reason for reconciliation apply
+      --target-bytes <bytes>   Desired ready-byte ceiling for media prune
       --json                   Print a versioned JSON report
 
 Owner commands:
@@ -113,6 +119,13 @@ Reconciliation command:
   kodama reconcile telegram --channel -1001234567890 [--channel -1009876543210] [--json]
   kodama reconcile telegram --channel -1001234567890 --apply --reason "approved repair"
 
+Media commands:
+  kodama media status [--json]
+  kodama media scan [--channel -1001234567890] [--channel -1009876543210] [--json]
+  kodama media cache --import-run <uuid> --input <result.json> --desktop-root <path> --apply --reason <text>
+  kodama media prune [--target-bytes <bytes>] [--apply --reason <text>] [--json]
+  kodama media reconcile [--apply --reason <text>] [--json]
+
 Doctor command:
   kodama doctor
 
@@ -129,10 +142,12 @@ interface CliOptions {
   channel?: string[];
   'complete-range'?: string[];
   'database-url'?: string;
+  'desktop-root'?: string;
   email?: string;
   'expires-in'?: string;
   help?: boolean;
   id?: string;
+  'import-run'?: string;
   input?: string;
   json?: boolean;
   name?: string;
@@ -140,6 +155,7 @@ interface CliOptions {
   port?: string;
   reason?: string;
   scope?: string[];
+  'target-bytes'?: string;
   'telegram-id'?: string;
   version?: boolean;
 }
@@ -161,10 +177,12 @@ function parseCli(): {
       channel: { multiple: true, type: 'string' },
       'complete-range': { multiple: true, type: 'string' },
       'database-url': { type: 'string' },
+      'desktop-root': { type: 'string' },
       email: { type: 'string' },
       'expires-in': { type: 'string' },
       help: { short: 'h', type: 'boolean' },
       id: { type: 'string' },
+      'import-run': { type: 'string' },
       input: { type: 'string' },
       json: { type: 'boolean' },
       name: { type: 'string' },
@@ -172,6 +190,7 @@ function parseCli(): {
       port: { short: 'p', type: 'string' },
       reason: { type: 'string' },
       scope: { multiple: true, type: 'string' },
+      'target-bytes': { type: 'string' },
       'telegram-id': { type: 'string' },
       version: { short: 'v', type: 'boolean' },
     },
@@ -201,6 +220,7 @@ function sensitiveEnvironmentValues(): string[] {
     process.env.DATABASE_URL,
     process.env.POSTGRES_PASSWORD,
     process.env.BETTER_AUTH_SECRET,
+    process.env.MEDIA_CACHE_ROOT,
     process.env.TELEGRAM_BOT_TOKEN,
   ].filter((value): value is string => typeof value === 'string' && value.length > 0);
 }
@@ -223,14 +243,16 @@ async function main(): Promise<void> {
   if (command === 'serve') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
     const auth = resolveAuthConfig();
-    const runtime = startServerRuntime({
+    const mediaCache = resolveMediaCacheConfig();
+    const runtime = await startServerRuntime({
       auth,
       databaseUrl,
+      mediaCache,
       port: resolvePort(options.port),
       publicApi: resolvePublicApiConfig(),
     });
     registerProcessLifecycle(runtime, {
-      secrets: [auth.secret, databaseUrl],
+      secrets: [auth.secret, databaseUrl, mediaCache.root],
     });
     return;
   }
@@ -238,13 +260,15 @@ async function main(): Promise<void> {
   if (command === 'worker') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
     const telegram = resolveTelegramConfig();
+    const mediaCache = resolveMediaCacheConfig();
     const runtime = createWorkerRuntime({
       ...telegram,
       databaseUrl,
       instanceId: resolveWorkerInstanceId(),
+      mediaCache,
     });
     registerProcessLifecycle(runtime, {
-      secrets: [databaseUrl, telegram.botToken],
+      secrets: [databaseUrl, telegram.botToken, mediaCache.root],
     });
     void runtime.start().catch(() => {
       // The lifecycle reporter owns sanitized process diagnostics.
@@ -255,6 +279,37 @@ async function main(): Promise<void> {
   if (command === 'migrate') {
     await runMigrations(resolveDatabaseUrl(options['database-url']));
     process.stdout.write('Database migrations applied.\n');
+    return;
+  }
+
+  if (command === 'media') {
+    const databaseUrl = resolveDatabaseUrl(options['database-url']);
+    const mediaCache = resolveMediaCacheConfig();
+    try {
+      await runMediaCacheCli({
+        apply: options.apply === true,
+        ...(options.channel ? { channels: options.channel } : {}),
+        databaseUrl,
+        ...(options['desktop-root'] ? { desktopRoot: options['desktop-root'] } : {}),
+        ...(options['import-run'] ? { importRunId: options['import-run'] } : {}),
+        ...(options.input ? { inputPath: options.input } : {}),
+        json: options.json === true,
+        mediaCache,
+        ...(options.reason ? { reason: options.reason } : {}),
+        subcommand,
+        ...(options['target-bytes'] ? { targetBytes: options['target-bytes'] } : {}),
+      });
+    } catch (error) {
+      throw new Error(
+        sanitizeDiagnosticText(error, [
+          ...sensitiveEnvironmentValues(),
+          databaseUrl,
+          mediaCache.root,
+          ...(options.input ? [options.input] : []),
+          ...(options['desktop-root'] ? [options['desktop-root']] : []),
+        ]),
+      );
+    }
     return;
   }
 

@@ -27,7 +27,7 @@ function reader(variant: 'original' | 'thumbnail' = 'original'): {
     byteLength: 10,
     close,
     contentType: 'image/jpeg',
-    etag: `"${'a'.repeat(64)}"`,
+    etag: `"media-${OBJECT_ID}"`,
     stream,
     variant,
   };
@@ -41,7 +41,14 @@ function reader(variant: 'original' | 'thumbnail' = 'original'): {
 }
 
 describe('public media API', () => {
-  it('streams an opaque original with immutable and security headers', async () => {
+  it('does not register the media route when the cache is disabled', async () => {
+    const response = await createApp().request(`/api/v1/media/${OBJECT_ID}`);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get('RateLimit-Limit')).toBeNull();
+  });
+
+  it('streams an opaque original with revalidation and security headers', async () => {
     const fixture = reader();
 
     const response = await createApp({ media: fixture.media }).request(
@@ -51,11 +58,61 @@ describe('public media API', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('Content-Type')).toBe('image/jpeg');
     expect(response.headers.get('Content-Length')).toBe('10');
-    expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
-    expect(response.headers.get('ETag')).toBe(`"${'a'.repeat(64)}"`);
+    expect(response.headers.get('Cache-Control')).toBe('public, no-cache');
+    expect(response.headers.get('ETag')).toBe(`"media-${OBJECT_ID}"`);
     expect(response.headers.get('Accept-Ranges')).toBe('bytes');
     expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
     await expect(response.text()).resolves.toBe('0123456789');
+  });
+
+  it.each([
+    ['GET', `"media-${OBJECT_ID}"`],
+    ['GET', `W/"media-${OBJECT_ID}"`],
+    ['GET', `"other,tag", W/"media-${OBJECT_ID}"`],
+    ['HEAD', '*'],
+  ] as const)(
+    'revalidates current readable media with %s If-None-Match %s before streaming',
+    async (method, ifNoneMatch) => {
+      const fixture = reader();
+      const response = await createApp({ media: fixture.media }).request(
+        `/api/v1/media/${OBJECT_ID}`,
+        {
+          headers: {
+            'If-None-Match': ifNoneMatch,
+            Range: 'bytes=3-6',
+          },
+          method,
+        },
+      );
+
+      expect(response.status).toBe(304);
+      expect(response.headers.get('Cache-Control')).toBe('public, no-cache');
+      expect(response.headers.get('ETag')).toBe(`"media-${OBJECT_ID}"`);
+      expect(response.headers.get('Content-Range')).toBeNull();
+      await expect(response.text()).resolves.toBe('');
+      expect(fixture.close).toHaveBeenCalledOnce();
+      expect(fixture.stream).not.toHaveBeenCalled();
+    },
+  );
+
+  it('ignores a malformed or nonmatching If-None-Match and then applies Range', async () => {
+    for (const ifNoneMatch of ['"stale"', `"media-${OBJECT_ID}", invalid`]) {
+      const fixture = reader();
+      const response = await createApp({ media: fixture.media }).request(
+        `/api/v1/media/${OBJECT_ID}`,
+        {
+          headers: {
+            'If-None-Match': ifNoneMatch,
+            Range: 'bytes=3-6',
+          },
+        },
+      );
+
+      expect(response.status).toBe(206);
+      expect(response.headers.get('Cache-Control')).toBe('public, no-cache');
+      expect(response.headers.get('Content-Range')).toBe('bytes 3-6/10');
+      await expect(response.text()).resolves.toBe('3456');
+    }
   });
 
   it('serves one original byte range and rejects multiple or unsatisfiable ranges', async () => {
@@ -118,11 +175,17 @@ describe('public media API', () => {
 
     const missing = await createApp({ media: fixture.media }).request(
       `/api/v1/media/${randomUUID()}`,
+      { headers: { 'If-None-Match': '*' } },
     );
     expect(missing.status).toBe(404);
+    expect(missing.headers.get('Cache-Control')).toBe('private, no-store');
     await expect(missing.json()).resolves.toMatchObject({
       error: { code: 'media_not_found' },
     });
+
+    const invalid = await createApp({ media: fixture.media }).request('/api/v1/media/not-a-uuid');
+    expect(invalid.status).toBe(400);
+    expect(invalid.headers.get('Cache-Control')).toBe('private, no-store');
   });
 
   it('varies every public response by Origin when a CORS allowlist is configured', async () => {
@@ -143,11 +206,27 @@ describe('public media API', () => {
     expect(noOrigin.headers.get('Access-Control-Allow-Origin')).toBeNull();
 
     const allowed = await app.request(`/api/v1/media/${OBJECT_ID}`, {
-      headers: { Origin: 'https://blog.example.com' },
+      headers: {
+        'If-None-Match': `W/"media-${OBJECT_ID}"`,
+        Origin: 'https://blog.example.com',
+      },
       method: 'HEAD',
     });
+    expect(allowed.status).toBe(304);
     expect(allowed.headers.get('Vary')).toBe('Origin');
     expect(allowed.headers.get('Access-Control-Allow-Origin')).toBe('https://blog.example.com');
     expect(allowed.headers.get('Access-Control-Expose-Headers')).toContain('Content-Range');
+
+    const preflight = await app.request(`/api/v1/media/${OBJECT_ID}`, {
+      headers: {
+        'Access-Control-Request-Headers': 'If-None-Match',
+        'Access-Control-Request-Method': 'GET',
+        Origin: 'https://blog.example.com',
+      },
+      method: 'OPTIONS',
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Vary')).toBe('Origin');
+    expect(preflight.headers.get('Access-Control-Allow-Headers')).toContain('If-None-Match');
   });
 });

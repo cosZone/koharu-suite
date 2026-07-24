@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { eq, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
@@ -16,13 +19,29 @@ import {
   messages,
   telegramChannels,
 } from '../../src/db/schema.js';
+import { PostgresMediaCacheAdminService } from '../../src/media-cache/admin-service.js';
+import { LocalMediaBlobStore } from '../../src/media-cache/blob-store.js';
+import { MediaCacheEvictionService } from '../../src/media-cache/eviction-repository.js';
 import {
   MEDIA_CACHE_ADVISORY_LOCK,
   PostgresMediaCacheLedgerRepository,
 } from '../../src/media-cache/ledger-repository.js';
+import { PostgresPublicMediaObjectRepository } from '../../src/media-cache/public-reader.js';
+import { PostgresMediaCacheThumbnailLedgerRepository } from '../../src/media-cache/thumbnail-ledger-repository.js';
+import { MediaCacheWorker } from '../../src/media-cache/worker.js';
+import { PostgresMediaCacheWorkerRepository } from '../../src/media-cache/worker-repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const MIB = 1024n * 1024n;
+const JPEG_FIXTURE = Uint8Array.from([
+  0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+  0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+]);
+const MP4_20_MIB_FIXTURE = new Uint8Array(20 * Number(MIB));
+MP4_20_MIB_FIXTURE.set([
+  0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00, 0x00,
+  0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32,
+]);
 
 interface PlanFixture {
   objectIds: string[];
@@ -134,6 +153,15 @@ function leaseExpiry(milliseconds = 30_000): Date {
   return new Date(Date.now() + milliseconds);
 }
 
+function byteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
 describe('PostgreSQL media cache ledger repository', () => {
   let container: StartedPostgreSqlContainer | undefined;
   let connection: DatabaseConnection | undefined;
@@ -161,6 +189,51 @@ describe('PostgreSQL media cache ledger repository', () => {
         ${telegramChannels}
       cascade
     `);
+  });
+
+  it('reports admission headroom so deterministic LRU can make a near-full plan claimable', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 32, ['photo']);
+    const existingSha = 'e'.repeat(64);
+    await connection.db.insert(mediaCacheRuntime).values({
+      maxBytes: 10n * MIB,
+      readyBytes: 9n * MIB,
+      singletonKey: 'local',
+    });
+    await connection.db.insert(mediaCacheBlobs).values({
+      byteLength: 9n * MIB,
+      detectedMime: 'image/jpeg',
+      relativeKey: `blobs/ee/ee/${existingSha}`,
+      sha256: existingSha,
+      state: 'ready',
+    });
+    const ledger = new PostgresMediaCacheLedgerRepository(connection.db);
+    await expect(ledger.requiredHeadroomBytes()).resolves.toBe(9n * MIB);
+
+    const eviction = new MediaCacheEvictionService(connection.db, {
+      evict: async () => 'removed' as const,
+    });
+    await eviction.evict({
+      evictionExpiresAt: leaseExpiry(),
+      evictionOwner: 'capacity-test',
+      evictionToken: randomUUID(),
+      initiator: { kind: 'worker' },
+      selection: { kind: 'least_recently_used' },
+    });
+    const leaseToken = randomUUID();
+    await expect(
+      ledger.claimPostPlan({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'capacity-test',
+        leaseToken,
+        planId: fixture.planId,
+      }),
+    ).resolves.toMatchObject({
+      objectIds: fixture.objectIds,
+      requestedBytes: 10n * MIB,
+    });
   });
 
   it('reserves a 50 MiB post and keeps its published bytes conservative until settlement', async () => {
@@ -643,6 +716,74 @@ describe('PostgreSQL media cache ledger repository', () => {
     expect(runtime?.reservedBytes ?? 0n).toBe(0n);
   });
 
+  it('requires an explicit local claim and returns an expired Desktop lease to awaiting state', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 21, ['photo']);
+    await connection.db
+      .update(mediaCachePostPlans)
+      .set({ state: 'awaiting_local_source' })
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    await connection.db
+      .update(mediaCacheObjects)
+      .set({ state: 'awaiting_local_source' })
+      .where(eq(mediaCacheObjects.postPlanId, fixture.planId));
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+
+    await expect(
+      repository.claimPostPlan({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-must-not-claim',
+        leaseToken: randomUUID(),
+        planId: fixture.planId,
+      }),
+    ).resolves.toBeNull();
+
+    const previousLeaseToken = randomUUID();
+    await expect(
+      repository.claimPostPlan({
+        allowAwaitingLocalSource: true,
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'desktop-cli:123',
+        leaseToken: previousLeaseToken,
+        planId: fixture.planId,
+      }),
+    ).resolves.toMatchObject({ planId: fixture.planId });
+    await connection.db
+      .update(mediaCachePostPlans)
+      .set({ leaseExpiresAt: sql`clock_timestamp() - interval '1 second'` })
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    await connection.db
+      .update(mediaCacheObjects)
+      .set({ leaseExpiresAt: sql`clock_timestamp() - interval '1 second'` })
+      .where(eq(mediaCacheObjects.postPlanId, fixture.planId));
+
+    await expect(
+      repository.recoverExpiredPostPlan({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-recovery',
+        leaseToken: randomUUID(),
+        planId: fixture.planId,
+        recover: async () => undefined,
+      }),
+    ).resolves.toEqual({
+      nextState: 'awaiting_local_source',
+      planId: fixture.planId,
+      releasedReservationBytes: 10n * MIB,
+    });
+    const [plan] = await connection.db
+      .select()
+      .from(mediaCachePostPlans)
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    expect(plan).toMatchObject({
+      attemptCount: 0,
+      leaseOwner: null,
+      reservedOriginalBytes: 0n,
+      state: 'awaiting_local_source',
+    });
+  });
+
   it('keeps policy-skipped originals outside the atomic eligible set', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
@@ -911,6 +1052,105 @@ describe('PostgreSQL media cache ledger repository', () => {
     expect(runtime?.reservedBytes).toBe(0n);
   });
 
+  it('keeps an exhausted recovery runnable until cleanup succeeds and blocks precommit work', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 181, ['photo']);
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+    const work = new PostgresMediaCacheWorkerRepository(connection.db);
+    const previousLeaseToken = randomUUID();
+    await repository.claimPostPlan({
+      leaseExpiresAt: leaseExpiry(),
+      leaseOwner: 'worker-old',
+      leaseToken: previousLeaseToken,
+      planId: fixture.planId,
+    });
+    await connection.db
+      .update(mediaCachePostPlans)
+      .set({
+        attemptCount: 9,
+        leaseExpiresAt: sql`clock_timestamp() - interval '1 second'`,
+      })
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    await connection.db
+      .update(mediaCacheObjects)
+      .set({
+        attemptCount: 9,
+        leaseExpiresAt: sql`clock_timestamp() - interval '1 second'`,
+      })
+      .where(eq(mediaCacheObjects.postPlanId, fixture.planId));
+
+    await expect(
+      repository.recoverExpiredPostPlan({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-recovery',
+        leaseToken: randomUUID(),
+        planId: fixture.planId,
+        recover: async () => {
+          throw new Error('simulated cleanup failure');
+        },
+      }),
+    ).rejects.toThrow('simulated cleanup failure');
+    await expect(
+      repository.markExpiredRecoveryFailed({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-recovery',
+        leaseToken: randomUUID(),
+        planId: fixture.planId,
+      }),
+    ).resolves.toBe(true);
+
+    const [failedRecovery] = await connection.db
+      .select()
+      .from(mediaCachePostPlans)
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    expect(failedRecovery).toMatchObject({
+      attemptCount: 10,
+      leaseToken: previousLeaseToken,
+      reservedOriginalBytes: 10n * MIB,
+      state: 'recovering',
+    });
+    await expect(work.listExpiredPostPlanIds(1)).resolves.toEqual([]);
+
+    await connection.db
+      .update(mediaCachePostPlans)
+      .set({ availableAt: sql`clock_timestamp() - interval '1 second'` })
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    await expect(work.listExpiredPostPlanIds(1)).resolves.toEqual([fixture.planId]);
+
+    await expect(
+      repository.recoverExpiredPostPlan({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-recovered',
+        leaseToken: randomUUID(),
+        planId: fixture.planId,
+        recover: async (snapshot) => {
+          expect(snapshot).toMatchObject({
+            phase: 'precommit',
+            previousLeaseToken,
+          });
+        },
+      }),
+    ).resolves.toEqual({
+      nextState: 'blocked',
+      planId: fixture.planId,
+      releasedReservationBytes: 10n * MIB,
+    });
+    const [blockedPlan] = await connection.db
+      .select()
+      .from(mediaCachePostPlans)
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    expect(blockedPlan).toMatchObject({
+      attemptCount: 10,
+      leaseToken: null,
+      reservedOriginalBytes: 0n,
+      state: 'blocked',
+    });
+    const [runtime] = await connection.db.select().from(mediaCacheRuntime);
+    expect(runtime?.reservedBytes).toBe(0n);
+  });
+
   it('recovers expired postcommit provenance onto a fresh token and completes settlement', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
@@ -980,5 +1220,433 @@ describe('PostgreSQL media cache ledger repository', () => {
       logicalReadyBytes: 5n * MIB,
       reservedBytes: 0n,
     });
+  });
+
+  it('releases a failed live plan into bounded retry backoff only after staging cleanup', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 20, ['photo']);
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+    const leaseToken = randomUUID();
+    await repository.claimPostPlan({
+      leaseExpiresAt: leaseExpiry(),
+      leaseOwner: 'worker-1',
+      leaseToken,
+      planId: fixture.planId,
+    });
+    let cleanupCompleted = false;
+
+    await expect(
+      repository.failClaimedPostPlan({
+        cleanup: async () => {
+          cleanupCompleted = true;
+        },
+        errorClass: 'source',
+        errorCode: 'telegram_media_source_transient',
+        leaseToken,
+        planId: fixture.planId,
+      }),
+    ).resolves.toMatchObject({
+      attemptCount: 1,
+      nextState: 'retry_wait',
+      releasedReservationBytes: 10n * MIB,
+    });
+    expect(cleanupCompleted).toBe(true);
+
+    const [plan] = await connection.db
+      .select()
+      .from(mediaCachePostPlans)
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    expect(plan).toMatchObject({
+      attemptCount: 1,
+      lastErrorClass: 'source',
+      lastErrorCode: 'telegram_media_source_transient',
+      leaseToken: null,
+      reservedOriginalBytes: 0n,
+      state: 'retry_wait',
+    });
+    expect(plan?.availableAt.getTime()).toBeGreaterThan(plan?.updatedAt.getTime() ?? 0);
+    const [object] = await connection.db
+      .select()
+      .from(mediaCacheObjects)
+      .where(eq(mediaCacheObjects.id, fixture.objectIds[0] ?? ''));
+    expect(object).toMatchObject({
+      attemptCount: 1,
+      lastErrorClass: 'source',
+      lastErrorCode: 'telegram_media_source_transient',
+      leaseToken: null,
+      reservedBytes: 0n,
+      state: 'retry_wait',
+    });
+    const [runtime] = await connection.db.select().from(mediaCacheRuntime);
+    expect(runtime?.reservedBytes).toBe(0n);
+  });
+
+  it('atomically skips a post when streamed originals actually exceed 50 MiB', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 30, ['video', 'video', 'video']);
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+    const root = await mkdtemp(join(tmpdir(), 'koharu-ledger-post-limit-'));
+    const blobs = new LocalMediaBlobStore(root);
+    await blobs.initialize();
+    const publish = vi.spyOn(blobs, 'publish');
+    const leaseToken = randomUUID();
+    const worker = new MediaCacheWorker({
+      blobStore: blobs,
+      discovery: {
+        discoverBatch: async () => ({
+          cursor: null,
+          objectsCreated: 0,
+          plansCreated: 0,
+          scanned: 0,
+          sourcesCreated: 0,
+        }),
+      },
+      ledger: repository,
+      leaseOwner: 'integration-post-limit',
+      randomUuid: () => leaseToken,
+      source: {
+        open: async () => ({
+          declaredBytes: null,
+          stream: byteStream(MP4_20_MIB_FIXTURE),
+        }),
+      },
+      work: {
+        ensureThumbnailObjects: async () => 0,
+        listExpiredPostPlanIds: async () => [],
+        listRunnablePostPlanIds: async () => [fixture.planId],
+        loadClaimedOriginals: async () =>
+          fixture.objectIds.map((objectId, position) => ({
+            kind: 'video' as const,
+            objectId,
+            position,
+            sources: [{ fileId: `actual-20-mib-${position}` }],
+          })),
+      },
+    });
+
+    try {
+      await expect(worker.runOnce()).resolves.toMatchObject({
+        completedPlans: 0,
+        failedPlans: 1,
+      });
+      expect(publish).not.toHaveBeenCalled();
+      await expect(blobs.recoverLease({ leaseToken, planId: fixture.planId })).resolves.toEqual([]);
+
+      const [plan] = await connection.db
+        .select()
+        .from(mediaCachePostPlans)
+        .where(eq(mediaCachePostPlans.id, fixture.planId));
+      expect(plan).toMatchObject({
+        lastErrorCode: 'skipped_post_limit',
+        leaseToken: null,
+        reasonCode: 'skipped_post_limit',
+        reservedOriginalBytes: 0n,
+        state: 'skipped',
+      });
+      const objects = await connection.db
+        .select()
+        .from(mediaCacheObjects)
+        .where(eq(mediaCacheObjects.postPlanId, fixture.planId));
+      expect(objects).toHaveLength(3);
+      expect(objects).toEqual(
+        expect.arrayContaining(
+          fixture.objectIds.map((id) =>
+            expect.objectContaining({
+              id,
+              leaseToken: null,
+              reasonCode: 'skipped_post_limit',
+              reservedBytes: 0n,
+              state: 'skipped',
+            }),
+          ),
+        ),
+      );
+      const [runtime] = await connection.db.select().from(mediaCacheRuntime);
+      expect(runtime).toMatchObject({ readyBytes: 0n, reservedBytes: 0n });
+      expect(await connection.db.select().from(mediaCacheBlobs)).toEqual([]);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it('terminally fences changed bytes against a sticky hash and permits an audited owner retry', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 31, ['photo']);
+    const objectId = fixture.objectIds[0];
+    if (!objectId) {
+      throw new Error('Fixture object was not created');
+    }
+    const stickyHash = 'd'.repeat(64);
+    await connection.db.insert(mediaCacheBlobs).values({
+      byteLength: BigInt(JPEG_FIXTURE.byteLength),
+      detectedMime: 'image/jpeg',
+      relativeKey: `blobs/dd/dd/${stickyHash}`,
+      sha256: stickyHash,
+      state: 'evicted',
+    });
+    await connection.db
+      .update(mediaCacheObjects)
+      .set({ blobSha256: stickyHash })
+      .where(eq(mediaCacheObjects.id, objectId));
+
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+    const root = await mkdtemp(join(tmpdir(), 'koharu-ledger-sticky-conflict-'));
+    const blobs = new LocalMediaBlobStore(root);
+    await blobs.initialize();
+    const publish = vi.spyOn(blobs, 'publish');
+    const leaseToken = randomUUID();
+    const worker = new MediaCacheWorker({
+      blobStore: blobs,
+      discovery: {
+        discoverBatch: async () => ({
+          cursor: null,
+          objectsCreated: 0,
+          plansCreated: 0,
+          scanned: 0,
+          sourcesCreated: 0,
+        }),
+      },
+      ledger: repository,
+      leaseOwner: 'integration-sticky-conflict',
+      randomUuid: () => leaseToken,
+      source: {
+        open: async () => ({
+          declaredBytes: BigInt(JPEG_FIXTURE.byteLength),
+          stream: byteStream(JPEG_FIXTURE),
+        }),
+      },
+      work: {
+        ensureThumbnailObjects: async () => 0,
+        listExpiredPostPlanIds: async () => [],
+        listRunnablePostPlanIds: async () => [fixture.planId],
+        loadClaimedOriginals: async () => [
+          {
+            kind: 'photo',
+            objectId,
+            position: 0,
+            sources: [{ fileId: 'changed-bytes' }],
+          },
+        ],
+      },
+    });
+
+    try {
+      await expect(worker.runOnce()).resolves.toMatchObject({
+        completedPlans: 0,
+        failedPlans: 1,
+      });
+      expect(publish).not.toHaveBeenCalled();
+      await expect(blobs.recoverLease({ leaseToken, planId: fixture.planId })).resolves.toEqual([]);
+
+      const [plan] = await connection.db
+        .select()
+        .from(mediaCachePostPlans)
+        .where(eq(mediaCachePostPlans.id, fixture.planId));
+      expect(plan).toMatchObject({
+        attemptCount: 1,
+        lastErrorClass: 'integrity',
+        lastErrorCode: 'sticky_hash_conflict',
+        leaseToken: null,
+        reasonCode: 'integrity_conflict',
+        reservedOriginalBytes: 0n,
+        state: 'blocked',
+      });
+      const [object] = await connection.db
+        .select()
+        .from(mediaCacheObjects)
+        .where(eq(mediaCacheObjects.id, objectId));
+      expect(object).toMatchObject({
+        attemptCount: 1,
+        blobSha256: stickyHash,
+        lastErrorClass: 'integrity',
+        lastErrorCode: 'sticky_hash_conflict',
+        leaseToken: null,
+        reasonCode: 'integrity_conflict',
+        reservedBytes: 0n,
+        state: 'integrity_conflict',
+      });
+      const [runtime] = await connection.db.select().from(mediaCacheRuntime);
+      expect(runtime).toMatchObject({ readyBytes: 0n, reservedBytes: 0n });
+      await expect(
+        new PostgresPublicMediaObjectRepository(connection.db).findReadyObject(objectId),
+      ).resolves.toBeNull();
+
+      const admin = new PostgresMediaCacheAdminService(connection.db);
+      await expect(
+        admin.retry({
+          initiatorId: 'owner-integration-test',
+          objectId,
+          reason: 'source was corrected',
+        }),
+      ).resolves.toMatchObject({
+        objectIds: [objectId],
+        planId: fixture.planId,
+        state: 'retry_wait',
+      });
+      const [retriedObject] = await connection.db
+        .select()
+        .from(mediaCacheObjects)
+        .where(eq(mediaCacheObjects.id, objectId));
+      expect(retriedObject).toMatchObject({
+        attemptCount: 0,
+        blobSha256: stickyHash,
+        lastErrorCode: null,
+        reasonCode: null,
+        state: 'retry_wait',
+      });
+      const [retryAction] = await connection.db
+        .select()
+        .from(mediaCacheActions)
+        .where(eq(mediaCacheActions.objectId, objectId));
+      expect(retryAction).toMatchObject({
+        actionKind: 'retry',
+        initiatorId: 'owner-integration-test',
+        initiatorKind: 'owner_session',
+        reason: 'source was corrected',
+      });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it('skips one permanently unavailable original while preserving all-or-nothing publication for the rest', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 21, ['photo', 'photo']);
+    const repository = new PostgresMediaCacheLedgerRepository(connection.db);
+    const leaseToken = randomUUID();
+    await repository.claimPostPlan({
+      leaseExpiresAt: leaseExpiry(),
+      leaseOwner: 'worker-1',
+      leaseToken,
+      planId: fixture.planId,
+    });
+    let cleanupCompleted = false;
+
+    await expect(
+      repository.skipClaimedObject({
+        cleanup: async () => {
+          cleanupCompleted = true;
+        },
+        leaseToken,
+        objectId: fixture.objectIds[0] ?? '',
+        planId: fixture.planId,
+        reasonCode: 'unsupported_content',
+      }),
+    ).resolves.toBe(true);
+    expect(cleanupCompleted).toBe(true);
+
+    await expect(
+      repository.recordPublishedObjects({
+        leaseToken,
+        objects: [publishedObject(fixture.objectIds[1] ?? '', '5', 1n * MIB, 'image/jpeg')],
+        planId: fixture.planId,
+        publish: async () => undefined,
+      }),
+    ).resolves.toMatchObject({ physicalBytesAdded: 1n * MIB });
+    await expect(
+      repository.completeSettlement({ leaseToken, planId: fixture.planId }),
+    ).resolves.toMatchObject({ logicalReadyBytes: 1n * MIB });
+
+    const objects = await connection.db
+      .select({
+        id: mediaCacheObjects.id,
+        reasonCode: mediaCacheObjects.reasonCode,
+        state: mediaCacheObjects.state,
+      })
+      .from(mediaCacheObjects);
+    expect(objects).toEqual(
+      expect.arrayContaining([
+        {
+          id: fixture.objectIds[0],
+          reasonCode: 'unsupported_content',
+          state: 'skipped',
+        },
+        { id: fixture.objectIds[1], reasonCode: null, state: 'ready' },
+      ]),
+    );
+  });
+
+  it('reserves, publishes, deduplicates, and settles thumbnail bytes independently from original post bytes', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const fixture = await createPlanFixture(connection, 22, ['photo']);
+    const originals = new PostgresMediaCacheLedgerRepository(connection.db);
+    const originalToken = randomUUID();
+    await originals.claimPostPlan({
+      leaseExpiresAt: leaseExpiry(),
+      leaseOwner: 'worker-original',
+      leaseToken: originalToken,
+      planId: fixture.planId,
+    });
+    await originals.recordPublishedObjects({
+      leaseToken: originalToken,
+      objects: [publishedObject(fixture.objectIds[0] ?? '', '7', 1n * MIB, 'image/jpeg')],
+      planId: fixture.planId,
+      publish: async () => undefined,
+    });
+    await originals.completeSettlement({ leaseToken: originalToken, planId: fixture.planId });
+
+    const work = new PostgresMediaCacheWorkerRepository(connection.db);
+    await expect(work.ensureThumbnailObjects(fixture.planId)).resolves.toBe(1);
+    const [thumbnailId] = await work.listRunnableThumbnailObjectIds();
+    if (!thumbnailId) {
+      throw new Error('Thumbnail job was not created');
+    }
+    const thumbnails = new PostgresMediaCacheThumbnailLedgerRepository(connection.db);
+    const thumbnailToken = randomUUID();
+    await expect(
+      thumbnails.claim({
+        leaseExpiresAt: leaseExpiry(),
+        leaseOwner: 'worker-thumbnail',
+        leaseToken: thumbnailToken,
+        objectId: thumbnailId,
+      }),
+    ).resolves.toMatchObject({
+      objectId: thumbnailId,
+      original: {
+        byteLength: 1n * MIB,
+        detectedMime: 'image/jpeg',
+        sha256: '7'.repeat(64),
+      },
+      planId: fixture.planId,
+    });
+    const thumbnailSha = '8'.repeat(64);
+    await thumbnails.recordPublished({
+      leaseToken: thumbnailToken,
+      object: {
+        byteLength: 500n,
+        detectedMime: 'image/webp',
+        objectId: thumbnailId,
+        relativeKey: `blobs/88/88/${thumbnailSha}`,
+        sha256: thumbnailSha,
+      },
+      publish: async () => undefined,
+    });
+    const [duringSettlement] = await connection.db.select().from(mediaCacheRuntime);
+    expect(duringSettlement).toMatchObject({
+      readyBytes: 1n * MIB + 500n,
+      reservedBytes: 1n * MIB,
+    });
+
+    await thumbnails.complete({ leaseToken: thumbnailToken, objectId: thumbnailId });
+    const [runtime] = await connection.db.select().from(mediaCacheRuntime);
+    expect(runtime).toMatchObject({
+      readyBytes: 1n * MIB + 500n,
+      reservedBytes: 0n,
+    });
+    const [plan] = await connection.db
+      .select()
+      .from(mediaCachePostPlans)
+      .where(eq(mediaCachePostPlans.id, fixture.planId));
+    expect(plan).toMatchObject({ readyOriginalBytes: 1n * MIB, state: 'ready' });
   });
 });

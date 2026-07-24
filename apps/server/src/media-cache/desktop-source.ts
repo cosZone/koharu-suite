@@ -1,4 +1,4 @@
-import { constants } from 'node:fs';
+import { type BigIntStats, constants } from 'node:fs';
 import { type FileHandle, open, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -36,7 +36,23 @@ export class DesktopMediaSourceTooLargeError extends Error {
   }
 }
 
+interface DesktopMediaSourceFileSystem {
+  open(path: string, flags: number): Promise<FileHandle>;
+  realpath(path: string): Promise<string>;
+  stat(path: string): Promise<BigIntStats>;
+}
+
+const desktopMediaSourceFileSystem: DesktopMediaSourceFileSystem = {
+  open,
+  realpath,
+  stat: (path) => stat(path, { bigint: true }),
+};
+
 export class DesktopMediaSource {
+  constructor(
+    private readonly fileSystem: DesktopMediaSourceFileSystem = desktopMediaSourceFileSystem,
+  ) {}
+
   async open(input: OpenDesktopMediaInput): Promise<OpenedDesktopMedia> {
     if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes <= 0) {
       throw new TypeError('Desktop media maxBytes must be a positive safe integer');
@@ -49,12 +65,12 @@ export class DesktopMediaSource {
     let canonicalRoot: string;
     let canonicalSource: string;
     try {
-      canonicalRoot = await realpath(input.desktopRoot);
-      const rootMetadata = await stat(canonicalRoot);
+      canonicalRoot = await this.fileSystem.realpath(input.desktopRoot);
+      const rootMetadata = await this.fileSystem.stat(canonicalRoot);
       if (!rootMetadata.isDirectory()) {
         throw new DesktopMediaSourceUnavailableError();
       }
-      canonicalSource = await realpath(resolve(canonicalRoot, input.sourcePath));
+      canonicalSource = await this.fileSystem.realpath(resolve(canonicalRoot, input.sourcePath));
     } catch (error) {
       if (error instanceof DesktopMediaSourceUnavailableError) {
         throw error;
@@ -67,13 +83,22 @@ export class DesktopMediaSource {
 
     let file: FileHandle | undefined;
     try {
-      file = await open(canonicalSource, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const metadata = await file.stat();
-      if (!metadata.isFile() || !Number.isSafeInteger(metadata.size) || metadata.size < 0) {
+      const expectedMetadata = await this.fileSystem.stat(canonicalSource);
+      if (!expectedMetadata.isFile() || expectedMetadata.size < 0n) {
         throw new DesktopMediaSourceUnavailableError();
       }
-      if (metadata.size > input.maxBytes) {
-        throw new DesktopMediaSourceTooLargeError(input.maxBytes, BigInt(metadata.size));
+      file = await this.fileSystem.open(canonicalSource, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const metadata = await file.stat({ bigint: true });
+      if (
+        !metadata.isFile() ||
+        metadata.size < 0n ||
+        metadata.dev !== expectedMetadata.dev ||
+        metadata.ino !== expectedMetadata.ino
+      ) {
+        throw new DesktopMediaSourceUnavailableError();
+      }
+      if (metadata.size > BigInt(input.maxBytes)) {
+        throw new DesktopMediaSourceTooLargeError(input.maxBytes, metadata.size);
       }
       const stream = file.createReadStream({
         autoClose: true,
@@ -82,7 +107,7 @@ export class DesktopMediaSource {
       });
       file = undefined;
       return {
-        declaredBytes: BigInt(metadata.size),
+        declaredBytes: metadata.size,
         stream: nodeReadableToByteStream(stream, input.signal),
       };
     } catch (error) {

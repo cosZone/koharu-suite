@@ -220,7 +220,9 @@ describe('database migrations', () => {
     }
 
     const database = connection.db;
-    const repository = new PostgresMessageRepository(database);
+    const repository = new PostgresMessageRepository(database, {
+      mediaCacheEnabled: true,
+    });
     const post = normalizeChannelPost(channelPostFixture(), ALLOWED_CHANNEL_ID);
     if (!post) {
       throw new Error('Fixture did not normalize');
@@ -372,6 +374,30 @@ describe('database migrations', () => {
     expect(serialized).not.toContain('sensitive-video-file-id');
     expect(serialized).not.toContain('sensitive-audio-file-id');
     expect(serialized).not.toContain('telegramFile');
+
+    const cacheDisabledMessage = await new PostgresMessageRepository(database).getMessage(
+      ingested.messageId,
+    );
+    expect(cacheDisabledMessage?.media).toEqual([
+      expect.objectContaining({
+        cacheStatus: 'unavailable',
+        id: photo.id,
+        originalUrl: null,
+        thumbnailUrl: null,
+      }),
+      expect.objectContaining({
+        cacheStatus: 'unavailable',
+        id: video.id,
+        originalUrl: null,
+        thumbnailUrl: null,
+      }),
+      expect.objectContaining({
+        cacheStatus: 'unavailable',
+        id: unsupportedAudio.id,
+        originalUrl: null,
+        thumbnailUrl: null,
+      }),
+    ]);
   }, 30_000);
 
   it('checkpoints allowed channel updates atomically and binds exactly one Bot', async () => {

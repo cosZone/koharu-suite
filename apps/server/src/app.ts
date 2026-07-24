@@ -13,6 +13,13 @@ import type { ServiceTokenScope } from './auth/service-token.js';
 import { type PublicApiConfig, parseTelegramChannelId } from './config.js';
 import { decodeMessageCursor, encodeMessageCursor, type MessageCursor } from './http/cursor.js';
 import { FixedWindowRateLimiter, matchCorsOrigin } from './http/public-policy.js';
+import type { MediaCacheAdminReader } from './media-cache/admin-repository.js';
+import {
+  MediaCacheAdminConflictError,
+  type MediaCacheAdminMutations,
+  MediaCacheAdminNotFoundError,
+  MediaCacheAdminNotSupportedError,
+} from './media-cache/admin-service.js';
 import { resolveMediaByteRange } from './media-cache/http-range.js';
 import type { PublicMediaReader } from './media-cache/public-reader.js';
 import type { MessageReader } from './messages/types.js';
@@ -39,6 +46,8 @@ export interface AppDependencies {
   adminAssetsRoot?: string;
   auth: RuntimeAuth;
   media: PublicMediaReader;
+  mediaCacheAdmin: MediaCacheAdminReader;
+  mediaCacheMutations: MediaCacheAdminMutations;
   messages: MessageReader;
   operations: Pick<
     PostgresAdminOperations,
@@ -109,6 +118,33 @@ const unavailableAuth: RuntimeAuth = {
 };
 const unavailableMediaReader: PublicMediaReader = {
   open: async () => null,
+};
+const unavailableMediaCacheAdmin: MediaCacheAdminReader = {
+  getStatus: async () => ({
+    commands: [],
+    enabled: false,
+    failures: [],
+    stateCounts: { blobs: [], objects: [], plans: [] },
+    usage: {
+      lastReconciledAt: null,
+      maxBytes: '0',
+      readyBytes: '0',
+      reservedBytes: '0',
+      updatedAt: null,
+    },
+  }),
+  listObjects: async () => ({ items: [], nextCursor: null }),
+};
+const unavailableMediaCacheMutations: MediaCacheAdminMutations = {
+  evict: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  reconcile: async () => {
+    throw new MediaCacheAdminNotSupportedError();
+  },
+  retry: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
 };
 const unavailableOperations: AppDependencies['operations'] = {
   listBlockedTasks: async () => [],
@@ -202,6 +238,13 @@ function reconciliationMutationStatus(error: unknown): 404 | 409 | null {
 const uuidSchema = z.uuid();
 const listLimitSchema = z.coerce.number().int().min(1).max(100).default(50);
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(500) }).strict();
+const mediaCacheReconcileSchema = reasonSchema;
+const mediaCacheObjectListSchema = z
+  .object({
+    cursor: z.string().min(1).max(512).optional(),
+    limit: listLimitSchema,
+  })
+  .strict();
 const reconciliationActionSchema = z
   .object({
     expectedEvidenceVersion: z.number().int().min(1),
@@ -226,11 +269,11 @@ const reconciliationTombstoneSchema = reconciliationActionSchema
   .extend({ messageId: z.uuid() })
   .strict();
 
-function isPublicApiPath(path: string): boolean {
+function isPublicApiPath(path: string, mediaEnabled: boolean): boolean {
   return (
     path === '/api/v1/health' ||
     path === '/api/v1/channels' ||
-    path.startsWith('/api/v1/media/') ||
+    (mediaEnabled && path.startsWith('/api/v1/media/')) ||
     path === '/api/v1/messages' ||
     path.startsWith('/api/v1/messages/')
   );
@@ -242,11 +285,14 @@ function forwardedAddress(context: Context): string | null {
 }
 
 export function createApp(dependencies: Partial<AppDependencies> = {}) {
+  const mediaEnabled = dependencies.media !== undefined;
   const resolved = {
     admin: dependencies.admin ?? unavailableAdminReader,
     adminAssetsRoot: dependencies.adminAssetsRoot,
     auth: dependencies.auth ?? unavailableAuth,
     media: dependencies.media ?? unavailableMediaReader,
+    mediaCacheAdmin: dependencies.mediaCacheAdmin ?? unavailableMediaCacheAdmin,
+    mediaCacheMutations: dependencies.mediaCacheMutations ?? unavailableMediaCacheMutations,
     messages: dependencies.messages ?? unavailableMessageReader,
     operations: dependencies.operations ?? unavailableOperations,
     publicApi: dependencies.publicApi ?? defaultPublicApi,
@@ -300,8 +346,24 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     throw error;
   };
 
+  const mediaCacheMutationFailure = (context: Context, error: unknown) => {
+    if (error instanceof MediaCacheAdminNotFoundError) {
+      return context.json(apiError('media_cache_object_not_found', error.message), 404);
+    }
+    if (error instanceof MediaCacheAdminNotSupportedError) {
+      return context.json(apiError('media_cache_reconciliation_not_supported', error.message), 409);
+    }
+    if (error instanceof MediaCacheAdminConflictError) {
+      return context.json(apiError('media_cache_conflict', error.message), 409);
+    }
+    if (error instanceof RangeError) {
+      return context.json(apiError('invalid_media_cache_action', error.message), 400);
+    }
+    throw error;
+  };
+
   app.use('/api/v1/*', async (context, next) => {
-    if (!isPublicApiPath(context.req.path)) {
+    if (!isPublicApiPath(context.req.path, mediaEnabled)) {
       await next();
       return;
     }
@@ -313,7 +375,10 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     if (origin) {
       context.header('Access-Control-Allow-Origin', origin);
       context.header('Access-Control-Allow-Methods', 'GET, HEAD');
-      context.header('Access-Control-Allow-Headers', 'Content-Type, Range, If-Range');
+      context.header(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Range, If-Range, If-None-Match',
+      );
       context.header(
         'Access-Control-Expose-Headers',
         'Content-Length, Content-Range, ETag, Accept-Ranges',
@@ -355,59 +420,66 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
   app.get('/api/v1/channels', async (context) =>
     context.json({ items: await resolved.messages.listChannels() }),
   );
-  app.on(['GET', 'HEAD'], '/api/v1/media/:id', async (context) => {
-    const parsedObjectId = uuidSchema.safeParse(context.req.param('id'));
-    if (!parsedObjectId.success) {
-      return context.json(
-        apiError('invalid_media_id', 'id must be a suite media object UUID'),
-        400,
-      );
-    }
-    const opened = await resolved.media.open(parsedObjectId.data);
-    if (!opened) {
-      return context.json(apiError('media_not_found', 'Media was not found'), 404);
-    }
+  if (mediaEnabled) {
+    app.on(['GET', 'HEAD'], '/api/v1/media/:id', async (context) => {
+      const parsedObjectId = uuidSchema.safeParse(context.req.param('id'));
+      if (!parsedObjectId.success) {
+        context.header('Cache-Control', 'private, no-store');
+        return context.json(
+          apiError('invalid_media_id', 'id must be a suite media object UUID'),
+          400,
+        );
+      }
+      const opened = await resolved.media.open(parsedObjectId.data);
+      if (!opened) {
+        context.header('Cache-Control', 'private, no-store');
+        return context.json(apiError('media_not_found', 'Media was not found'), 404);
+      }
 
-    context.header('Content-Type', opened.contentType);
-    context.header('ETag', opened.etag);
-    context.header('X-Content-Type-Options', 'nosniff');
-    if (opened.variant === 'original') {
-      context.header('Accept-Ranges', 'bytes');
-    }
+      context.header('Content-Type', opened.contentType);
+      context.header('ETag', opened.etag);
+      context.header('Cache-Control', 'public, no-cache');
+      context.header('X-Content-Type-Options', 'nosniff');
+      if (opened.variant === 'original') {
+        context.header('Accept-Ranges', 'bytes');
+      }
 
-    if (context.req.method === 'HEAD') {
-      context.header('Cache-Control', 'public, max-age=31536000, immutable');
+      if (matchesIfNoneMatch(context.req.header('If-None-Match'), opened.etag)) {
+        await opened.close();
+        return context.body(null, 304);
+      }
+
+      if (context.req.method === 'HEAD') {
+        context.header('Content-Length', String(opened.byteLength));
+        await opened.close();
+        return context.body(null, 200);
+      }
+
+      const requestedRange =
+        opened.variant === 'original' &&
+        (context.req.header('If-Range') === undefined ||
+          context.req.header('If-Range') === opened.etag)
+          ? resolveMediaByteRange(context.req.header('Range'), opened.byteLength)
+          : null;
+      if (requestedRange === 'unsatisfiable') {
+        context.header('Cache-Control', 'private, no-store');
+        context.header('Content-Range', `bytes */${opened.byteLength}`);
+        await opened.close();
+        return context.body(null, 416);
+      }
+      if (requestedRange) {
+        context.header('Content-Length', String(requestedRange.length));
+        context.header(
+          'Content-Range',
+          `bytes ${requestedRange.start}-${requestedRange.end}/${opened.byteLength}`,
+        );
+        return context.body(opened.stream(requestedRange), 206);
+      }
+
       context.header('Content-Length', String(opened.byteLength));
-      await opened.close();
-      return context.body(null, 200);
-    }
-
-    const requestedRange =
-      opened.variant === 'original' &&
-      (context.req.header('If-Range') === undefined ||
-        context.req.header('If-Range') === opened.etag)
-        ? resolveMediaByteRange(context.req.header('Range'), opened.byteLength)
-        : null;
-    if (requestedRange === 'unsatisfiable') {
-      context.header('Cache-Control', 'private, no-store');
-      context.header('Content-Range', `bytes */${opened.byteLength}`);
-      await opened.close();
-      return context.body(null, 416);
-    }
-    if (requestedRange) {
-      context.header('Cache-Control', 'public, max-age=31536000, immutable');
-      context.header('Content-Length', String(requestedRange.length));
-      context.header(
-        'Content-Range',
-        `bytes ${requestedRange.start}-${requestedRange.end}/${opened.byteLength}`,
-      );
-      return context.body(opened.stream(requestedRange), 206);
-    }
-
-    context.header('Cache-Control', 'public, max-age=31536000, immutable');
-    context.header('Content-Length', String(opened.byteLength));
-    return context.body(opened.stream(), 200);
-  });
+      return context.body(opened.stream(), 200);
+    });
+  }
   app.get('/api/v1/messages', async (context) => {
     const parsedChannelId = uuidSchema.safeParse(context.req.query('channel'));
     if (!parsedChannelId.success) {
@@ -467,6 +539,95 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       },
       version: VERSION,
     });
+  });
+  app.get('/api/v1/admin/media-cache/status', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) {
+      return authorization.response;
+    }
+    return context.json(await resolved.mediaCacheAdmin.getStatus());
+  });
+  app.get('/api/v1/admin/media-cache/objects', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) {
+      return authorization.response;
+    }
+    const parsed = mediaCacheObjectListSchema.safeParse(context.req.query());
+    if (!parsed.success) {
+      return context.json(apiError('invalid_media_cache_query', 'Invalid cursor or limit'), 400);
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheAdmin.listObjects({
+          limit: parsed.data.limit,
+          ...(parsed.data.cursor ? { cursor: parsed.data.cursor } : {}),
+        }),
+      );
+    } catch (error) {
+      if (error instanceof RangeError) {
+        return context.json(apiError('invalid_media_cache_query', error.message), 400);
+      }
+      throw error;
+    }
+  });
+  for (const action of ['retry', 'evict'] as const) {
+    app.post(`/api/v1/admin/media-cache/objects/:id/${action}`, async (context) => {
+      const authorization = await authorizeAdmin(context, 'admin:read');
+      if ('response' in authorization) {
+        return authorization.response;
+      }
+      if (authorization.principal.actorType !== 'owner_session') {
+        return context.json(
+          apiError('owner_session_required', 'An owner session is required'),
+          403,
+        );
+      }
+      const id = uuidSchema.safeParse(context.req.param('id'));
+      const body = reasonSchema.safeParse(await context.req.json().catch(() => null));
+      if (!id.success || !body.success) {
+        return context.json(
+          apiError('invalid_media_cache_action', 'A valid object id and reason are required'),
+          400,
+        );
+      }
+      try {
+        const result = await resolved.mediaCacheMutations[action]({
+          initiatorId: authorization.principal.actorId,
+          objectId: id.data,
+          reason: body.data.reason,
+        });
+        return context.json(result, action === 'evict' ? 202 : 200);
+      } catch (error) {
+        return mediaCacheMutationFailure(context, error);
+      }
+    });
+  }
+  app.post('/api/v1/admin/media-cache/reconcile', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) {
+      return authorization.response;
+    }
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const body = mediaCacheReconcileSchema.safeParse(await context.req.json().catch(() => null));
+    if (!body.success) {
+      return context.json(
+        apiError('invalid_media_cache_action', 'A valid reason is required'),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.reconcile({
+          initiatorId: authorization.principal.actorId,
+          reason: body.data.reason,
+        }),
+        202,
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
   });
   app.get('/api/v1/admin/messages/:id/raw', async (context) => {
     const authorization = await authorizeAdmin(context, 'admin:read');
@@ -789,4 +950,56 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
   }
 
   return app;
+}
+
+function matchesIfNoneMatch(header: string | undefined, etag: string): boolean {
+  if (header === undefined) {
+    return false;
+  }
+  const value = header.trim();
+  if (value === '*') {
+    return true;
+  }
+
+  const comparableEtag = etag.startsWith('W/') ? etag.slice(2) : etag;
+  let matched = false;
+  let offset = 0;
+  while (offset < value.length) {
+    while (value[offset] === ' ' || value[offset] === '\t') {
+      offset += 1;
+    }
+    if (value.startsWith('W/', offset)) {
+      offset += 2;
+    }
+    if (value[offset] !== '"') {
+      return false;
+    }
+    const tagStart = offset;
+    offset += 1;
+    while (offset < value.length && value[offset] !== '"') {
+      const code = value.charCodeAt(offset);
+      if (code < 0x21 || code === 0x7f) {
+        return false;
+      }
+      offset += 1;
+    }
+    if (offset >= value.length) {
+      return false;
+    }
+    offset += 1;
+    if (value.slice(tagStart, offset) === comparableEtag) {
+      matched = true;
+    }
+    while (value[offset] === ' ' || value[offset] === '\t') {
+      offset += 1;
+    }
+    if (offset === value.length) {
+      break;
+    }
+    if (value[offset] !== ',') {
+      return false;
+    }
+    offset += 1;
+  }
+  return matched;
 }

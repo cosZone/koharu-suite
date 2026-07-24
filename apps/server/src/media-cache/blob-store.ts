@@ -66,6 +66,11 @@ export interface DiscardPartialLeaseResult {
   removedFiles: number;
 }
 
+export interface StaleMediaLeasePage {
+  leases: MediaBlobLease[];
+  nextCursor: string | null;
+}
+
 export class MediaBlobStoreError extends Error {
   constructor(
     readonly code: string,
@@ -123,7 +128,7 @@ export class LocalMediaBlobStore {
 
   async initialize(): Promise<void> {
     await mkdir(this.#root, { mode: 0o700, recursive: true });
-    this.#root = await realpath(this.#root);
+    await this.#canonicalizeRoot();
     await Promise.all([
       mkdir(join(this.#root, '.tmp'), { mode: 0o700, recursive: true }),
       mkdir(join(this.#root, 'blobs'), { mode: 0o700, recursive: true }),
@@ -131,6 +136,14 @@ export class LocalMediaBlobStore {
     await Promise.all([
       this.#assertDirectoryContained(join(this.#root, '.tmp')),
       this.#assertDirectoryContained(join(this.#root, 'blobs')),
+    ]);
+  }
+
+  async initializeReadOnly(): Promise<void> {
+    await this.#canonicalizeRoot();
+    await Promise.all([
+      this.#assertRequiredDirectoryContained(join(this.#root, '.tmp')),
+      this.#assertRequiredDirectoryContained(join(this.#root, 'blobs')),
     ]);
   }
 
@@ -334,6 +347,57 @@ export class LocalMediaBlobStore {
     return { removedBytes, removedFiles };
   }
 
+  async listStaleLeases(input: {
+    before: Date;
+    cursor?: string;
+    limit: number;
+  }): Promise<StaleMediaLeasePage> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      throw new RangeError('Stale media lease limit must be between 1 and 100');
+    }
+    if (!Number.isFinite(input.before.getTime())) {
+      throw new TypeError('Stale media lease cutoff is invalid');
+    }
+    const temporaryRoot = join(this.#root, '.tmp');
+    await this.#assertRequiredDirectoryContained(temporaryRoot);
+    const leases: MediaBlobLease[] = [];
+    let nextCursor: string | null = null;
+    const plans = (await readdir(temporaryRoot, { withFileTypes: true })).sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+    for (const plan of plans) {
+      if (!plan.isDirectory() || plan.isSymbolicLink()) {
+        throw new MediaBlobIntegrityError('Temporary media cache tree contains an invalid plan');
+      }
+      assertUuid('temporary planId', plan.name);
+      const planDirectory = join(temporaryRoot, plan.name);
+      await this.#assertRequiredDirectoryContained(planDirectory);
+      const tokens = (await readdir(planDirectory, { withFileTypes: true })).sort((left, right) =>
+        left.name.localeCompare(right.name),
+      );
+      for (const token of tokens) {
+        if (!token.isDirectory() || token.isSymbolicLink()) {
+          throw new MediaBlobIntegrityError('Temporary media cache tree contains an invalid lease');
+        }
+        assertUuid('temporary leaseToken', token.name);
+        const cursor = `${plan.name}/${token.name}`;
+        if (input.cursor && cursor <= input.cursor) continue;
+        const metadata = await lstat(join(planDirectory, token.name));
+        if (metadata.mtime >= input.before) continue;
+        if (leases.length === input.limit) {
+          const last = leases.at(-1);
+          if (!last) {
+            throw new MediaBlobIntegrityError('Stale media lease cursor could not be created');
+          }
+          nextCursor = `${last.planId}/${last.leaseToken}`;
+          return { leases, nextCursor };
+        }
+        leases.push({ leaseToken: token.name, planId: plan.name });
+      }
+    }
+    return { leases, nextCursor };
+  }
+
   async openStaged(staged: StagedMediaBlob): Promise<FileHandle> {
     this.#assertOwned(staged);
     const path = this.#stagedPath(staged.lease, staged.objectId);
@@ -352,20 +416,33 @@ export class LocalMediaBlobStore {
     assertBlobIdentity(blob);
     const path = this.#resolveRelativeKey(blob.relativeKey);
     const parent = dirname(path);
-    await this.#assertRequiredDirectoryContained(parent);
+    if (!(await this.#assertDirectoryContained(parent))) {
+      await this.#syncNearestExistingDirectory(parent);
+      return 'absent';
+    }
     let file: FileHandle;
     try {
-      file = await openRegularFile(path, blob.byteLength);
+      file = await openRegularFileForEviction(path);
     } catch (error) {
       if (hasErrorCode(error, 'ENOENT')) {
-        await this.#syncDirectory(parent);
+        await this.#syncNearestExistingDirectory(parent);
         return 'absent';
       }
       throw error;
     }
 
     try {
-      const [openMetadata, pathMetadata] = await Promise.all([file.stat(), lstat(path)]);
+      const openMetadata = await file.stat();
+      const pathMetadata = await lstat(path).catch((error: unknown) => {
+        if (hasErrorCode(error, 'ENOENT')) {
+          return null;
+        }
+        throw error;
+      });
+      if (!pathMetadata) {
+        await this.#syncNearestExistingDirectory(parent);
+        return 'absent';
+      }
       if (
         pathMetadata.isSymbolicLink() ||
         !pathMetadata.isFile() ||
@@ -381,7 +458,7 @@ export class LocalMediaBlobStore {
         }
         result = 'absent';
       });
-      await this.#syncDirectory(parent);
+      await this.#syncNearestExistingDirectory(parent);
       return result;
     } finally {
       await file.close().catch(() => undefined);
@@ -503,6 +580,23 @@ export class LocalMediaBlobStore {
     }
   }
 
+  async #canonicalizeRoot(): Promise<void> {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = await realpath(this.#root);
+    } catch (error) {
+      if (hasErrorCode(error, 'ENOENT') || hasErrorCode(error, 'ENOTDIR')) {
+        throw new MediaBlobIntegrityError('Required media blob store root is missing');
+      }
+      throw error;
+    }
+    const metadata = await lstat(canonicalRoot);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new MediaBlobIntegrityError('Media blob store root is not a directory');
+    }
+    this.#root = canonicalRoot;
+  }
+
   async #assertDirectoryContained(path: string): Promise<boolean> {
     let canonicalPath: string;
     try {
@@ -515,6 +609,10 @@ export class LocalMediaBlobStore {
     }
     if (canonicalPath !== this.#root && !canonicalPath.startsWith(`${this.#root}${sep}`)) {
       throw new MediaBlobIntegrityError('Media blob directory escapes the store root');
+    }
+    const metadata = await lstat(canonicalPath);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new MediaBlobIntegrityError('Media blob directory is not a directory');
     }
     return true;
   }
@@ -541,6 +639,22 @@ export class LocalMediaBlobStore {
     } finally {
       await directory?.close().catch(() => undefined);
     }
+  }
+
+  async #syncNearestExistingDirectory(path: string): Promise<void> {
+    let candidate = path;
+    while (candidate === this.#root || candidate.startsWith(`${this.#root}${sep}`)) {
+      if (await this.#assertDirectoryContained(candidate)) {
+        await this.#syncDirectory(candidate);
+        return;
+      }
+      const parent = dirname(candidate);
+      if (parent === candidate) {
+        break;
+      }
+      candidate = parent;
+    }
+    throw new MediaBlobIntegrityError('Media blob store root became unavailable');
   }
 }
 
@@ -643,6 +757,24 @@ async function openRegularFile(path: string, expectedBytes: number): Promise<Fil
     return file;
   } catch (error) {
     await file.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function openRegularFileForEviction(path: string): Promise<FileHandle> {
+  let file: FileHandle | undefined;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await file.stat();
+    if (!metadata.isFile()) {
+      throw new MediaBlobIntegrityError('Media blob is not a regular file');
+    }
+    return file;
+  } catch (error) {
+    await file?.close().catch(() => undefined);
+    if (hasErrorCode(error, 'ELOOP')) {
+      throw new MediaBlobIntegrityError('Media blob must not be a symbolic link');
+    }
     throw error;
   }
 }

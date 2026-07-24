@@ -7,6 +7,10 @@ import {
 const FIRST_HASH = 'a'.repeat(64);
 const SECOND_HASH = 'b'.repeat(64);
 
+function hashFor(index: number): string {
+  return index.toString(16).padStart(64, '0');
+}
+
 describe('MediaCacheAccessCoalescer', () => {
   it('writes only the newest observed access for each shared blob', async () => {
     let now = new Date('2026-07-24T10:00:00.000Z');
@@ -79,5 +83,43 @@ describe('MediaCacheAccessCoalescer', () => {
 
     expect(write).toHaveBeenCalledTimes(2);
     expect(write).toHaveBeenLastCalledWith([{ observedAt: newer, sha256: FIRST_HASH }]);
+  });
+
+  it('flushes more than 100 shared blobs in stable SHA batches', async () => {
+    const observedAt = new Date('2026-07-24T10:00:00.000Z');
+    const write = vi.fn<MediaCacheAccessWriter['writeAccesses']>(async () => undefined);
+    const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => observedAt);
+    const hashes = Array.from({ length: 205 }, (_, index) => hashFor(204 - index));
+    for (const sha256 of hashes) {
+      coalescer.observe(sha256, observedAt);
+    }
+
+    await coalescer.flush();
+
+    expect(write.mock.calls.map(([batch]) => batch.length)).toEqual([100, 100, 5]);
+    expect(write.mock.calls.flatMap(([batch]) => batch.map((access) => access.sha256))).toEqual(
+      hashes.sort(),
+    );
+  });
+
+  it('retries only the failed and later access batches', async () => {
+    const observedAt = new Date('2026-07-24T10:00:00.000Z');
+    const write = vi
+      .fn<MediaCacheAccessWriter['writeAccesses']>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('second batch unavailable'))
+      .mockResolvedValue(undefined);
+    const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => observedAt);
+    for (let index = 0; index < 150; index += 1) {
+      coalescer.observe(hashFor(index), observedAt);
+    }
+
+    await expect(coalescer.flush()).rejects.toThrow('second batch unavailable');
+    await expect(coalescer.flush()).resolves.toBeUndefined();
+
+    expect(write.mock.calls.map(([batch]) => batch.length)).toEqual([100, 50, 50]);
+    expect(write.mock.calls[2]?.[0].map((access) => access.sha256)).toEqual(
+      Array.from({ length: 50 }, (_, index) => hashFor(index + 100)),
+    );
   });
 });

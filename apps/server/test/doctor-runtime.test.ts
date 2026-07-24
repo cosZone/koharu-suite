@@ -24,6 +24,12 @@ describe('doctor runtime adapters', () => {
           constraintName: 'auth_api_keys_key_unique',
           schemaName: 'public',
         },
+      ])
+      .mockResolvedValueOnce([
+        {
+          indexName: 'auth_api_keys_reference_id_idx',
+          schemaName: 'public',
+        },
       ]);
     const diagnostics = new PostgresDoctorDiagnostics({
       execute,
@@ -38,12 +44,15 @@ describe('doctor runtime adapters', () => {
         'drizzle.__drizzle_migrations',
         'constraint:public.auth_api_keys_key_unique',
         'constraint:public.auth_api_keys_missing_check',
+        'index:public.auth_api_keys_reference_id_idx',
+        'index:public.auth_api_keys_missing_idx',
       ]),
     ).resolves.toEqual([
       'auth_api_keys.permissions',
       'constraint:public.auth_api_keys_missing_check',
+      'index:public.auth_api_keys_missing_idx',
     ]);
-    expect(execute).toHaveBeenCalledTimes(3);
+    expect(execute).toHaveBeenCalledTimes(4);
     for (const [query] of execute.mock.calls) {
       expect(JSON.stringify(query)).not.toContain('auth_api_keys.permissions');
     }
