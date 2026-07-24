@@ -77,6 +77,7 @@ export interface SourceWriteDecision {
 export interface SourceWriteResult extends SourceWriteDecision {
   channelId: string;
   messageId: string;
+  observationId: string;
   revisionId: string | null;
 }
 

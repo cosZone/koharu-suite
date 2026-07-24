@@ -50,7 +50,9 @@ describe('Telegram long polling', () => {
       }),
     };
     const checkpointBatch = vi
-      .fn<(botId: bigint, updates: Update[]) => Promise<bigint | null>>()
+      .fn<
+        (botId: bigint, requestedOffset: bigint | null, updates: Update[]) => Promise<bigint | null>
+      >()
       .mockResolvedValueOnce(1_002n)
       .mockResolvedValue(1_002n);
     const onTelegramSuccess = vi.fn(async () => {});
@@ -76,6 +78,11 @@ describe('Telegram long polling', () => {
     expect(requests[0]).toMatchObject({ offset: 900 });
     expect(requests[1]).toMatchObject({ offset: 1_002 });
     expect(checkpointBatch).toHaveBeenCalledOnce();
+    expect(checkpointBatch).toHaveBeenCalledWith(
+      123_456n,
+      900n,
+      expect.arrayContaining([expect.objectContaining({ update_id: 1_001 })]),
+    );
     expect(onTelegramSuccess).toHaveBeenCalledOnce();
   });
 

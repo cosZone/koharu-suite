@@ -3,6 +3,7 @@ import type { Database } from '../db/client.js';
 import {
   messageMedia,
   messageRevisions,
+  messageSourceMediaObservations,
   messageSourceObservations,
   messages,
   telegramChannels,
@@ -45,6 +46,86 @@ export interface MessageWriter {
 
 type MessageRow = Awaited<ReturnType<PostgresMessageRepository['selectMessages']>>[number];
 type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+type SourceMediaAvailability = typeof messageSourceMediaObservations.$inferInsert.availability;
+
+function sourceMediaAvailability(media: SourceNeutralMedia): SourceMediaAvailability {
+  switch (media.availabilityReason) {
+    case null:
+      return 'available';
+    case 'exceeds_maximum_size':
+    case 'not_included':
+    case 'unavailable':
+      return media.availabilityReason;
+    default:
+      throw new Error('Unsupported source media availability reason');
+  }
+}
+
+function isSafeDesktopSourcePath(path: string): boolean {
+  return (
+    path.length >= 1 &&
+    path.length <= 1_024 &&
+    !path.startsWith('/') &&
+    !path.startsWith('\\') &&
+    !/^[A-Za-z]:/.test(path) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(path) &&
+    !/(^|\/)\.\.?($|\/)/.test(path) &&
+    !path.includes('\\') &&
+    !path.includes('\u0000')
+  );
+}
+
+function sourceMediaObservation(
+  media: SourceNeutralMedia,
+  observation: SourceObservation,
+  observationId: string,
+  position: number,
+): typeof messageSourceMediaObservations.$inferInsert {
+  const availability = sourceMediaAvailability(media);
+  if (observation.kind === 'telegram_bot_update') {
+    if (
+      availability !== 'available' ||
+      media.sourcePath !== null ||
+      !media.telegramFileId ||
+      !media.telegramFileUniqueId
+    ) {
+      throw new Error('Bot source media must contain only available Telegram file locators');
+    }
+    return {
+      availability,
+      desktopSourcePath: null,
+      mediaKind: media.kind,
+      observationId,
+      position,
+      sourceKind: observation.kind,
+      sourceMetadata: media.sourceMetadata,
+      telegramFileId: media.telegramFileId,
+      telegramFileUniqueId: media.telegramFileUniqueId,
+    };
+  }
+
+  if (media.telegramFileId !== null || media.telegramFileUniqueId !== null) {
+    throw new Error('Desktop source media cannot contain Telegram file locators');
+  }
+  if (
+    (availability === 'available' &&
+      (media.sourcePath === null || !isSafeDesktopSourcePath(media.sourcePath))) ||
+    (availability !== 'available' && media.sourcePath !== null)
+  ) {
+    throw new Error('Desktop source media path does not match its availability');
+  }
+  return {
+    availability,
+    desktopSourcePath: media.sourcePath,
+    mediaKind: media.kind,
+    observationId,
+    position,
+    sourceKind: observation.kind,
+    sourceMetadata: media.sourceMetadata,
+    telegramFileId: null,
+    telegramFileUniqueId: null,
+  };
+}
 
 function sourceUrl(username: string | null, telegramMessageId: bigint): string | null {
   return username ? `https://t.me/${username}/${telegramMessageId}` : null;
@@ -339,6 +420,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     const [replayedObservation] = await transaction
       .select({
         channelId: messageSourceObservations.channelId,
+        id: messageSourceObservations.id,
         messageId: messageSourceObservations.messageId,
         resolution: messageSourceObservations.resolution,
         revisionId: messageSourceObservations.revisionId,
@@ -365,6 +447,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
         createdMessage: false,
         createdRevision: false,
         messageId: identity.id,
+        observationId: replayedObservation.id,
         replayed: true,
         resolution: replayedObservation.resolution,
         revisionId: replayedObservation.revisionId,
@@ -452,28 +535,41 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       }
     }
 
-    await transaction.insert(messageSourceObservations).values({
-      channelId: channel.id,
-      contentFingerprint: fingerprint,
-      contentFingerprintVersion: CURRENT_MESSAGE_FINGERPRINT_VERSION,
-      importRunId: observation.kind === 'telegram_desktop_json' ? observation.importRunId : null,
-      messageId: identity.id,
-      observedAt: observation.observedAt,
-      rawJson: observation.raw,
-      resolution,
-      revisionId,
-      sourceMetadata: observation.sourceMetadata,
-      sourceKey: observation.sourceKey,
-      sourceKind: observation.kind,
-      telegramMessageId: snapshot.message.telegramMessageId,
-      telegramUpdateId:
-        observation.kind === 'telegram_bot_update' ? observation.telegramUpdateId : null,
-    });
+    const [insertedObservation] = await transaction
+      .insert(messageSourceObservations)
+      .values({
+        channelId: channel.id,
+        contentFingerprint: fingerprint,
+        contentFingerprintVersion: CURRENT_MESSAGE_FINGERPRINT_VERSION,
+        importRunId: observation.kind === 'telegram_desktop_json' ? observation.importRunId : null,
+        messageId: identity.id,
+        observedAt: observation.observedAt,
+        rawJson: observation.raw,
+        resolution,
+        revisionId,
+        sourceMetadata: observation.sourceMetadata,
+        sourceKey: observation.sourceKey,
+        sourceKind: observation.kind,
+        telegramMessageId: snapshot.message.telegramMessageId,
+        telegramUpdateId:
+          observation.kind === 'telegram_bot_update' ? observation.telegramUpdateId : null,
+      })
+      .returning({ id: messageSourceObservations.id });
+    if (!insertedObservation) {
+      throw new Error('Failed to create source observation');
+    }
+    await this.insertSourceMediaObservations(
+      transaction,
+      insertedObservation.id,
+      snapshot.media,
+      observation,
+    );
     return {
       channelId: channel.id,
       createdMessage: insertedMessage !== undefined,
       createdRevision,
       messageId: identity.id,
+      observationId: insertedObservation.id,
       replayed: false,
       resolution,
       revisionId,
@@ -617,6 +713,25 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     }
 
     return revision.id;
+  }
+
+  private async insertSourceMediaObservations(
+    transaction: DatabaseTransaction,
+    observationId: string,
+    mediaItems: SourceNeutralMedia[],
+    observation: SourceObservation,
+  ): Promise<void> {
+    if (mediaItems.length === 0) {
+      return;
+    }
+
+    await transaction
+      .insert(messageSourceMediaObservations)
+      .values(
+        mediaItems.map((media, position) =>
+          sourceMediaObservation(media, observation, observationId, position),
+        ),
+      );
   }
 
   private async selectCurrentRevision(

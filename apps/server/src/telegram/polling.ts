@@ -6,6 +6,7 @@ export interface TelegramInbox {
   bindBot(botId: bigint): Promise<bigint | null>;
   checkpointBatch(
     botId: bigint,
+    requestedOffset: bigint | null,
     updates: Awaited<ReturnType<TelegramApi['getUpdates']>>,
   ): Promise<bigint | null>;
 }
@@ -114,10 +115,11 @@ export class TelegramPoller {
 
     while (!signal.aborted) {
       await this.options.inbox.assertPollerLock();
+      const requestedOffset = this.offset;
       const request =
-        this.offset === null
+        requestedOffset === null
           ? TELEGRAM_POLLING_OPTIONS
-          : { ...TELEGRAM_POLLING_OPTIONS, offset: Number(this.offset) };
+          : { ...TELEGRAM_POLLING_OPTIONS, offset: Number(requestedOffset) };
       const updates = await this.requestWithRetry(
         () => this.options.api.getUpdates(request, signal),
         signal,
@@ -127,7 +129,7 @@ export class TelegramPoller {
       }
       await this.options.onTelegramSuccess?.();
       await this.options.inbox.assertPollerLock();
-      this.offset = await this.options.inbox.checkpointBatch(botId, updates);
+      this.offset = await this.options.inbox.checkpointBatch(botId, requestedOffset, updates);
     }
   }
 
