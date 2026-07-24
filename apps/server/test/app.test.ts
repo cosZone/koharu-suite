@@ -6,6 +6,7 @@ import { type AppDependencies, createApp } from '../src/app.js';
 import type { AdminPrincipal, RuntimeAuth } from '../src/auth/runtime-auth.js';
 import { encodeMessageCursor } from '../src/http/cursor.js';
 import type { MessageReader, PublicMessage } from '../src/messages/types.js';
+import { VERSION } from '../src/version.js';
 import { channelPostFixture } from './fixtures/telegram.js';
 
 const CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
@@ -104,7 +105,7 @@ describe('health endpoints', () => {
     await expect(response.json()).resolves.toMatchObject({
       service: 'koharu-suite',
       status: 'ok',
-      version: '0.1.0',
+      version: VERSION,
     });
   });
 
@@ -381,7 +382,7 @@ describe('owner admin endpoints', () => {
         email: 'owner@example.com',
         twoFactorEnabled: true,
       },
-      version: '0.1.0',
+      version: VERSION,
     });
 
     const invalid = await app.request('/api/v1/admin/messages/not-a-uuid/raw');
