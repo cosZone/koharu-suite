@@ -8,11 +8,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -20,6 +22,7 @@ import {
 } from '../../src/db/schema.js';
 import { LocalMediaBlobStore } from '../../src/media-cache/blob-store.js';
 import { MediaCacheMaintenanceService } from '../../src/media-cache/maintenance-service.js';
+import { StorageLedgerRepository } from '../../src/media-cache/storage-ledger-repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 
@@ -154,6 +157,8 @@ describe('PostgreSQL and filesystem media cache maintenance', () => {
     if (!connection) throw new Error('Database connection was not created');
     await connection.db.execute(sql`
       truncate table
+        ${mediaBlobLocations},
+        ${mediaStorageBackends},
         ${mediaCacheActions},
         ${mediaCacheObjects},
         ${mediaCacheBlobs},
@@ -221,8 +226,64 @@ describe('PostgreSQL and filesystem media cache maintenance', () => {
     ).toEqual([{ state: 'evicted' }, { state: 'evicted' }, { state: 'ready' }]);
   });
 
+  it('self-heals the local location state and backend byte ledger during applied reconcile', async () => {
+    if (!connection || !store || !root) {
+      throw new Error('Maintenance fixture was not initialized');
+    }
+    const bytes = Uint8Array.from({ length: 64 }, () => 7);
+    const fixture = await insertReadyFixture(connection, {
+      bytes,
+      lastAccessedAt: new Date('2026-07-24T01:00:00.000Z'),
+      mode: 'present',
+    });
+    await connection.db.insert(mediaCacheRuntime).values({ readyBytes: BigInt(bytes.byteLength) });
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * 1024n * 1024n, root },
+    });
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        state: 'corrupt',
+        verifiedAt: null,
+        verifiedByteLength: null,
+        verifiedSha256: null,
+      })
+      .where(eq(mediaBlobLocations.blobSha256, fixture.sha256));
+    await connection.db
+      .update(mediaStorageBackends)
+      .set({ readyBytes: 0n })
+      .where(eq(mediaStorageBackends.id, 'local'));
+
+    const service = new MediaCacheMaintenanceService(connection.db, store, 'maintenance-test');
+    await service.reconcile({
+      apply: true,
+      initiator: {
+        id: 'local-cli',
+        kind: 'local_operator',
+        reason: 'repair local location drift',
+      },
+    });
+
+    const [reconciled] = await connection.db
+      .select({
+        readyBytes: mediaStorageBackends.readyBytes,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+        verifiedSha256: mediaBlobLocations.verifiedSha256,
+      })
+      .from(mediaBlobLocations)
+      .innerJoin(mediaStorageBackends, eq(mediaStorageBackends.id, mediaBlobLocations.backendId))
+      .where(eq(mediaBlobLocations.blobSha256, fixture.sha256));
+    expect(reconciled).toEqual({
+      readyBytes: 64n,
+      state: 'ready',
+      verifiedByteLength: 64n,
+      verifiedSha256: fixture.sha256,
+    });
+  });
+
   it('detects missing and checksum-mismatched blobs and repairs them without exposing identity', async () => {
-    if (!connection || !store) throw new Error('Maintenance fixture was not initialized');
+    if (!connection || !store || !root) throw new Error('Maintenance fixture was not initialized');
     await insertReadyFixture(connection, {
       bytes: Uint8Array.from({ length: 64 }, () => 1),
       lastAccessedAt: new Date('2026-07-24T01:00:00.000Z'),
@@ -244,6 +305,9 @@ describe('PostgreSQL and filesystem media cache maintenance', () => {
       mode: 'wrong_size',
     });
     await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 999n, reservedBytes: 7n });
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * 1024n * 1024n, root },
+    });
     const service = new MediaCacheMaintenanceService(connection.db, store, 'maintenance-test');
     const initiator = {
       id: 'owner-user',
@@ -312,6 +376,28 @@ describe('PostgreSQL and filesystem media cache maintenance', () => {
       .where(eq(mediaCacheRuntime.singletonKey, 'local'));
     expect(runtime?.readyBytes).toBe(64n);
     expect(runtime?.lastReconciledAt).toBeInstanceOf(Date);
+    const repairedLocations = await connection.db
+      .select({
+        readyBytes: mediaStorageBackends.readyBytes,
+        sha256: mediaBlobLocations.blobSha256,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .innerJoin(mediaStorageBackends, eq(mediaStorageBackends.id, mediaBlobLocations.backendId))
+      .where(
+        inArray(mediaBlobLocations.blobSha256, [missing.sha256, corrupt.sha256, wrongSize.sha256]),
+      );
+    expect(repairedLocations).toEqual(
+      expect.arrayContaining(
+        [missing.sha256, corrupt.sha256, wrongSize.sha256].map((sha256) => ({
+          readyBytes: 64n,
+          sha256,
+          state: 'evicted',
+          verifiedByteLength: null,
+        })),
+      ),
+    );
   });
 
   it('continues after 100 blobs with an opaque object cursor and only marks a full pass complete', async () => {

@@ -4,11 +4,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaBlobLocations,
   mediaCacheBlobs,
   mediaCacheCommands,
+  mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -109,7 +112,11 @@ async function insertObjectFixture(
     })
     .returning({ id: mediaCacheObjects.id });
   if (!object) throw new Error('Fixture object was not created');
-  return { objectId: object.id, planId: plan.id };
+  return {
+    blobSha256: input.state === 'ready' ? sha256 : null,
+    objectId: object.id,
+    planId: plan.id,
+  };
 }
 
 describe('PostgreSQL media cache admin repository', () => {
@@ -132,6 +139,7 @@ describe('PostgreSQL media cache admin repository', () => {
         ${mediaCacheBlobs},
         ${mediaCachePostPlans},
         ${mediaCacheRuntime},
+        ${mediaStorageBackends},
         ${telegramChannels}
       cascade
     `);
@@ -145,6 +153,7 @@ describe('PostgreSQL media cache admin repository', () => {
     });
 
     await expect(repository.getStatus()).resolves.toEqual({
+      backends: [],
       commands: [],
       enabled: false,
       failures: [],
@@ -174,6 +183,62 @@ describe('PostgreSQL media cache admin repository', () => {
       reservedBytes: 64n,
       updatedAt,
     });
+    await connection.db.insert(mediaStorageBackends).values([
+      {
+        configFingerprint: 'a'.repeat(64),
+        id: 'local',
+        kind: 'local',
+        label: 'Local cache',
+        maxBytes: 1_024n,
+        readyBytes: 128n,
+        updatedAt,
+      },
+      {
+        configFingerprint: 'b'.repeat(64),
+        id: 's3-default',
+        kind: 's3',
+        label: 'S3 durable cache',
+        maxBytes: 4_096n,
+        readPriority: 200,
+        readyBytes: 0n,
+        updatedAt,
+        writePriority: 50,
+      },
+    ]);
+    if (!ready.blobSha256) throw new Error('Expected a ready blob');
+    await connection.db.insert(mediaBlobLocations).values({
+      backendId: 'local',
+      blobSha256: ready.blobSha256,
+      lastAccessedAt: updatedAt,
+      providerEtag: 'private-provider-etag',
+      providerVersionId: 'private-provider-version',
+      providerChecksumSha256: 'private-provider-checksum',
+      state: 'ready',
+      storageKey: `blobs/${ready.blobSha256.slice(0, 2)}/${ready.blobSha256.slice(2, 4)}/${ready.blobSha256}`,
+      updatedAt,
+      verifiedAt: updatedAt,
+      verifiedByteLength: 128n,
+      verifiedSha256: ready.blobSha256,
+    });
+    await connection.db.insert(mediaCacheObjectProtections).values([
+      {
+        objectId: ready.objectId,
+        ownerId: 'private-owner-id',
+        ownerKind: 'owner_session',
+        protectedAt: new Date('2026-07-24T07:00:00.000Z'),
+        reason: 'private active reason',
+        updatedAt,
+      },
+      {
+        expiresAt: new Date('2026-07-24T07:30:00.000Z'),
+        objectId: blocked.objectId,
+        ownerId: 'private-expired-owner-id',
+        ownerKind: 'local_operator',
+        protectedAt: new Date('2026-07-24T07:00:00.000Z'),
+        reason: 'private expired reason',
+        updatedAt,
+      },
+    ]);
     await connection.db.insert(mediaCacheCommands).values({
       completedAt: updatedAt,
       initiatorId: 'owner-user-id',
@@ -183,6 +248,15 @@ describe('PostgreSQL media cache admin repository', () => {
       state: 'succeeded',
       updatedAt,
     });
+    await connection.db.insert(mediaCacheCommands).values({
+      initiatorId: 'owner-user-id',
+      operation: 'prune',
+      reason: 'verify storage prune',
+      state: 'pending',
+      targetBackendId: 's3-default',
+      targetBytes: 512n,
+      updatedAt: new Date('2026-07-24T08:00:01.000Z'),
+    });
     const repository = new PostgresMediaCacheAdminRepository(connection.db, {
       enabled: true,
       maxBytes: MAX_BYTES,
@@ -190,13 +264,41 @@ describe('PostgreSQL media cache admin repository', () => {
 
     const status = await repository.getStatus();
     expect(status).toMatchObject({
-      commands: [
+      backends: [
         {
-          operation: 'reconcile',
-          result: { checked: 2, pages: 1 },
-          state: 'succeeded',
+          id: 'local',
+          kind: 'local',
+          label: 'Local cache',
+          locationStateCounts: [{ count: 1, state: 'ready' }],
+          maxBytes: '1024',
+          readyBytes: '128',
+        },
+        {
+          id: 's3-default',
+          kind: 's3',
+          label: 'S3 durable cache',
+          locationStateCounts: [],
+          maxBytes: '4096',
+          readyBytes: '0',
         },
       ],
+      commands: expect.arrayContaining([
+        expect.objectContaining({
+          operation: 'reconcile',
+          result: { checked: 2, pages: 1 },
+          sourceBackendId: null,
+          state: 'succeeded',
+          targetBackendId: null,
+          targetBytes: null,
+        }),
+        expect.objectContaining({
+          operation: 'prune',
+          sourceBackendId: null,
+          state: 'pending',
+          targetBackendId: 's3-default',
+          targetBytes: '512',
+        }),
+      ]),
       enabled: true,
       failures: [
         {
@@ -228,6 +330,8 @@ describe('PostgreSQL media cache admin repository', () => {
     expect(JSON.stringify(status)).not.toContain('blobs/');
     expect(JSON.stringify(status)).not.toContain('/private/cache/root');
     expect(JSON.stringify(status)).not.toContain('0000000000000000');
+    expect(JSON.stringify(status)).not.toContain('aaaaaaaaaaaaaaaa');
+    expect(JSON.stringify(status)).not.toContain('bbbbbbbbbbbbbbbb');
 
     const first = await repository.listObjects({ limit: 1 });
     expect(first.items).toHaveLength(1);
@@ -242,8 +346,39 @@ describe('PostgreSQL media cache admin repository', () => {
     expect(new Set([...first.items, ...second.items].map((item) => item.id))).toEqual(
       new Set([ready.objectId, blocked.objectId]),
     );
-    expect(JSON.stringify([...first.items, ...second.items])).not.toContain('private-file-id');
-    expect(JSON.stringify([...first.items, ...second.items])).not.toContain('blobs/');
+    const objects = [...first.items, ...second.items];
+    expect(objects.find((item) => item.id === ready.objectId)).toMatchObject({
+      evictedPolicy: 'recache_on_access',
+      locations: [
+        {
+          backendId: 'local',
+          state: 'ready',
+          verifiedBytes: '128',
+        },
+      ],
+      protection: {
+        active: true,
+        expired: false,
+        expiresAt: null,
+      },
+    });
+    expect(objects.find((item) => item.id === blocked.objectId)).toMatchObject({
+      evictedPolicy: 'recache_on_access',
+      locations: [],
+      protection: {
+        active: false,
+        expired: true,
+        expiresAt: '2026-07-24T07:30:00.000Z',
+      },
+    });
+    const serializedObjects = JSON.stringify(objects);
+    expect(serializedObjects).not.toContain('private-file-id');
+    expect(serializedObjects).not.toContain('blobs/');
+    expect(serializedObjects).not.toContain(ready.blobSha256);
+    expect(serializedObjects).not.toContain('private-provider');
+    expect(serializedObjects).not.toContain('private-owner');
+    expect(serializedObjects).not.toContain('private active reason');
+    expect(serializedObjects).not.toContain('private expired reason');
   });
 
   it('rejects malformed cursors and unbounded limits', async () => {

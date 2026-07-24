@@ -44,6 +44,8 @@ const postgresEnvironmentSchema = z.object({
   POSTGRES_USER: z.string().min(1),
 });
 const MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+const MEDIA_S3_DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+const MEDIA_S3_MAX_BYTES = 5 * 1024 * 1024 * 1024 * 1024;
 const mediaCacheEnvironmentSchema = z.object({
   MEDIA_CACHE_DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
   MEDIA_CACHE_ENABLED: z
@@ -57,6 +59,34 @@ const mediaCacheEnvironmentSchema = z.object({
     .max(MEDIA_CACHE_MAX_BYTES)
     .default(MEDIA_CACHE_MAX_BYTES),
   MEDIA_CACHE_ROOT: z.string().trim().min(1).default('/var/lib/koharu/media-cache'),
+});
+const optionalTrimmedString = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.string().trim().min(1).optional(),
+);
+const mediaS3EnvironmentSchema = z.object({
+  S3_ALLOW_INSECURE: z
+    .enum(['false', 'true'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  S3_BUCKET: optionalTrimmedString,
+  S3_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(250).max(30_000).default(5_000),
+  S3_ENDPOINT: optionalTrimmedString,
+  S3_FORCE_PATH_STYLE: z
+    .enum(['false', 'true'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  S3_KEY: optionalTrimmedString,
+  S3_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(MEDIA_S3_MAX_BYTES)
+    .default(MEDIA_S3_DEFAULT_MAX_BYTES),
+  S3_PREFIX: z.string().trim().default('koharu/media-cache'),
+  S3_REGION: z.string().trim().min(1).max(255).default('us-east-1'),
+  S3_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
+  S3_SECRET: optionalTrimmedString,
 });
 
 function databaseUrlFromEnvironment(environment: NodeJS.ProcessEnv): string {
@@ -113,6 +143,22 @@ export interface MediaCacheConfig {
   maxBytes: number;
   root: string;
 }
+
+export type MediaS3Config =
+  | { enabled: false }
+  | {
+      accessKeyId: string;
+      bucket: string;
+      connectTimeoutMs: number;
+      enabled: true;
+      endpoint: string;
+      forcePathStyle: boolean;
+      maxBytes: number;
+      prefix: string;
+      region: string;
+      requestTimeoutMs: number;
+      secretAccessKey: string;
+    };
 
 function parseAuthBaseUrl(value: string): string {
   const url = new URL(value);
@@ -172,6 +218,96 @@ export function resolveMediaCacheConfig(
     maxBytes: parsed.MEDIA_CACHE_MAX_BYTES,
     root: normalize(parsed.MEDIA_CACHE_ROOT),
   };
+}
+
+export function resolveMediaS3Config(environment: NodeJS.ProcessEnv = process.env): MediaS3Config {
+  const coreNames = ['S3_ENDPOINT', 'S3_KEY', 'S3_SECRET', 'S3_BUCKET'] as const;
+  if (coreNames.every((name) => !hasEnvironmentValue(environment[name]))) {
+    return { enabled: false };
+  }
+  const parsed = mediaS3EnvironmentSchema.parse(environment);
+  const required = [
+    ['S3_ENDPOINT', parsed.S3_ENDPOINT],
+    ['S3_KEY', parsed.S3_KEY],
+    ['S3_SECRET', parsed.S3_SECRET],
+    ['S3_BUCKET', parsed.S3_BUCKET],
+  ] as const;
+  const configured = required.filter(([, value]) => value !== undefined);
+  if (configured.length === 0) {
+    return { enabled: false };
+  }
+  if (configured.length !== required.length) {
+    const missing = required
+      .filter(([, value]) => value === undefined)
+      .map(([name]) => name)
+      .join(', ');
+    throw new Error(`S3 storage configuration is incomplete; missing ${missing}`);
+  }
+
+  const endpoint = parseS3Endpoint(parsed.S3_ENDPOINT as string, parsed.S3_ALLOW_INSECURE);
+  const prefix = parseS3Prefix(parsed.S3_PREFIX);
+  const bucket = parsed.S3_BUCKET as string;
+  if (bucket.length > 255 || bucket.includes('/') || bucket.includes('\\')) {
+    throw new Error('S3_BUCKET must be a bucket name without path separators');
+  }
+  return {
+    accessKeyId: parsed.S3_KEY as string,
+    bucket,
+    connectTimeoutMs: parsed.S3_CONNECT_TIMEOUT_MS,
+    enabled: true,
+    endpoint,
+    forcePathStyle: parsed.S3_FORCE_PATH_STYLE,
+    maxBytes: parsed.S3_MAX_BYTES,
+    prefix,
+    region: parsed.S3_REGION,
+    requestTimeoutMs: parsed.S3_REQUEST_TIMEOUT_MS,
+    secretAccessKey: parsed.S3_SECRET as string,
+  };
+}
+
+function parseS3Endpoint(value: string, allowInsecure: boolean): string {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new Error('S3_ENDPOINT must be a valid HTTP or HTTPS origin');
+  }
+  if (endpoint.protocol !== 'https:' && endpoint.protocol !== 'http:') {
+    throw new Error('S3_ENDPOINT must use HTTP or HTTPS');
+  }
+  if (
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.search ||
+    endpoint.hash ||
+    (endpoint.pathname !== '/' && endpoint.pathname !== '')
+  ) {
+    throw new Error('S3_ENDPOINT must be a canonical origin without credentials or a path');
+  }
+  if (endpoint.protocol === 'http:' && !allowInsecure) {
+    throw new Error('HTTP S3_ENDPOINT requires S3_ALLOW_INSECURE=true');
+  }
+  return endpoint.origin;
+}
+
+function hasEnvironmentValue(value: string | undefined): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function parseS3Prefix(value: string): string {
+  const prefix = value.replace(/^\/+|\/+$/gu, '');
+  const segments = prefix.split('/');
+  if (
+    !prefix ||
+    prefix.length > 512 ||
+    segments.some(
+      (segment) =>
+        !segment || segment === '.' || segment === '..' || !/^[A-Za-z0-9!_.*'()-]+$/u.test(segment),
+    )
+  ) {
+    throw new Error('S3_PREFIX must be a safe relative object-key prefix');
+  }
+  return prefix;
 }
 
 export function resolveTelegramConfig(

@@ -5,18 +5,35 @@ import { PostgresAdminOperations } from './admin/operations.js';
 import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
 import { BetterAuthRuntime } from './auth/runtime-auth.js';
-import type { AuthConfig, MediaCacheConfig, PublicApiConfig, TelegramConfig } from './config.js';
-import { createDatabaseConnection } from './db/client.js';
+import type {
+  AuthConfig,
+  MediaCacheConfig,
+  MediaS3Config,
+  PublicApiConfig,
+  TelegramConfig,
+} from './config.js';
+import { createDatabaseConnection, type Database } from './db/client.js';
 import { MediaCacheAccessCoalescer } from './media-cache/access-coalescer.js';
 import { PostgresMediaCacheAdminRepository } from './media-cache/admin-repository.js';
 import { PostgresMediaCacheAdminService } from './media-cache/admin-service.js';
+import {
+  BackendAwareCommittedBlobReader,
+  PostgresCommittedBlobLocationRepository,
+} from './media-cache/backend-aware-reader.js';
 import { LocalMediaBlobStore } from './media-cache/blob-store.js';
+import { PostgresMediaCacheCommandQueue } from './media-cache/command-queue.js';
 import { createPostgresMediaCacheAccessWriter } from './media-cache/eviction-repository.js';
 import {
   LocalPublicMediaReader,
   PostgresPublicMediaObjectRepository,
 } from './media-cache/public-reader.js';
-import { createMediaCacheWorkerRuntime } from './media-cache/runtime.js';
+import { DurableMediaRecacheObserver } from './media-cache/recache-on-access.js';
+import {
+  createMediaCacheWorkerRuntime,
+  createPersistentBlobBackendRegistry,
+} from './media-cache/runtime.js';
+import { StorageLedgerRepository } from './media-cache/storage-ledger-repository.js';
+import { PostgresStoragePruneService } from './media-cache/storage-prune-service.js';
 import { PostgresMessageRepository } from './messages/repository.js';
 import { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
 import { DeterministicRepairService } from './reconciliation/repair.js';
@@ -46,6 +63,7 @@ export interface ServerRuntimeConfig {
   auth: AuthConfig;
   databaseUrl: string;
   mediaCache: MediaCacheConfig;
+  mediaS3: MediaS3Config;
   port: number;
   publicApi: PublicApiConfig;
 }
@@ -54,6 +72,7 @@ export interface WorkerRuntimeConfig extends TelegramConfig {
   databaseUrl: string;
   instanceId: string;
   mediaCache: MediaCacheConfig;
+  mediaS3: MediaS3Config;
 }
 
 interface RuntimePoller {
@@ -375,12 +394,21 @@ export class WorkerRuntime implements StoppableRuntime {
 }
 
 export async function startServerRuntime(config: ServerRuntimeConfig): Promise<ServerRuntime> {
+  assertS3RequiresMediaCache(config.mediaCache, config.mediaS3);
   const blobStore = config.mediaCache.enabled
     ? new LocalMediaBlobStore(config.mediaCache.root)
     : undefined;
   await blobStore?.initializeReadOnly();
 
   const mainConnection = createDatabaseConnection(config.databaseUrl);
+  try {
+    if (config.mediaCache.enabled) {
+      await bootstrapStorageLedger(mainConnection.db, config.mediaCache, config.mediaS3);
+    }
+  } catch (error) {
+    await mainConnection.close().catch(() => undefined);
+    throw error;
+  }
   const repository = new PostgresMessageRepository(mainConnection.db, {
     mediaCacheEnabled: config.mediaCache.enabled,
   });
@@ -392,21 +420,36 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
     enabled: config.mediaCache.enabled,
     maxBytes: config.mediaCache.maxBytes,
   });
-  const mediaCacheMutations = blobStore
-    ? new PostgresMediaCacheAdminService(mainConnection.db)
-    : undefined;
 
   try {
+    const persistentBackends = blobStore
+      ? createPersistentBlobBackendRegistry(blobStore, config.mediaS3)
+      : undefined;
+    const mediaCacheMutations = persistentBackends
+      ? new PostgresMediaCacheAdminService(mainConnection.db, {
+          storagePrune: new PostgresStoragePruneService(mainConnection.db, persistentBackends),
+        })
+      : undefined;
+    const committedBlobReader = persistentBackends
+      ? new BackendAwareCommittedBlobReader(
+          new PostgresCommittedBlobLocationRepository(mainConnection.db),
+          persistentBackends,
+        )
+      : undefined;
+    const mediaRecache = committedBlobReader
+      ? new DurableMediaRecacheObserver(new PostgresMediaCacheCommandQueue(mainConnection.db))
+      : undefined;
     const app = createApp({
       admin: new PostgresAdminRepository(mainConnection.db),
       adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
       auth: new BetterAuthRuntime(mainConnection.db, config.auth),
-      ...(blobStore && accessCoalescer
+      ...(committedBlobReader && accessCoalescer
         ? {
             media: new LocalPublicMediaReader(
               new PostgresPublicMediaObjectRepository(mainConnection.db),
-              blobStore,
+              committedBlobReader,
               accessCoalescer,
+              mediaRecache,
             ),
           }
         : {}),
@@ -446,6 +489,7 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
 }
 
 export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime {
+  assertS3RequiresMediaCache(config.mediaCache, config.mediaS3);
   const mainConnection = createDatabaseConnection(config.databaseUrl);
   const repository = new PostgresMessageRepository(mainConnection.db);
   const heartbeat = new PostgresWorkerRuntimeRepository(mainConnection.db);
@@ -480,6 +524,7 @@ export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime 
         config: config.mediaCache,
         database: mainConnection.db,
         leaseOwner: config.instanceId,
+        mediaS3: config.mediaS3,
         telegramApi: api,
       })
     : undefined;
@@ -493,5 +538,36 @@ export function createWorkerRuntime(config: WorkerRuntimeConfig): WorkerRuntime 
     reconciliationRunner,
     reconciliationSchedule,
     workers,
+  });
+}
+
+function assertS3RequiresMediaCache(mediaCache: MediaCacheConfig, mediaS3: MediaS3Config): void {
+  if (mediaS3.enabled && !mediaCache.enabled) {
+    throw new Error('S3 storage requires MEDIA_CACHE_ENABLED=true');
+  }
+}
+
+function bootstrapStorageLedger(
+  database: Database,
+  mediaCache: MediaCacheConfig,
+  mediaS3: MediaS3Config,
+) {
+  return new StorageLedgerRepository(database).bootstrap({
+    local: {
+      maxBytes: BigInt(mediaCache.maxBytes),
+      root: mediaCache.root,
+    },
+    ...(mediaS3.enabled
+      ? {
+          s3: {
+            bucket: mediaS3.bucket,
+            endpointOrigin: mediaS3.endpoint,
+            forcePathStyle: mediaS3.forcePathStyle,
+            maxBytes: BigInt(mediaS3.maxBytes),
+            prefix: mediaS3.prefix,
+            region: mediaS3.region,
+          },
+        }
+      : {}),
   });
 }

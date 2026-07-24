@@ -1,8 +1,23 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { mediaCacheActions, mediaCacheObjects, mediaCachePostPlans } from '../db/schema.js';
+import {
+  mediaCacheActions,
+  mediaCacheObjects,
+  mediaCachePostPlans,
+  mediaStorageBackends,
+} from '../db/schema.js';
 import { type MediaCacheCommandReceipt, PostgresMediaCacheCommandQueue } from './command-queue.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import {
+  type MediaCacheEvictedPolicy,
+  type MediaCacheEvictedPolicyMutationResult,
+  MediaCacheObjectPolicyConflictError,
+  MediaCacheObjectPolicyInputError,
+  MediaCacheObjectPolicyNotFoundError,
+  type MediaCacheProtectionMutationResult,
+  PostgresMediaCacheObjectPolicyService,
+} from './object-policy-service.js';
+import type { PostgresStoragePruneService, StoragePrunePreview } from './storage-prune-service.js';
 
 const RETRYABLE_TERMINAL_STATES = [
   'blocked',
@@ -11,6 +26,8 @@ const RETRYABLE_TERMINAL_STATES = [
   'missing',
   'skipped',
 ] as const;
+const MAX_STORAGE_TARGET_BYTES = 5n * 1024n * 1024n * 1024n * 1024n;
+const STORAGE_BACKEND_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
 
 type MediaCacheTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 
@@ -25,6 +42,36 @@ export interface MediaCacheAdminReconcileInput {
   reason: string;
 }
 
+export interface MediaCacheAdminProtectInput extends MediaCacheAdminMutationInput {
+  expiresAt?: Date;
+}
+
+export interface MediaCacheAdminPolicyInput extends MediaCacheAdminMutationInput {
+  policy: MediaCacheEvictedPolicy;
+}
+
+export interface MediaCacheAdminMigrateInput {
+  initiatorId: string;
+  objectId?: string;
+  reason: string;
+  sourceBackendId: string;
+  targetBackendId: string;
+}
+
+export interface MediaCacheAdminRestoreInput extends MediaCacheAdminMutationInput {
+  targetBackendId: string;
+}
+
+export interface MediaCacheAdminPrunePreviewInput {
+  targetBackendId: string;
+  targetBytes: bigint;
+}
+
+export interface MediaCacheAdminPruneInput extends MediaCacheAdminPrunePreviewInput {
+  initiatorId: string;
+  reason: string;
+}
+
 export interface MediaCacheAdminRetryResult {
   objectIds: string[];
   planId: string;
@@ -34,8 +81,17 @@ export interface MediaCacheAdminRetryResult {
 
 export interface MediaCacheAdminMutations {
   evict(input: MediaCacheAdminMutationInput): Promise<MediaCacheCommandReceipt>;
+  migrate(input: MediaCacheAdminMigrateInput): Promise<MediaCacheCommandReceipt>;
+  previewPrune(input: MediaCacheAdminPrunePreviewInput): Promise<StoragePrunePreview>;
+  protect(input: MediaCacheAdminProtectInput): Promise<MediaCacheProtectionMutationResult>;
+  prune(input: MediaCacheAdminPruneInput): Promise<MediaCacheCommandReceipt>;
   reconcile(input: MediaCacheAdminReconcileInput): Promise<MediaCacheCommandReceipt>;
+  restore(input: MediaCacheAdminRestoreInput): Promise<MediaCacheCommandReceipt>;
   retry(input: MediaCacheAdminMutationInput): Promise<MediaCacheAdminRetryResult>;
+  setEvictedPolicy(
+    input: MediaCacheAdminPolicyInput,
+  ): Promise<MediaCacheEvictedPolicyMutationResult>;
+  unprotect(input: MediaCacheAdminMutationInput): Promise<MediaCacheProtectionMutationResult>;
 }
 
 export class MediaCacheAdminNotFoundError extends Error {
@@ -59,14 +115,136 @@ export class MediaCacheAdminNotSupportedError extends MediaCacheAdminConflictErr
   }
 }
 
+export interface MediaCacheAdminServiceDependencies {
+  commands?: PostgresMediaCacheCommandQueue;
+  objectPolicies?: PostgresMediaCacheObjectPolicyService;
+  storagePrune?: PostgresStoragePruneService;
+}
+
 export class PostgresMediaCacheAdminService implements MediaCacheAdminMutations {
   private readonly commands: PostgresMediaCacheCommandQueue;
+  private readonly objectPolicies: PostgresMediaCacheObjectPolicyService;
+  private readonly storagePrune: PostgresStoragePruneService | undefined;
 
   constructor(
     private readonly database: Database,
-    commands = new PostgresMediaCacheCommandQueue(database),
+    dependencies: MediaCacheAdminServiceDependencies = {},
   ) {
-    this.commands = commands;
+    this.commands = dependencies.commands ?? new PostgresMediaCacheCommandQueue(database);
+    this.objectPolicies =
+      dependencies.objectPolicies ?? new PostgresMediaCacheObjectPolicyService(database);
+    this.storagePrune = dependencies.storagePrune;
+  }
+
+  async protect(input: MediaCacheAdminProtectInput): Promise<MediaCacheProtectionMutationResult> {
+    assertMutationInput(input);
+    try {
+      return await this.objectPolicies.protect({
+        ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+        initiator: ownerPolicyInitiator(input),
+        objectId: input.objectId,
+      });
+    } catch (error) {
+      throw mapPolicyError(error);
+    }
+  }
+
+  async unprotect(
+    input: MediaCacheAdminMutationInput,
+  ): Promise<MediaCacheProtectionMutationResult> {
+    assertMutationInput(input);
+    try {
+      return await this.objectPolicies.unprotect({
+        initiator: ownerPolicyInitiator(input),
+        objectId: input.objectId,
+      });
+    } catch (error) {
+      throw mapPolicyError(error);
+    }
+  }
+
+  async setEvictedPolicy(
+    input: MediaCacheAdminPolicyInput,
+  ): Promise<MediaCacheEvictedPolicyMutationResult> {
+    assertMutationInput(input);
+    try {
+      return await this.objectPolicies.setEvictedPolicy({
+        initiator: ownerPolicyInitiator(input),
+        objectId: input.objectId,
+        policy: input.policy,
+      });
+    } catch (error) {
+      throw mapPolicyError(error);
+    }
+  }
+
+  async migrate(input: MediaCacheAdminMigrateInput): Promise<MediaCacheCommandReceipt> {
+    assertReconcileInput(input);
+    assertBackendId(input.sourceBackendId);
+    assertBackendId(input.targetBackendId);
+    if (input.sourceBackendId === input.targetBackendId) {
+      throw new RangeError('Media storage source and target backends must be different');
+    }
+    if (input.objectId) {
+      await this.assertObjectExists(input.objectId);
+    }
+    await this.assertBackendAvailable(input.sourceBackendId, 'readable');
+    await this.assertBackendAvailable(input.targetBackendId, 'writable');
+    return this.commands.enqueue({
+      initiatorId: input.initiatorId,
+      initiatorKind: 'owner_session',
+      ...(input.objectId ? { objectId: input.objectId } : {}),
+      operation: 'migrate',
+      reason: input.reason,
+      sourceBackendId: input.sourceBackendId,
+      targetBackendId: input.targetBackendId,
+    });
+  }
+
+  async restore(input: MediaCacheAdminRestoreInput): Promise<MediaCacheCommandReceipt> {
+    assertMutationInput(input);
+    assertBackendId(input.targetBackendId);
+    await this.assertObjectExists(input.objectId);
+    await this.assertBackendAvailable(input.targetBackendId, 'writable');
+    return this.commands.enqueue({
+      initiatorId: input.initiatorId,
+      initiatorKind: 'owner_session',
+      objectId: input.objectId,
+      operation: 'restore',
+      reason: input.reason,
+      targetBackendId: input.targetBackendId,
+    });
+  }
+
+  async previewPrune(input: MediaCacheAdminPrunePreviewInput): Promise<StoragePrunePreview> {
+    assertBackendId(input.targetBackendId);
+    assertPruneTarget(input.targetBytes);
+    if (!this.storagePrune) {
+      throw new MediaCacheAdminConflictError('Media storage pruning is unavailable');
+    }
+    try {
+      return await this.storagePrune.preview(input);
+    } catch (error) {
+      throw mapPruneError(error);
+    }
+  }
+
+  async prune(input: MediaCacheAdminPruneInput): Promise<MediaCacheCommandReceipt> {
+    assertReconcileInput(input);
+    assertBackendId(input.targetBackendId);
+    assertPruneTarget(input.targetBytes);
+    if (!this.storagePrune) {
+      throw new MediaCacheAdminConflictError('Media storage pruning is unavailable');
+    }
+    await this.assertBackendAvailable(input.targetBackendId, 'writable');
+    return this.commands.enqueue({
+      initiatorId: input.initiatorId,
+      initiatorKind: 'owner_session',
+      operation: 'prune',
+      reason: input.reason,
+      targetBackendId: input.targetBackendId,
+      targetBytes: input.targetBytes,
+    });
   }
 
   async retry(input: MediaCacheAdminMutationInput): Promise<MediaCacheAdminRetryResult> {
@@ -235,6 +413,33 @@ export class PostgresMediaCacheAdminService implements MediaCacheAdminMutations 
       reason: input.reason,
     });
   }
+
+  private async assertObjectExists(objectId: string): Promise<void> {
+    const [object] = await this.database
+      .select({ id: mediaCacheObjects.id })
+      .from(mediaCacheObjects)
+      .where(eq(mediaCacheObjects.id, objectId))
+      .limit(1);
+    if (!object) throw new MediaCacheAdminNotFoundError();
+  }
+
+  private async assertBackendAvailable(
+    backendId: string,
+    capability: 'readable' | 'writable',
+  ): Promise<void> {
+    const [backend] = await this.database
+      .select({
+        enabled: mediaStorageBackends.enabled,
+        readable: mediaStorageBackends.readable,
+        writable: mediaStorageBackends.writable,
+      })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, backendId))
+      .limit(1);
+    if (!backend?.enabled || !backend[capability]) {
+      throw new MediaCacheAdminConflictError(`Media storage ${capability} backend is unavailable`);
+    }
+  }
 }
 
 function retryObjectState(now: Date) {
@@ -268,6 +473,51 @@ function assertReconcileInput(input: MediaCacheAdminReconcileInput): void {
   if (!reason || reason.length > 500) {
     throw new TypeError('Media cache mutation reason must be between 1 and 500 characters');
   }
+}
+
+function assertBackendId(backendId: string): void {
+  if (!STORAGE_BACKEND_ID.test(backendId)) {
+    throw new RangeError('Media storage backend id is invalid');
+  }
+}
+
+function assertPruneTarget(targetBytes: bigint): void {
+  if (targetBytes < 1n || targetBytes > MAX_STORAGE_TARGET_BYTES) {
+    throw new RangeError('Media storage prune target must be between 1 byte and 5 TiB');
+  }
+}
+
+function ownerPolicyInitiator(input: MediaCacheAdminMutationInput) {
+  return {
+    id: input.initiatorId.trim(),
+    kind: 'owner_session' as const,
+    reason: input.reason.trim(),
+  };
+}
+
+function mapPolicyError(error: unknown): Error {
+  if (error instanceof MediaCacheObjectPolicyNotFoundError) {
+    return new MediaCacheAdminNotFoundError();
+  }
+  if (error instanceof MediaCacheObjectPolicyConflictError) {
+    return new MediaCacheAdminConflictError(error.message);
+  }
+  if (error instanceof MediaCacheObjectPolicyInputError) {
+    return new RangeError(error.message);
+  }
+  return error instanceof Error ? error : new Error('Media cache object policy failed');
+}
+
+function mapPruneError(error: unknown): Error {
+  if (error instanceof RangeError || error instanceof TypeError) return error;
+  if (
+    error instanceof Error &&
+    (error.message === 'Media storage prune backend is unavailable' ||
+      error.message === 'Media storage prune backend is not writable')
+  ) {
+    return new MediaCacheAdminConflictError(error.message);
+  }
+  return error instanceof Error ? error : new Error('Media storage prune preview failed');
 }
 
 function assertRetryableObject(object: {

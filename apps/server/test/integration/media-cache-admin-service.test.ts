@@ -8,9 +8,11 @@ import {
   mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheCommands,
+  mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -23,6 +25,7 @@ import {
 } from '../../src/media-cache/command-queue.js';
 import { MediaCacheEvictionService } from '../../src/media-cache/eviction-repository.js';
 import { PostgresMediaCacheLedgerRepository } from '../../src/media-cache/ledger-repository.js';
+import type { PostgresStoragePruneService } from '../../src/media-cache/storage-prune-service.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const SHA256 = 'a'.repeat(64);
@@ -134,9 +137,11 @@ async function createFixture(input: {
   };
 }
 
-function service() {
+function service(storagePrune?: PostgresStoragePruneService) {
   if (!connection) throw new Error('Database connection was not created');
-  return new PostgresMediaCacheAdminService(connection.db);
+  return new PostgresMediaCacheAdminService(connection.db, {
+    ...(storagePrune ? { storagePrune } : {}),
+  });
 }
 
 describe('PostgreSQL media cache Admin service', () => {
@@ -157,10 +162,12 @@ describe('PostgreSQL media cache Admin service', () => {
       truncate table
         ${mediaCacheActions},
         ${mediaCacheCommands},
+        ${mediaCacheObjectProtections},
         ${mediaCacheRuntime},
         ${mediaCacheObjects},
         ${mediaCacheBlobs},
         ${mediaCachePostPlans},
+        ${mediaStorageBackends},
         ${telegramChannels}
       cascade
     `);
@@ -441,12 +448,196 @@ describe('PostgreSQL media cache Admin service', () => {
       .where(eq(mediaCacheCommands.id, result.commandId));
     expect(command).toMatchObject({
       initiatorId: 'owner-user-id',
+      initiatorKind: 'owner_session',
       objectId: fixture.objectIds[0],
       operation: 'evict',
       reason: 'free local cache space',
       state: 'pending',
     });
     expect(JSON.stringify(result)).not.toContain(SHA256);
+  });
+
+  it('applies owner object policies synchronously and records sanitized audit state', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const fixture = await createFixture({ planState: 'ready', state: 'ready' });
+    const objectId = fixture.objectIds[0] ?? '';
+    const expiresAt = new Date('2027-07-24T08:00:00.000Z');
+
+    const protectedObject = await service().protect({
+      expiresAt,
+      initiatorId: 'owner-user-id',
+      objectId,
+      reason: 'retain shared family media',
+    });
+    expect(protectedObject).toMatchObject({ expiresAt, objectId, protected: true });
+    const policy = await service().setEvictedPolicy({
+      initiatorId: 'owner-user-id',
+      objectId,
+      policy: 'stay_evicted',
+      reason: 'do not fetch this object again',
+    });
+    expect(policy).toEqual({
+      alreadyApplied: false,
+      objectId,
+      policy: 'stay_evicted',
+    });
+    const unprotectedObject = await service().unprotect({
+      initiatorId: 'owner-user-id',
+      objectId,
+      reason: 'allow bounded pruning',
+    });
+    expect(unprotectedObject).toMatchObject({ objectId, protected: false });
+
+    const [object] = await connection.db
+      .select({ evictedPolicy: mediaCacheObjects.evictedPolicy })
+      .from(mediaCacheObjects)
+      .where(eq(mediaCacheObjects.id, objectId));
+    expect(object).toEqual({ evictedPolicy: 'stay_evicted' });
+    await expect(
+      connection.db
+        .select()
+        .from(mediaCacheObjectProtections)
+        .where(eq(mediaCacheObjectProtections.objectId, objectId)),
+    ).resolves.toEqual([]);
+    const actions = await connection.db
+      .select({
+        actionKind: mediaCacheActions.actionKind,
+        initiatorKind: mediaCacheActions.initiatorKind,
+      })
+      .from(mediaCacheActions);
+    expect(actions).toHaveLength(3);
+    expect(actions).toEqual(
+      expect.arrayContaining([
+        { actionKind: 'protect', initiatorKind: 'owner_session' },
+        { actionKind: 'set_evicted_policy', initiatorKind: 'owner_session' },
+        { actionKind: 'unprotect', initiatorKind: 'owner_session' },
+      ]),
+    );
+  });
+
+  it('validates storage capabilities before enqueueing owner copy, restore, and prune commands', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const fixture = await createFixture({ planState: 'ready', state: 'ready' });
+    const objectId = fixture.objectIds[0];
+    if (!objectId) throw new Error('Fixture object was not created');
+    await connection.db.insert(mediaStorageBackends).values([
+      {
+        configFingerprint: 'a'.repeat(64),
+        id: 'local',
+        kind: 'local',
+        label: 'Local',
+        maxBytes: 5_368_709_120n,
+      },
+      {
+        configFingerprint: 'b'.repeat(64),
+        id: 's3-default',
+        kind: 's3',
+        label: 'S3',
+        maxBytes: 5_497_558_138_880n,
+      },
+    ]);
+    const storagePrune = {
+      preview: vi.fn(),
+    } as unknown as PostgresStoragePruneService;
+    const admin = service(storagePrune);
+    const migrate = await admin.migrate({
+      initiatorId: 'owner-user-id',
+      objectId,
+      reason: 'copy to durable storage',
+      sourceBackendId: 'local',
+      targetBackendId: 's3-default',
+    });
+    const restore = await admin.restore({
+      initiatorId: 'owner-user-id',
+      objectId,
+      reason: 'restore local hot copy',
+      targetBackendId: 'local',
+    });
+    const prune = await admin.prune({
+      initiatorId: 'owner-user-id',
+      reason: 'enforce durable storage bound',
+      targetBackendId: 's3-default',
+      targetBytes: 5_368_709_120n,
+    });
+
+    const commands = await connection.db
+      .select({
+        id: mediaCacheCommands.id,
+        initiatorKind: mediaCacheCommands.initiatorKind,
+        objectId: mediaCacheCommands.objectId,
+        operation: mediaCacheCommands.operation,
+        sourceBackendId: mediaCacheCommands.sourceBackendId,
+        targetBackendId: mediaCacheCommands.targetBackendId,
+        targetBytes: mediaCacheCommands.targetBytes,
+      })
+      .from(mediaCacheCommands);
+    expect(commands).toHaveLength(3);
+    expect(commands).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: migrate.commandId,
+          initiatorKind: 'owner_session',
+          objectId,
+          operation: 'migrate',
+          sourceBackendId: 'local',
+          targetBackendId: 's3-default',
+        }),
+        expect.objectContaining({
+          id: restore.commandId,
+          initiatorKind: 'owner_session',
+          objectId,
+          operation: 'restore',
+          targetBackendId: 'local',
+        }),
+        expect.objectContaining({
+          id: prune.commandId,
+          initiatorKind: 'owner_session',
+          objectId: null,
+          operation: 'prune',
+          targetBackendId: 's3-default',
+          targetBytes: 5_368_709_120n,
+        }),
+      ]),
+    );
+  });
+
+  it('roundtrips bigint prune payloads through a claimed durable command', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await connection.db.insert(mediaStorageBackends).values({
+      configFingerprint: 'a'.repeat(64),
+      id: 's3-default',
+      kind: 's3',
+      label: 'S3',
+      maxBytes: 5_368_709_120n,
+    });
+    const queue = new PostgresMediaCacheCommandQueue(connection.db);
+    const receipt = await queue.enqueue({
+      initiatorId: 'owner-user-id',
+      initiatorKind: 'local_operator',
+      operation: 'prune',
+      reason: 'enforce the configured S3 capacity',
+      targetBackendId: 's3-default',
+      targetBytes: 4_294_967_296n,
+    });
+
+    const command = await queue.claim({ leaseOwner: 'worker:test' });
+
+    expect(command).toMatchObject({
+      id: receipt.commandId,
+      initiatorKind: 'local_operator',
+      objectId: null,
+      operation: 'prune',
+      sourceBackendId: null,
+      targetBackendId: 's3-default',
+      targetBytes: 4_294_967_296n,
+    });
+    if (!command) throw new Error('Command was not claimed');
+    await queue.succeed(command, {
+      prunedBlobCount: 0,
+      prunedBytes: '0',
+      readyBytes: '0',
+      targetBackendId: 's3-default',
+    });
   });
 
   it('executes an eviction command once and never exposes its blob identity in the result', async () => {

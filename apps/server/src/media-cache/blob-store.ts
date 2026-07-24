@@ -29,6 +29,17 @@ export interface MediaBlobIdentity {
   sha256: string;
 }
 
+export interface MediaBlobReadRange {
+  end: number;
+  start: number;
+}
+
+export interface MediaBlobReadHandle {
+  byteLength: number;
+  close(): Promise<void>;
+  stream(range?: MediaBlobReadRange): ReadableStream<Uint8Array>;
+}
+
 export interface StagedMediaBlob {
   byteLength: number;
   lease: MediaBlobLease;
@@ -405,11 +416,21 @@ export class LocalMediaBlobStore {
     return openRegularFile(path, staged.byteLength);
   }
 
+  async readStaged(staged: StagedMediaBlob): Promise<MediaBlobReadHandle> {
+    const file = await this.openStaged(staged);
+    return mediaBlobReadHandle(file, staged.byteLength);
+  }
+
   async open(blob: MediaBlobIdentity): Promise<FileHandle> {
     assertBlobIdentity(blob);
     const path = this.#resolveRelativeKey(blob.relativeKey);
     await this.#assertRequiredDirectoryContained(dirname(path));
     return openRegularFile(path, blob.byteLength);
+  }
+
+  async read(blob: MediaBlobIdentity): Promise<MediaBlobReadHandle> {
+    const file = await this.open(blob);
+    return mediaBlobReadHandle(file, blob.byteLength);
   }
 
   async evict(blob: MediaBlobIdentity): Promise<MediaBlobEvictionResult> {
@@ -686,6 +707,91 @@ function assertBlobIdentity(blob: MediaBlobIdentity): void {
   if (!SHA256.test(blob.sha256) || blob.relativeKey !== relativeKeyForHash(blob.sha256)) {
     throw new MediaBlobIntegrityError('Media blob identity is not canonical');
   }
+}
+
+function mediaBlobReadHandle(file: FileHandle, byteLength: number): MediaBlobReadHandle {
+  let closePromise: Promise<void> | undefined;
+  let consumed = false;
+
+  const close = (): Promise<void> => {
+    closePromise ??= file.close();
+    return closePromise;
+  };
+
+  return {
+    byteLength,
+    close,
+    stream(range) {
+      if (consumed || closePromise) {
+        throw new MediaBlobStoreError(
+          'media_blob_read_handle_consumed',
+          'Media blob read handle was already consumed or closed',
+        );
+      }
+      if (range) {
+        assertMediaBlobReadRange(range, byteLength);
+      }
+      consumed = true;
+      return fileHandleToByteStream(file, close, range ?? fullMediaBlobRange(byteLength));
+    },
+  };
+}
+
+function assertMediaBlobReadRange(range: MediaBlobReadRange, byteLength: number): void {
+  if (
+    !Number.isSafeInteger(range.start) ||
+    !Number.isSafeInteger(range.end) ||
+    range.start < 0 ||
+    range.end < range.start ||
+    range.end >= byteLength
+  ) {
+    throw new RangeError('Media blob read range must be an inclusive range within the blob');
+  }
+}
+
+function fullMediaBlobRange(byteLength: number): MediaBlobReadRange {
+  return { end: byteLength - 1, start: 0 };
+}
+
+function fileHandleToByteStream(
+  file: FileHandle,
+  close: () => Promise<void>,
+  range: MediaBlobReadRange,
+): ReadableStream<Uint8Array> {
+  let position = range.start;
+  return new ReadableStream<Uint8Array>({
+    async cancel() {
+      await close();
+    },
+    async pull(controller) {
+      if (position > range.end) {
+        try {
+          await close();
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+        return;
+      }
+
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, range.end - position + 1));
+      try {
+        const { bytesRead } = await file.read(buffer, 0, buffer.byteLength, position);
+        if (bytesRead === 0) {
+          throw new MediaBlobIntegrityError('Media blob ended before its expected byte length');
+        }
+        position += bytesRead;
+        controller.enqueue(buffer.subarray(0, bytesRead));
+        if (position > range.end) {
+          await close();
+          controller.close();
+        }
+      } catch (error) {
+        await close().catch(() => undefined);
+        controller.error(error);
+      }
+    },
+  });
 }
 
 function relativeKeyForHash(sha256: string): string {

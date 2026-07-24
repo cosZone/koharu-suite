@@ -53,7 +53,52 @@ export async function validateMediaContentType(
 ): Promise<ValidatedMediaContentType> {
   const prefix = new Uint8Array(DETECTION_PREFIX_BYTES);
   const { bytesRead } = await file.read(prefix, 0, prefix.byteLength, 0);
-  const detected = await fileTypeFromBuffer(prefix.subarray(0, bytesRead));
+  return validateDetectedContentType(prefix.subarray(0, bytesRead), expectedKind);
+}
+
+export async function validateMediaContentTypeStream(
+  stream: ReadableStream<Uint8Array>,
+  expectedKind: CacheableMediaKind,
+): Promise<ValidatedMediaContentType> {
+  const prefix = new Uint8Array(DETECTION_PREFIX_BYTES);
+  const reader = stream.getReader();
+  let bytesRead = 0;
+  let complete = false;
+  try {
+    while (bytesRead < prefix.byteLength) {
+      const result = await reader.read();
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      if (!(result.value instanceof Uint8Array)) {
+        throw new TypeError('Media content stream yielded a non-Uint8Array chunk');
+      }
+      const remaining = prefix.byteLength - bytesRead;
+      const chunk = result.value.subarray(0, remaining);
+      prefix.set(chunk, bytesRead);
+      bytesRead += chunk.byteLength;
+      if (result.value.byteLength > remaining) {
+        break;
+      }
+    }
+    if (!complete) {
+      void reader.cancel().catch(() => undefined);
+    }
+  } catch (error) {
+    void reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return validateDetectedContentType(prefix.subarray(0, bytesRead), expectedKind);
+}
+
+async function validateDetectedContentType(
+  prefix: Uint8Array,
+  expectedKind: CacheableMediaKind,
+): Promise<ValidatedMediaContentType> {
+  const detected = await fileTypeFromBuffer(prefix);
 
   if (detected === undefined) {
     throw new MediaContentTypeError(

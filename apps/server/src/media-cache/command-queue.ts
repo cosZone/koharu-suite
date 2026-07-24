@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, lt, lte, or, sql } from 'drizzle-orm';
+import { and, asc, eq, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { mediaCacheCommands, mediaCacheObjects } from '../db/schema.js';
+import {
+  mediaBlobLocations,
+  mediaCacheBlobs,
+  mediaCacheCommands,
+  mediaCacheObjects,
+  mediaStorageBackends,
+  messageMedia,
+  messageRevisions,
+  messages,
+} from '../db/schema.js';
 import type { MediaCacheEvictionService } from './eviction-repository.js';
 import type {
   MediaCacheMaintenanceService,
@@ -12,8 +21,10 @@ const COMMAND_LEASE_MS = 5 * 60_000;
 const COMMAND_RENEWAL_MS = 60_000;
 const EVICTION_LEASE_MS = 2 * 60_000;
 
-export type MediaCacheCommandOperation = 'evict' | 'reconcile';
+export type MediaCacheCommandOperation = 'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore';
 export type MediaCacheCommandState = 'failed' | 'pending' | 'running' | 'succeeded';
+export type MediaCacheCommandInitiatorKind = 'local_operator' | 'owner_session';
+type InternalMediaCacheCommandInitiatorKind = MediaCacheCommandInitiatorKind | 'worker';
 
 export interface MediaCacheCommandReceipt {
   commandId: string;
@@ -21,14 +32,97 @@ export interface MediaCacheCommandReceipt {
   state: 'pending';
 }
 
-interface ClaimedMediaCacheCommand {
+interface MediaCacheCommandInputBase {
+  initiatorId: string;
+  initiatorKind?: MediaCacheCommandInitiatorKind;
+  reason: string;
+}
+
+export type MediaCacheCommandInput = MediaCacheCommandInputBase &
+  (
+    | {
+        objectId: string;
+        operation: 'evict';
+        sourceBackendId?: never;
+        targetBackendId?: never;
+        targetBytes?: never;
+      }
+    | {
+        objectId?: string;
+        operation: 'migrate';
+        sourceBackendId: string;
+        targetBackendId: string;
+        targetBytes?: never;
+      }
+    | {
+        objectId?: never;
+        operation: 'prune';
+        sourceBackendId?: never;
+        targetBackendId: string;
+        targetBytes: bigint;
+      }
+    | {
+        objectId?: never;
+        operation: 'reconcile';
+        sourceBackendId?: never;
+        targetBackendId?: never;
+        targetBytes?: never;
+      }
+    | {
+        objectId: string;
+        operation: 'restore';
+        sourceBackendId?: never;
+        targetBackendId: string;
+        targetBytes?: never;
+      }
+  );
+
+interface ClaimedMediaCacheCommandBase {
   id: string;
   initiatorId: string;
-  objectId: string | null;
-  operation: MediaCacheCommandOperation;
+  initiatorKind: InternalMediaCacheCommandInitiatorKind;
   reason: string;
   token: string;
 }
+
+export type ClaimedMediaCacheCommand = ClaimedMediaCacheCommandBase &
+  (
+    | {
+        objectId: string;
+        operation: 'evict';
+        sourceBackendId: null;
+        targetBackendId: null;
+        targetBytes: null;
+      }
+    | {
+        objectId: string | null;
+        operation: 'migrate';
+        sourceBackendId: string;
+        targetBackendId: string;
+        targetBytes: null;
+      }
+    | {
+        objectId: null;
+        operation: 'prune';
+        sourceBackendId: null;
+        targetBackendId: string;
+        targetBytes: bigint;
+      }
+    | {
+        objectId: null;
+        operation: 'reconcile';
+        sourceBackendId: null;
+        targetBackendId: null;
+        targetBytes: null;
+      }
+    | {
+        objectId: string;
+        operation: 'restore';
+        sourceBackendId: null;
+        targetBackendId: string;
+        targetBytes: null;
+      }
+  );
 
 interface CommandEviction {
   evict: MediaCacheEvictionService['evict'];
@@ -38,32 +132,71 @@ interface CommandMaintenance {
   reconcile: MediaCacheMaintenanceService['reconcile'];
 }
 
+type StorageCommandOperation = 'migrate' | 'prune' | 'restore';
+
+export interface CommandStorageOperationInput<Operation extends StorageCommandOperation> {
+  command: Extract<ClaimedMediaCacheCommand, { operation: Operation }>;
+  renewLease(): Promise<void>;
+  signal?: AbortSignal;
+}
+
+export interface CommandStorageMigrateResult {
+  alreadyApplied?: boolean;
+  hasMore?: boolean;
+  migratedBlobCount: number;
+  migratedBytes: string;
+  sourceBackendId: string;
+  targetBackendId: string;
+}
+
+export interface CommandStoragePruneResult {
+  alreadyApplied?: boolean;
+  hasMore?: boolean;
+  prunedBlobCount: number;
+  prunedBytes: string;
+  readyBytes: string;
+  targetBackendId: string;
+}
+
+export interface CommandStorageRestoreResult {
+  alreadyApplied?: boolean;
+  hasMore?: boolean;
+  restoredBytes: string;
+  restoredObjectCount: number;
+  targetBackendId: string;
+}
+
+export interface CommandStorageOperations {
+  migrate(input: CommandStorageOperationInput<'migrate'>): Promise<CommandStorageMigrateResult>;
+  prune(input: CommandStorageOperationInput<'prune'>): Promise<CommandStoragePruneResult>;
+  restore(input: CommandStorageOperationInput<'restore'>): Promise<CommandStorageRestoreResult>;
+}
+
+export interface MediaCacheCommandQueueControl {
+  claim(input: { leaseOwner: string }): Promise<ClaimedMediaCacheCommand | null>;
+  fail(command: ClaimedMediaCacheCommand, errorCode: string): Promise<void>;
+  renew(command: ClaimedMediaCacheCommand): Promise<void>;
+  succeed(command: ClaimedMediaCacheCommand, result: Record<string, unknown>): Promise<void>;
+}
+
 export class PostgresMediaCacheCommandQueue {
   constructor(private readonly database: Database) {}
 
-  async enqueue(input: {
-    initiatorId: string;
-    objectId?: string;
-    operation: MediaCacheCommandOperation;
-    reason: string;
-  }): Promise<MediaCacheCommandReceipt> {
+  async enqueue(input: MediaCacheCommandInput): Promise<MediaCacheCommandReceipt> {
     const initiatorId = input.initiatorId.trim();
+    const initiatorKind = normalizeInitiatorKind(input.initiatorKind);
     const reason = input.reason.trim();
     if (!initiatorId || initiatorId.length > 255 || !reason || reason.length > 500) {
       throw new TypeError('Invalid media cache command initiator or reason');
     }
-    if (
-      (input.operation === 'evict' && !input.objectId) ||
-      (input.operation === 'reconcile' && input.objectId)
-    ) {
-      throw new TypeError('Invalid media cache command target');
-    }
+    const payload = normalizeCommandPayload(input);
     const [command] = await this.database
       .insert(mediaCacheCommands)
       .values({
         initiatorId,
-        objectId: input.objectId,
+        initiatorKind,
         operation: input.operation,
+        ...payload,
         reason,
       })
       .returning({ id: mediaCacheCommands.id });
@@ -71,6 +204,122 @@ export class PostgresMediaCacheCommandQueue {
       throw new Error('Media cache command was not enqueued');
     }
     return { commandId: command.id, operation: input.operation, state: 'pending' };
+  }
+
+  /**
+   * Records a best-effort restore request after a public read succeeds from durable storage.
+   * Eligibility is re-checked in PostgreSQL so stale public requests cannot revive tombstoned
+   * content or override an object's explicit stay-evicted policy.
+   */
+  async enqueueRecacheOnAccess(input: {
+    objectId: string;
+    sourceBackendId: string;
+  }): Promise<boolean> {
+    const objectId = input.objectId.trim();
+    const sourceBackendId = input.sourceBackendId.trim();
+    if (!objectId || !sourceBackendId || sourceBackendId === 'local') {
+      return false;
+    }
+
+    return this.database.transaction(async (transaction) => {
+      const [eligible] = await transaction
+        .select({ objectId: mediaCacheObjects.id })
+        .from(mediaCacheObjects)
+        .innerJoin(mediaCacheBlobs, eq(mediaCacheBlobs.sha256, mediaCacheObjects.blobSha256))
+        .innerJoin(messageMedia, eq(messageMedia.id, mediaCacheObjects.canonicalMediaId))
+        .innerJoin(messageRevisions, eq(messageRevisions.id, mediaCacheObjects.revisionId))
+        .innerJoin(
+          messages,
+          and(
+            eq(messages.id, messageRevisions.messageId),
+            eq(messages.currentRevisionNumber, messageRevisions.revisionNumber),
+            isNull(messages.tombstonedAt),
+          ),
+        )
+        .innerJoin(
+          mediaBlobLocations,
+          and(
+            eq(mediaBlobLocations.backendId, sourceBackendId),
+            eq(mediaBlobLocations.blobSha256, mediaCacheObjects.blobSha256),
+            eq(mediaBlobLocations.storageKey, mediaCacheBlobs.relativeKey),
+            eq(mediaBlobLocations.state, 'ready'),
+            eq(mediaBlobLocations.verifiedByteLength, mediaCacheBlobs.byteLength),
+            eq(mediaBlobLocations.verifiedSha256, mediaCacheBlobs.sha256),
+          ),
+        )
+        .innerJoin(
+          mediaStorageBackends,
+          and(
+            eq(mediaStorageBackends.id, mediaBlobLocations.backendId),
+            eq(mediaStorageBackends.enabled, true),
+            eq(mediaStorageBackends.readable, true),
+          ),
+        )
+        .where(
+          and(
+            eq(mediaCacheObjects.id, objectId),
+            eq(mediaCacheObjects.state, 'ready'),
+            eq(mediaCacheObjects.evictedPolicy, 'recache_on_access'),
+            ne(mediaBlobLocations.backendId, 'local'),
+            sql`exists (
+              select 1
+              from media_storage_backends local_backend
+              where local_backend.id = 'local'
+                and local_backend.enabled = true
+                and local_backend.writable = true
+            )`,
+            sql`not exists (
+              select 1
+              from media_blob_locations local_location
+              where local_location.backend_id = 'local'
+                and local_location.blob_sha256 = ${mediaCacheObjects.blobSha256}
+                and local_location.storage_key = ${mediaCacheBlobs.relativeKey}
+                and local_location.state = 'ready'
+                and local_location.verified_byte_length = ${mediaCacheBlobs.byteLength}
+                and local_location.verified_sha256 = ${mediaCacheBlobs.sha256}
+            )`,
+            sql`not exists (
+              select 1
+              from media_cache_commands recent_restore
+              where recent_restore.object_id = ${mediaCacheObjects.id}
+                and recent_restore.operation = 'restore'
+                and recent_restore.target_backend_id = 'local'
+                and (
+                  recent_restore.state in ('pending', 'running')
+                  or (
+                    recent_restore.state = 'failed'
+                    and recent_restore.updated_at > clock_timestamp() - interval '5 minutes'
+                  )
+                  or (
+                    recent_restore.state = 'succeeded'
+                    and recent_restore.updated_at > clock_timestamp() - interval '30 seconds'
+                  )
+                )
+            )`,
+          ),
+        )
+        .limit(1);
+      if (!eligible) return false;
+
+      const inserted = await transaction
+        .insert(mediaCacheCommands)
+        .values({
+          initiatorId: 'media-recache-scheduler',
+          initiatorKind: 'worker',
+          objectId: eligible.objectId,
+          operation: 'restore',
+          reason: 'Restore local hot copy after durable public read',
+          targetBackendId: 'local',
+        })
+        .onConflictDoNothing({
+          target: [mediaCacheCommands.objectId, mediaCacheCommands.targetBackendId],
+          where: sql`${mediaCacheCommands.operation} = 'restore'
+            and ${mediaCacheCommands.initiatorKind} = 'worker'
+            and ${mediaCacheCommands.state} in ('pending', 'running')`,
+        })
+        .returning({ id: mediaCacheCommands.id });
+      return inserted.length === 1;
+    });
   }
 
   async claim(input: { leaseOwner: string }): Promise<ClaimedMediaCacheCommand | null> {
@@ -105,9 +354,13 @@ export class PostgresMediaCacheCommandQueue {
         .select({
           id: mediaCacheCommands.id,
           initiatorId: mediaCacheCommands.initiatorId,
+          initiatorKind: mediaCacheCommands.initiatorKind,
           objectId: mediaCacheCommands.objectId,
           operation: mediaCacheCommands.operation,
           reason: mediaCacheCommands.reason,
+          sourceBackendId: mediaCacheCommands.sourceBackendId,
+          targetBackendId: mediaCacheCommands.targetBackendId,
+          targetBytes: mediaCacheCommands.targetBytes,
         })
         .from(mediaCacheCommands)
         .where(
@@ -138,7 +391,7 @@ export class PostgresMediaCacheCommandQueue {
         })
         .where(eq(mediaCacheCommands.id, candidate.id))
         .returning({ id: mediaCacheCommands.id });
-      return claimed ? { ...candidate, token } : null;
+      return claimed ? hydrateClaimedCommand(candidate, token) : null;
     });
   }
 
@@ -214,10 +467,11 @@ export class PostgresMediaCacheCommandQueue {
 export class MediaCacheCommandProcessor {
   constructor(
     private readonly database: Database,
-    private readonly queue: PostgresMediaCacheCommandQueue,
+    private readonly queue: MediaCacheCommandQueueControl,
     private readonly eviction: CommandEviction,
     private readonly maintenance: CommandMaintenance,
     private readonly leaseOwner: string,
+    private readonly storageOperations?: CommandStorageOperations,
   ) {}
 
   async runOnce(signal?: AbortSignal): Promise<boolean> {
@@ -235,10 +489,7 @@ export class MediaCacheCommandProcessor {
     }, COMMAND_RENEWAL_MS);
     renewalTimer.unref();
     try {
-      const result =
-        command.operation === 'evict'
-          ? await this.evict(command, signal)
-          : await this.reconcile(command, signal);
+      const result = await this.dispatch(command, signal);
       clearInterval(renewalTimer);
       await renewal;
       if (renewalError) throw renewalError;
@@ -252,6 +503,24 @@ export class MediaCacheCommandProcessor {
       await this.queue.fail(command, classifyCommandError(error));
     }
     return true;
+  }
+
+  private async dispatch(
+    command: ClaimedMediaCacheCommand,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    switch (command.operation) {
+      case 'evict':
+        return await this.evict(command, signal);
+      case 'migrate':
+      case 'prune':
+      case 'restore':
+        return await this.runStorageOperation(command, signal);
+      case 'reconcile':
+        return await this.reconcile(command, signal);
+      default:
+        return assertNever(command);
+    }
   }
 
   private async evict(
@@ -285,7 +554,7 @@ export class MediaCacheCommandProcessor {
       evictionToken: randomUUID(),
       initiator: {
         initiatorId: command.initiatorId,
-        kind: 'owner_session',
+        kind: command.initiatorKind,
         reason: command.reason,
       },
       selection: { kind: 'specific_blob', sha256: object.blobSha256 },
@@ -325,7 +594,7 @@ export class MediaCacheCommandProcessor {
         ...(cursor ? { cursor } : {}),
         initiator: {
           id: command.initiatorId,
-          kind: 'owner_session',
+          kind: externalCommandInitiatorKind(command),
           reason: command.reason,
         },
       });
@@ -342,6 +611,319 @@ export class MediaCacheCommandProcessor {
     } while (cursor);
     return { ...totals, pages };
   }
+
+  private async runStorageOperation(
+    command: ClaimedMediaCacheCommand,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    signal?.throwIfAborted();
+    const operations = this.storageOperations;
+    if (!operations) throw new Error('storage_operation_unavailable');
+    await this.queue.renew(command);
+    const renewLease = () => this.queue.renew(command);
+    switch (command.operation) {
+      case 'migrate':
+        return sanitizeStorageOperationResult(
+          'migrate',
+          await operations.migrate({
+            command,
+            renewLease,
+            ...(signal ? { signal } : {}),
+          }),
+        );
+      case 'prune':
+        return sanitizeStorageOperationResult(
+          'prune',
+          await operations.prune({
+            command,
+            renewLease,
+            ...(signal ? { signal } : {}),
+          }),
+        );
+      case 'restore':
+        return sanitizeStorageOperationResult(
+          'restore',
+          await operations.restore({
+            command,
+            renewLease,
+            ...(signal ? { signal } : {}),
+          }),
+        );
+      default:
+        throw new Error('storage_operation_unavailable');
+    }
+  }
+}
+
+function hydrateClaimedCommand(
+  candidate: {
+    id: string;
+    initiatorId: string;
+    initiatorKind: InternalMediaCacheCommandInitiatorKind;
+    objectId: string | null;
+    operation: MediaCacheCommandOperation;
+    reason: string;
+    sourceBackendId: string | null;
+    targetBackendId: string | null;
+    targetBytes: bigint | null;
+  },
+  token: string,
+): ClaimedMediaCacheCommand {
+  if (candidate.initiatorKind === 'worker' && candidate.operation !== 'restore') {
+    return invalidClaimedPayload();
+  }
+  const common = {
+    id: candidate.id,
+    initiatorId: candidate.initiatorId,
+    initiatorKind: candidate.initiatorKind,
+    reason: candidate.reason,
+    token,
+  };
+  switch (candidate.operation) {
+    case 'evict':
+      if (
+        !candidate.objectId ||
+        candidate.sourceBackendId ||
+        candidate.targetBackendId ||
+        candidate.targetBytes !== null
+      ) {
+        return invalidClaimedPayload();
+      }
+      return {
+        ...common,
+        objectId: candidate.objectId,
+        operation: 'evict',
+        sourceBackendId: null,
+        targetBackendId: null,
+        targetBytes: null,
+      };
+    case 'migrate':
+      if (
+        !candidate.sourceBackendId ||
+        !candidate.targetBackendId ||
+        candidate.sourceBackendId === candidate.targetBackendId ||
+        candidate.targetBytes !== null
+      ) {
+        return invalidClaimedPayload();
+      }
+      return {
+        ...common,
+        objectId: candidate.objectId,
+        operation: 'migrate',
+        sourceBackendId: candidate.sourceBackendId,
+        targetBackendId: candidate.targetBackendId,
+        targetBytes: null,
+      };
+    case 'prune':
+      if (
+        candidate.objectId ||
+        candidate.sourceBackendId ||
+        !candidate.targetBackendId ||
+        candidate.targetBytes === null ||
+        candidate.targetBytes < 0n
+      ) {
+        return invalidClaimedPayload();
+      }
+      return {
+        ...common,
+        objectId: null,
+        operation: 'prune',
+        sourceBackendId: null,
+        targetBackendId: candidate.targetBackendId,
+        targetBytes: candidate.targetBytes,
+      };
+    case 'reconcile':
+      if (
+        candidate.objectId ||
+        candidate.sourceBackendId ||
+        candidate.targetBackendId ||
+        candidate.targetBytes !== null
+      ) {
+        return invalidClaimedPayload();
+      }
+      return {
+        ...common,
+        objectId: null,
+        operation: 'reconcile',
+        sourceBackendId: null,
+        targetBackendId: null,
+        targetBytes: null,
+      };
+    case 'restore':
+      if (
+        !candidate.objectId ||
+        candidate.sourceBackendId ||
+        !candidate.targetBackendId ||
+        candidate.targetBytes !== null
+      ) {
+        return invalidClaimedPayload();
+      }
+      return {
+        ...common,
+        objectId: candidate.objectId,
+        operation: 'restore',
+        sourceBackendId: null,
+        targetBackendId: candidate.targetBackendId,
+        targetBytes: null,
+      };
+    default:
+      return assertNever(candidate.operation);
+  }
+}
+
+function externalCommandInitiatorKind(
+  command: ClaimedMediaCacheCommand,
+): MediaCacheCommandInitiatorKind {
+  if (command.initiatorKind === 'worker') {
+    throw new Error('invalid_media_cache_command_payload');
+  }
+  return command.initiatorKind;
+}
+
+function invalidClaimedPayload(): never {
+  throw new Error('PostgreSQL returned an invalid media cache command payload');
+}
+
+function normalizeInitiatorKind(value: unknown): MediaCacheCommandInitiatorKind {
+  if (value === undefined) return 'owner_session';
+  if (value === 'local_operator' || value === 'owner_session') return value;
+  throw new TypeError('Invalid media cache command initiator kind');
+}
+
+function normalizeCommandPayload(input: MediaCacheCommandInput): {
+  objectId?: string;
+  sourceBackendId?: string;
+  targetBackendId?: string;
+  targetBytes?: bigint;
+} {
+  const raw = input as MediaCacheCommandInput & Record<string, unknown>;
+  const objectId = normalizeOptionalId(raw.objectId, 255);
+  const sourceBackendId = normalizeOptionalId(raw.sourceBackendId, 64);
+  const targetBackendId = normalizeOptionalId(raw.targetBackendId, 64);
+  const hasTargetBytes = raw.targetBytes !== undefined && raw.targetBytes !== null;
+  const targetBytes =
+    hasTargetBytes && typeof raw.targetBytes === 'bigint' ? raw.targetBytes : null;
+  switch (input.operation) {
+    case 'evict':
+      if (!objectId || sourceBackendId || targetBackendId || hasTargetBytes) invalidTarget();
+      return { objectId };
+    case 'migrate':
+      if (
+        !sourceBackendId ||
+        !targetBackendId ||
+        sourceBackendId === targetBackendId ||
+        hasTargetBytes
+      ) {
+        invalidTarget();
+      }
+      return {
+        ...(objectId ? { objectId } : {}),
+        sourceBackendId,
+        targetBackendId,
+      };
+    case 'prune':
+      if (
+        objectId ||
+        sourceBackendId ||
+        !targetBackendId ||
+        targetBytes === null ||
+        targetBytes < 0n
+      ) {
+        invalidTarget();
+      }
+      return { targetBackendId, targetBytes };
+    case 'reconcile':
+      if (objectId || sourceBackendId || targetBackendId || hasTargetBytes) invalidTarget();
+      return {};
+    case 'restore':
+      if (!objectId || sourceBackendId || !targetBackendId || hasTargetBytes) invalidTarget();
+      return { objectId, targetBackendId };
+    default:
+      return assertNever(input as never);
+  }
+}
+
+function normalizeOptionalId(value: unknown, maxLength: number): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') invalidTarget();
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maxLength) invalidTarget();
+  return normalized;
+}
+
+function invalidTarget(): never {
+  throw new TypeError('Invalid media cache command target');
+}
+
+const STORAGE_BOOLEAN_KEYS = new Set(['alreadyApplied', 'hasMore']);
+const STORAGE_COUNT_KEYS = new Set(['migratedBlobCount', 'prunedBlobCount', 'restoredObjectCount']);
+const STORAGE_BYTE_KEYS = new Set(['migratedBytes', 'prunedBytes', 'readyBytes', 'restoredBytes']);
+const STORAGE_BACKEND_KEYS = new Set(['sourceBackendId', 'targetBackendId']);
+
+export function sanitizeStorageOperationResult(
+  operation: StorageCommandOperation,
+  result: object,
+): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(result)) {
+    if (STORAGE_BOOLEAN_KEYS.has(key) && typeof value === 'boolean') {
+      sanitized[key] = value;
+    } else if (STORAGE_COUNT_KEYS.has(key) && Number.isSafeInteger(value) && Number(value) >= 0) {
+      sanitized[key] = value;
+    } else if (STORAGE_BYTE_KEYS.has(key) && isDecimalString(value)) {
+      sanitized[key] = value;
+    } else if (
+      STORAGE_BACKEND_KEYS.has(key) &&
+      typeof value === 'string' &&
+      /^[a-z][a-z0-9_-]{0,63}$/u.test(value)
+    ) {
+      sanitized[key] = value;
+    }
+  }
+  if (operation === 'migrate') {
+    return pickKeys(sanitized, [
+      'alreadyApplied',
+      'hasMore',
+      'migratedBlobCount',
+      'migratedBytes',
+      'sourceBackendId',
+      'targetBackendId',
+    ]);
+  }
+  if (operation === 'restore') {
+    return pickKeys(sanitized, [
+      'alreadyApplied',
+      'hasMore',
+      'restoredBytes',
+      'restoredObjectCount',
+      'targetBackendId',
+    ]);
+  }
+  return pickKeys(sanitized, [
+    'alreadyApplied',
+    'hasMore',
+    'prunedBlobCount',
+    'prunedBytes',
+    'readyBytes',
+    'targetBackendId',
+  ]);
+}
+
+function pickKeys(
+  result: Record<string, unknown>,
+  keys: readonly string[],
+): Record<string, unknown> {
+  return Object.fromEntries(
+    keys.flatMap((key) => (Object.hasOwn(result, key) ? [[key, result[key]]] : [])),
+  );
+}
+
+function isDecimalString(value: unknown): value is string {
+  return typeof value === 'string' && /^(0|[1-9]\d*)$/u.test(value);
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unsupported media cache command operation: ${String(value)}`);
 }
 
 function parseClock(value: Date | string | undefined): Date {
@@ -359,6 +941,9 @@ function classifyCommandError(error: unknown): string {
     if (error.message === 'object_not_evictable') return 'object_not_evictable';
     if (error.message === 'reconcile_cursor_loop') return 'reconcile_cursor_loop';
     if (error.message === 'reconcile_page_limit') return 'reconcile_page_limit';
+    if (error.message === 'storage_operation_unavailable') {
+      return 'storage_operation_unavailable';
+    }
     if (error.name === 'MediaCacheEvictionError') return 'eviction_failed';
   }
   return 'operation_failed';

@@ -1,5 +1,43 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MediaCacheWorkerRuntime } from '../src/media-cache/runtime.js';
+import { LocalMediaBlobStore } from '../src/media-cache/blob-store.js';
+import {
+  createPersistentBlobBackendRegistry,
+  MediaCacheWorkerRuntime,
+} from '../src/media-cache/runtime.js';
+
+describe('media cache persistent backend runtime', () => {
+  it('constructs only the local backend when S3 is disabled', () => {
+    const registry = createPersistentBlobBackendRegistry(
+      new LocalMediaBlobStore('/tmp/koharu-runtime-local-only'),
+      { enabled: false },
+    );
+
+    expect(registry.find('local')?.id).toBe('local');
+    expect(registry.find('s3-default')).toBeUndefined();
+  });
+
+  it('constructs the configured S3 backend without performing network I/O', () => {
+    const registry = createPersistentBlobBackendRegistry(
+      new LocalMediaBlobStore('/tmp/koharu-runtime-with-s3'),
+      {
+        accessKeyId: 'test-key',
+        bucket: 'test-bucket',
+        connectTimeoutMs: 5_000,
+        enabled: true,
+        endpoint: 'https://s3.example.test',
+        forcePathStyle: true,
+        maxBytes: 5 * 1024 * 1024 * 1024,
+        prefix: 'koharu/media-cache',
+        region: 'us-east-1',
+        requestTimeoutMs: 30_000,
+        secretAccessKey: 'test-secret',
+      },
+    );
+
+    expect(registry.find('local')?.id).toBe('local');
+    expect(registry.find('s3-default')?.id).toBe('s3-default');
+  });
+});
 
 describe('media cache worker runtime lifecycle', () => {
   it('initializes once, stays alive, aborts in-flight work, and waits for it during stop', async () => {

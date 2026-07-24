@@ -83,9 +83,10 @@ docker compose exec worker node dist/cli.js health worker
 its heartbeat every 10 seconds, and a heartbeat older than 30 seconds is stale. A reverse proxy should route
 traffic only to the server's port 3000.
 
-## Optional local media cache
+## Optional media storage
 
-The media cache is disabled by default. To enable it, add:
+The media cache is disabled by default, and local-only remains the default deployment. To enable the local hot
+tier, add:
 
 ```dotenv
 MEDIA_CACHE_ENABLED=true
@@ -103,6 +104,30 @@ An upgrade backup requires PostgreSQL only; source evidence can rebuild cache by
 cache, stop server and worker and snapshot both the database and complete volume in the same downtime window.
 See the [media cache operations guide](../media-cache/README.en.md) for volume loss or deletion, permissions,
 dry-run pruning, reconciliation, and Telegram fallback.
+
+To add a durable cached tier, set all four S3 core values together. A partial set fails server/worker
+configuration closed, and S3 cannot be enabled independently of `MEDIA_CACHE_ENABLED`:
+
+```dotenv
+S3_ENDPOINT=https://s3.example.com
+S3_BUCKET=koharu-media
+S3_KEY=<access-key-id>
+S3_SECRET=<secret-access-key>
+S3_REGION=us-east-1
+S3_PREFIX=koharu/media-cache
+S3_FORCE_PATH_STYLE=true
+S3_ALLOW_INSECURE=false
+S3_MAX_BYTES=5368709120
+S3_CONNECT_TIMEOUT_MS=5000
+S3_REQUEST_TIMEOUT_MS=30000
+```
+
+Local capacity is capped at 5 GiB. The S3 application ledger defaults to 5 GiB and is capped at 5 TiB. The
+implementation uses AWS SDK v3, but CI has only a pinned MinIO compatibility baseline and does not promise
+every S3-compatible provider. Before production, run the operations guide's conditional-create, full/range
+read, copy/restore, protection, prune preview/apply, and fallback smoke against the target provider. Public
+media remains server-proxied. Do not expose the bucket or make provider lifecycle rules the authoritative
+deletion path.
 
 ## Reproducible local smoke
 
@@ -132,7 +157,10 @@ pg_restore --list "backups/koharu-before-upgrade.dump" >/dev/null
 ```
 
 Also record the current image digest, version, commit, and a redacted copy of `docker compose config`. Do not
-put expanded secrets in an Issue, pull request, or log.
+put expanded secrets in an Issue, pull request, or log. An ordinary backup requires PostgreSQL only. If a
+warm local/S3 cache must be preserved, stop server and worker and capture PostgreSQL, the complete local
+volume, and a provider-consistent snapshot of `S3_BUCKET/S3_PREFIX` in the same downtime window. Database,
+filesystem, and bucket listings from different points in time do not form a consistent backup.
 
 ## Import Telegram Desktop history
 
@@ -210,6 +238,13 @@ Then check the Owner Desk, channel list, and one new message. Use only an explic
 4. Restore the prior tag or digest in `KOHARU_IMAGE` only after the compatibility check passes.
 5. Start the prior worker, verify `kodama health worker`, and confirm there is one lock owner.
 6. Start the prior server and check `/readyz`, the public API, and the Owner Desk.
+
+If rollback also requires disabling S3, stop new storage mutations, let required commands complete or be
+taken over after lease expiry, copy/restore objects that must remain cached to `local`, and verify public
+reads. Then stop server and worker, clear `S3_ENDPOINT`, `S3_BUCKET`, `S3_KEY`, and `S3_SECRET` together, and
+restart local-only. Preserve additive backend/location/audit tables for diagnosis; do not run a destructive
+down migration or let bucket lifecycle replace the application ledger. See the
+[media cache operations guide](../media-cache/README.en.md) for the complete procedure.
 
 An additive migration does not guarantee behavioral compatibility with an old reader, and an ordinary
 application rollback must still not execute a destructive down migration. If the tombstone floor above or the

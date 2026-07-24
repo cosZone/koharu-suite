@@ -1,8 +1,10 @@
-import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
+import { type FileHandle, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import sharp from 'sharp';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { MediaBlobReadHandle } from '../src/media-cache/blob-store.js';
 import { createThumbnailSource, ThumbnailGenerationError } from '../src/media-cache/thumbnail.js';
 
 const temporaryDirectories: string[] = [];
@@ -21,6 +23,35 @@ async function openFixture(contents: Uint8Array) {
   const path = join(directory, 'fixture');
   await writeFile(path, contents);
   return open(path, 'r');
+}
+
+function readHandle(file: FileHandle): MediaBlobReadHandle {
+  let closePromise: Promise<void> | undefined;
+  return {
+    byteLength: 0,
+    close() {
+      closePromise ??= file.close();
+      return closePromise;
+    },
+    stream(range) {
+      return Readable.toWeb(
+        file.createReadStream({
+          autoClose: false,
+          ...(range ? { end: range.end, start: range.start } : { start: 0 }),
+        }),
+      ) as ReadableStream<Uint8Array>;
+    },
+  };
+}
+
+function withFailingClose(input: MediaBlobReadHandle): MediaBlobReadHandle {
+  return {
+    ...input,
+    async close() {
+      await input.close();
+      throw new Error('private backend close detail');
+    },
+  };
 }
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
@@ -46,7 +77,9 @@ describe('bounded media cache thumbnail source', () => {
       .toBuffer();
     const file = await openFixture(orientedJpeg);
 
-    const thumbnail = createThumbnailSource(file, { mimeType: 'image/jpeg' });
+    const thumbnail = createThumbnailSource(withFailingClose(readHandle(file)), {
+      mimeType: 'image/jpeg',
+    });
     const output = await readAll(thumbnail.stream);
     const result = await thumbnail.result;
     const metadata = await sharp(output).metadata();
@@ -74,7 +107,7 @@ describe('bounded media cache thumbnail source', () => {
     );
     const file = await openFixture(png);
 
-    const thumbnail = createThumbnailSource(file, { mimeType: 'image/png' });
+    const thumbnail = createThumbnailSource(readHandle(file), { mimeType: 'image/png' });
     const output = await readAll(thumbnail.stream);
 
     await expect(thumbnail.result).resolves.toMatchObject({
@@ -89,16 +122,19 @@ describe('bounded media cache thumbnail source', () => {
   it('rejects a video before starting Sharp and leaves ownership with the caller', async () => {
     const file = await openFixture(Buffer.from('not read'));
 
-    expect(() => createThumbnailSource(file, { mimeType: 'video/mp4' })).toThrow(
+    const input = readHandle(file);
+    expect(() => createThumbnailSource(input, { mimeType: 'video/mp4' })).toThrow(
       ThumbnailGenerationError,
     );
     await expect(file.stat()).resolves.toMatchObject({ size: 8 });
-    await file.close();
+    await input.close();
   });
 
   it('rejects corrupt raster input with a stable sanitized code and closes the file', async () => {
     const file = await openFixture(Buffer.from('corrupt image'));
-    const thumbnail = createThumbnailSource(file, { mimeType: 'image/jpeg' });
+    const thumbnail = createThumbnailSource(withFailingClose(readHandle(file)), {
+      mimeType: 'image/jpeg',
+    });
 
     await expect(readAll(thumbnail.stream)).rejects.toMatchObject({
       code: 'thumbnail_unavailable',
@@ -119,7 +155,7 @@ describe('bounded media cache thumbnail source', () => {
     const file = await openFixture(png);
     const abortController = new AbortController();
     abortController.abort(new Error('private worker shutdown detail'));
-    const thumbnail = createThumbnailSource(file, {
+    const thumbnail = createThumbnailSource(readHandle(file), {
       mimeType: 'image/png',
       signal: abortController.signal,
     });

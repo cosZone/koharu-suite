@@ -1,14 +1,21 @@
-import { and, count, desc, eq, lt, or } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import {
+  mediaBlobLocations,
   mediaCacheBlobs,
   mediaCacheCommands,
+  mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
 } from '../db/schema.js';
+import {
+  type MediaCacheCommandOperation,
+  sanitizeStorageOperationResult,
+} from './command-queue.js';
 
 const objectCursorSchema = z
   .object({
@@ -37,11 +44,27 @@ export interface MediaCacheAdminObject {
   actualBytes: string | null;
   canonicalMediaId: string;
   declaredBytes: string | null;
+  evictedPolicy?: 'recache_on_access' | 'stay_evicted';
   id: string;
   kind: string;
+  locations?: Array<{
+    backendId: string;
+    lastAccessedAt: string;
+    state: 'copying' | 'corrupt' | 'deleting' | 'evicted' | 'missing' | 'ready';
+    updatedAt: string;
+    verifiedAt: string | null;
+    verifiedBytes: string | null;
+  }>;
   messageId: string;
   planId: string;
   planState: string;
+  protection?: {
+    active: boolean;
+    expired: boolean;
+    expiresAt: string | null;
+    protectedAt: string;
+    updatedAt: string;
+  } | null;
   reasonCode: string | null;
   state: string;
   updatedAt: string;
@@ -54,14 +77,32 @@ export interface MediaCacheAdminObjectPage {
 }
 
 export interface MediaCacheAdminStatus {
+  backends?: Array<{
+    enabled: boolean;
+    id: string;
+    kind: 'local' | 's3';
+    label: string;
+    lastReconciledAt: string | null;
+    locationStateCounts: MediaCacheStateCount[];
+    maxBytes: string;
+    readPriority: number;
+    readable: boolean;
+    readyBytes: string;
+    updatedAt: string;
+    writable: boolean;
+    writePriority: number;
+  }>;
   commands: Array<{
     completedAt: string | null;
     createdAt: string;
     errorCode: string | null;
     id: string;
-    operation: 'evict' | 'reconcile';
+    operation: MediaCacheCommandOperation;
     result: Record<string, unknown> | null;
+    sourceBackendId?: string | null;
     state: 'failed' | 'pending' | 'running' | 'succeeded';
+    targetBackendId?: string | null;
+    targetBytes?: string | null;
     updatedAt: string;
   }>;
   enabled: boolean;
@@ -95,78 +136,123 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
   ) {}
 
   async getStatus(): Promise<MediaCacheAdminStatus> {
-    const [runtimeRows, plans, objects, blobs, failures, commands] = await Promise.all([
-      this.database
-        .select({
-          lastReconciledAt: mediaCacheRuntime.lastReconciledAt,
-          maxBytes: mediaCacheRuntime.maxBytes,
-          readyBytes: mediaCacheRuntime.readyBytes,
-          reservedBytes: mediaCacheRuntime.reservedBytes,
-          updatedAt: mediaCacheRuntime.updatedAt,
-        })
-        .from(mediaCacheRuntime)
-        .where(eq(mediaCacheRuntime.singletonKey, 'local'))
-        .limit(1),
-      this.database
-        .select({ count: count(), state: mediaCachePostPlans.state })
-        .from(mediaCachePostPlans)
-        .groupBy(mediaCachePostPlans.state)
-        .orderBy(mediaCachePostPlans.state),
-      this.database
-        .select({ count: count(), state: mediaCacheObjects.state })
-        .from(mediaCacheObjects)
-        .groupBy(mediaCacheObjects.state)
-        .orderBy(mediaCacheObjects.state),
-      this.database
-        .select({ count: count(), state: mediaCacheBlobs.state })
-        .from(mediaCacheBlobs)
-        .groupBy(mediaCacheBlobs.state)
-        .orderBy(mediaCacheBlobs.state),
-      this.database
-        .select({
-          lastErrorClass: mediaCacheObjects.lastErrorClass,
-          lastErrorCode: mediaCacheObjects.lastErrorCode,
-          objectId: mediaCacheObjects.id,
-          planId: mediaCacheObjects.postPlanId,
-          reasonCode: mediaCacheObjects.reasonCode,
-          state: mediaCacheObjects.state,
-          updatedAt: mediaCacheObjects.updatedAt,
-          variant: mediaCacheObjects.variant,
-        })
-        .from(mediaCacheObjects)
-        .where(
-          or(
-            eq(mediaCacheObjects.state, 'blocked'),
-            eq(mediaCacheObjects.state, 'integrity_conflict'),
-            eq(mediaCacheObjects.state, 'missing'),
-            eq(mediaCacheObjects.state, 'skipped'),
-          ),
-        )
-        .orderBy(desc(mediaCacheObjects.updatedAt), desc(mediaCacheObjects.id))
-        .limit(10),
-      this.database
-        .select({
-          completedAt: mediaCacheCommands.completedAt,
-          createdAt: mediaCacheCommands.createdAt,
-          errorCode: mediaCacheCommands.errorCode,
-          id: mediaCacheCommands.id,
-          operation: mediaCacheCommands.operation,
-          result: mediaCacheCommands.result,
-          state: mediaCacheCommands.state,
-          updatedAt: mediaCacheCommands.updatedAt,
-        })
-        .from(mediaCacheCommands)
-        .orderBy(desc(mediaCacheCommands.createdAt), desc(mediaCacheCommands.id))
-        .limit(10),
-    ]);
+    const [runtimeRows, plans, objects, blobs, failures, commands, backends, locationCounts] =
+      await Promise.all([
+        this.database
+          .select({
+            lastReconciledAt: mediaCacheRuntime.lastReconciledAt,
+            maxBytes: mediaCacheRuntime.maxBytes,
+            readyBytes: mediaCacheRuntime.readyBytes,
+            reservedBytes: mediaCacheRuntime.reservedBytes,
+            updatedAt: mediaCacheRuntime.updatedAt,
+          })
+          .from(mediaCacheRuntime)
+          .where(eq(mediaCacheRuntime.singletonKey, 'local'))
+          .limit(1),
+        this.database
+          .select({ count: count(), state: mediaCachePostPlans.state })
+          .from(mediaCachePostPlans)
+          .groupBy(mediaCachePostPlans.state)
+          .orderBy(mediaCachePostPlans.state),
+        this.database
+          .select({ count: count(), state: mediaCacheObjects.state })
+          .from(mediaCacheObjects)
+          .groupBy(mediaCacheObjects.state)
+          .orderBy(mediaCacheObjects.state),
+        this.database
+          .select({ count: count(), state: mediaCacheBlobs.state })
+          .from(mediaCacheBlobs)
+          .groupBy(mediaCacheBlobs.state)
+          .orderBy(mediaCacheBlobs.state),
+        this.database
+          .select({
+            lastErrorClass: mediaCacheObjects.lastErrorClass,
+            lastErrorCode: mediaCacheObjects.lastErrorCode,
+            objectId: mediaCacheObjects.id,
+            planId: mediaCacheObjects.postPlanId,
+            reasonCode: mediaCacheObjects.reasonCode,
+            state: mediaCacheObjects.state,
+            updatedAt: mediaCacheObjects.updatedAt,
+            variant: mediaCacheObjects.variant,
+          })
+          .from(mediaCacheObjects)
+          .where(
+            or(
+              eq(mediaCacheObjects.state, 'blocked'),
+              eq(mediaCacheObjects.state, 'integrity_conflict'),
+              eq(mediaCacheObjects.state, 'missing'),
+              eq(mediaCacheObjects.state, 'skipped'),
+            ),
+          )
+          .orderBy(desc(mediaCacheObjects.updatedAt), desc(mediaCacheObjects.id))
+          .limit(10),
+        this.database
+          .select({
+            completedAt: mediaCacheCommands.completedAt,
+            createdAt: mediaCacheCommands.createdAt,
+            errorCode: mediaCacheCommands.errorCode,
+            id: mediaCacheCommands.id,
+            operation: mediaCacheCommands.operation,
+            result: mediaCacheCommands.result,
+            sourceBackendId: mediaCacheCommands.sourceBackendId,
+            state: mediaCacheCommands.state,
+            targetBackendId: mediaCacheCommands.targetBackendId,
+            targetBytes: mediaCacheCommands.targetBytes,
+            updatedAt: mediaCacheCommands.updatedAt,
+          })
+          .from(mediaCacheCommands)
+          .orderBy(desc(mediaCacheCommands.createdAt), desc(mediaCacheCommands.id))
+          .limit(10),
+        this.database
+          .select({
+            enabled: mediaStorageBackends.enabled,
+            id: mediaStorageBackends.id,
+            kind: mediaStorageBackends.kind,
+            label: mediaStorageBackends.label,
+            lastReconciledAt: mediaStorageBackends.lastReconciledAt,
+            maxBytes: mediaStorageBackends.maxBytes,
+            readPriority: mediaStorageBackends.readPriority,
+            readable: mediaStorageBackends.readable,
+            readyBytes: mediaStorageBackends.readyBytes,
+            updatedAt: mediaStorageBackends.updatedAt,
+            writable: mediaStorageBackends.writable,
+            writePriority: mediaStorageBackends.writePriority,
+          })
+          .from(mediaStorageBackends)
+          .orderBy(mediaStorageBackends.readPriority, mediaStorageBackends.id),
+        this.database
+          .select({
+            backendId: mediaBlobLocations.backendId,
+            count: count(),
+            state: mediaBlobLocations.state,
+          })
+          .from(mediaBlobLocations)
+          .groupBy(mediaBlobLocations.backendId, mediaBlobLocations.state)
+          .orderBy(mediaBlobLocations.backendId, mediaBlobLocations.state),
+      ]);
     const runtime = runtimeRows[0];
+    const locationCountsByBackend = new Map<string, MediaCacheStateCount[]>();
+    for (const locationCount of locationCounts) {
+      const counts = locationCountsByBackend.get(locationCount.backendId) ?? [];
+      counts.push({ count: locationCount.count, state: locationCount.state });
+      locationCountsByBackend.set(locationCount.backendId, counts);
+    }
 
     return {
+      backends: backends.map((backend) => ({
+        ...backend,
+        lastReconciledAt: backend.lastReconciledAt?.toISOString() ?? null,
+        locationStateCounts: locationCountsByBackend.get(backend.id) ?? [],
+        maxBytes: backend.maxBytes.toString(),
+        readyBytes: backend.readyBytes.toString(),
+        updatedAt: backend.updatedAt.toISOString(),
+      })),
       commands: commands.map((command) => ({
         ...command,
         completedAt: command.completedAt?.toISOString() ?? null,
         createdAt: command.createdAt.toISOString(),
-        result: sanitizeCommandResult(command.operation, command.result),
+        result: sanitizeMediaCacheCommandResult(command.operation, command.result),
+        targetBytes: command.targetBytes?.toString() ?? null,
         updatedAt: command.updatedAt.toISOString(),
       })),
       enabled: this.config.enabled,
@@ -199,6 +285,7 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
         actualBytes: mediaCacheObjects.actualBytes,
         canonicalMediaId: mediaCacheObjects.canonicalMediaId,
         declaredBytes: mediaCacheObjects.declaredBytes,
+        evictedPolicy: mediaCacheObjects.evictedPolicy,
         id: mediaCacheObjects.id,
         kind: messageMedia.kind,
         messageId: mediaCachePostPlans.messageId,
@@ -208,6 +295,7 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
         state: mediaCacheObjects.state,
         updatedAt: mediaCacheObjects.updatedAt,
         variant: mediaCacheObjects.variant,
+        blobSha256: mediaCacheObjects.blobSha256,
       })
       .from(mediaCacheObjects)
       .innerJoin(mediaCachePostPlans, eq(mediaCachePostPlans.id, mediaCacheObjects.postPlanId))
@@ -227,12 +315,73 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
       .limit(input.limit + 1);
     const pageRows = rows.slice(0, input.limit);
     const last = pageRows.at(-1);
+    const blobSha256s = pageRows.flatMap((row) => (row.blobSha256 ? [row.blobSha256] : []));
+    const objectIds = pageRows.map((row) => row.id);
+    const [locations, protections] = await Promise.all([
+      blobSha256s.length > 0
+        ? this.database
+            .select({
+              backendId: mediaBlobLocations.backendId,
+              blobSha256: mediaBlobLocations.blobSha256,
+              lastAccessedAt: mediaBlobLocations.lastAccessedAt,
+              state: mediaBlobLocations.state,
+              updatedAt: mediaBlobLocations.updatedAt,
+              verifiedAt: mediaBlobLocations.verifiedAt,
+              verifiedBytes: mediaBlobLocations.verifiedByteLength,
+            })
+            .from(mediaBlobLocations)
+            .where(inArray(mediaBlobLocations.blobSha256, blobSha256s))
+            .orderBy(mediaBlobLocations.backendId)
+        : [],
+      objectIds.length > 0
+        ? this.database
+            .select({
+              active: sql<boolean>`${mediaCacheObjectProtections.expiresAt} is null
+                or ${mediaCacheObjectProtections.expiresAt} > statement_timestamp()`,
+              expired: sql<boolean>`${mediaCacheObjectProtections.expiresAt} is not null
+                and ${mediaCacheObjectProtections.expiresAt} <= statement_timestamp()`,
+              expiresAt: mediaCacheObjectProtections.expiresAt,
+              objectId: mediaCacheObjectProtections.objectId,
+              protectedAt: mediaCacheObjectProtections.protectedAt,
+              updatedAt: mediaCacheObjectProtections.updatedAt,
+            })
+            .from(mediaCacheObjectProtections)
+            .where(inArray(mediaCacheObjectProtections.objectId, objectIds))
+        : [],
+    ]);
+    const locationsByBlob = new Map<string, MediaCacheAdminObject['locations']>();
+    for (const location of locations) {
+      const items = locationsByBlob.get(location.blobSha256) ?? [];
+      items.push({
+        backendId: location.backendId,
+        lastAccessedAt: location.lastAccessedAt.toISOString(),
+        state: location.state,
+        updatedAt: location.updatedAt.toISOString(),
+        verifiedAt: location.verifiedAt?.toISOString() ?? null,
+        verifiedBytes: location.verifiedBytes?.toString() ?? null,
+      });
+      locationsByBlob.set(location.blobSha256, items);
+    }
+    const protectionsByObject = new Map(
+      protections.map((protection) => [
+        protection.objectId,
+        {
+          active: protection.active,
+          expired: protection.expired,
+          expiresAt: protection.expiresAt?.toISOString() ?? null,
+          protectedAt: protection.protectedAt.toISOString(),
+          updatedAt: protection.updatedAt.toISOString(),
+        },
+      ]),
+    );
 
     return {
-      items: pageRows.map((row) => ({
+      items: pageRows.map(({ blobSha256, ...row }) => ({
         ...row,
         actualBytes: row.actualBytes?.toString() ?? null,
         declaredBytes: row.declaredBytes?.toString() ?? null,
+        locations: blobSha256 ? (locationsByBlob.get(blobSha256) ?? []) : [],
+        protection: protectionsByObject.get(row.id) ?? null,
         updatedAt: row.updatedAt.toISOString(),
       })),
       nextCursor:
@@ -243,8 +392,8 @@ export class PostgresMediaCacheAdminRepository implements MediaCacheAdminReader 
   }
 }
 
-function sanitizeCommandResult(
-  operation: 'evict' | 'reconcile',
+export function sanitizeMediaCacheCommandResult(
+  operation: MediaCacheCommandOperation,
   result: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
   if (!result) return null;
@@ -265,22 +414,25 @@ function sanitizeCommandResult(
       ...(isDecimalString(result.readyBytes) ? { readyBytes: result.readyBytes } : {}),
     };
   }
-  const sanitized: Record<string, unknown> = {};
-  for (const key of [
-    'checked',
-    'missing',
-    'orphanFailed',
-    'orphanFound',
-    'orphanRecovered',
-    'pages',
-    'repairFailed',
-    'repaired',
-  ]) {
-    if (Number.isSafeInteger(result[key]) && Number(result[key]) >= 0) {
-      sanitized[key] = result[key];
+  if (operation === 'reconcile') {
+    const sanitized: Record<string, unknown> = {};
+    for (const key of [
+      'checked',
+      'missing',
+      'orphanFailed',
+      'orphanFound',
+      'orphanRecovered',
+      'pages',
+      'repairFailed',
+      'repaired',
+    ]) {
+      if (Number.isSafeInteger(result[key]) && Number(result[key]) >= 0) {
+        sanitized[key] = result[key];
+      }
     }
+    return sanitized;
   }
-  return sanitized;
+  return sanitizeStorageOperationResult(operation, result);
 }
 
 function isDecimalString(value: unknown): value is string {

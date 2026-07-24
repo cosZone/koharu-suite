@@ -10,8 +10,14 @@ import {
   messageRevisions,
   messages,
 } from '../db/schema.js';
+import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
+import {
+  assertLocalStorageWriteAllowed,
+  recordLocalStorageReady,
+} from './storage-ledger-repository.js';
 
-export const MEDIA_CACHE_ADVISORY_LOCK = 6_309_648_946_926_691;
+export { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
+
 const MIB = 1024n * 1024n;
 const POST_MAX_BYTES = 50n * MIB;
 const ORIGINAL_LIMITS = {
@@ -31,7 +37,7 @@ const DETECTED_MEDIA_MIMES = new Set<DetectedMediaMime>([
 const SHA256 = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
-type MediaCacheTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+export type MediaCacheTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 type DetectedMediaMime =
   | 'image/avif'
   | 'image/gif'
@@ -59,6 +65,13 @@ export interface PublishedMediaCacheObjectIdentity {
   byteLength: bigint;
   detectedMime: DetectedMediaMime;
   objectId: string;
+  relativeKey: string;
+  sha256: string;
+}
+
+export interface RestoreLegacyLocalBlobInput {
+  byteLength: bigint;
+  now: Date;
   relativeKey: string;
   sha256: string;
 }
@@ -542,6 +555,9 @@ export class PostgresMediaCacheLedgerRepository {
         );
       }
 
+      for (const blob of uniqueBlobs) {
+        await assertLocalStorageWriteAllowed(transaction, blob.sha256);
+      }
       await input.publish();
       const postPublishNow = await readDatabaseClock(transaction);
       assertFencedRowsRemainLive(plan, claimedObjects, input.leaseToken, postPublishNow);
@@ -571,9 +587,7 @@ export class PostgresMediaCacheLedgerRepository {
             sha256: blob.sha256,
             state: 'ready',
           });
-          continue;
-        }
-        if (existing.state !== 'ready') {
+        } else if (existing.state !== 'ready') {
           await transaction
             .update(mediaCacheBlobs)
             .set({
@@ -585,6 +599,14 @@ export class PostgresMediaCacheLedgerRepository {
             })
             .where(eq(mediaCacheBlobs.sha256, blob.sha256));
         }
+        await recordLocalStorageReady(
+          transaction,
+          {
+            ...blob,
+            lastAccessedAt: postPublishNow,
+          },
+          postPublishNow,
+        );
       }
 
       const pendingOriginalBytesByPlan = new Map<string, bigint>();
@@ -1296,6 +1318,79 @@ export class PostgresMediaCacheLedgerRepository {
         .where(eq(mediaCachePostPlans.id, plan.id));
       return true;
     });
+  }
+}
+
+/**
+ * Restores the legacy local-reader ledger only. The caller owns the advisory lock and the
+ * additive media_blob_locations/media_storage_backends finalization in the same transaction.
+ */
+export async function restoreLegacyLocalBlob(
+  transaction: MediaCacheTransaction,
+  input: RestoreLegacyLocalBlobInput,
+): Promise<void> {
+  if (
+    input.byteLength <= 0n ||
+    !SHA256.test(input.sha256) ||
+    !input.relativeKey ||
+    !Number.isFinite(input.now.getTime())
+  ) {
+    throw new MediaCacheLedgerError('invalid_input', 'Legacy local restore identity is invalid');
+  }
+  const [blob] = await transaction
+    .select({
+      byteLength: mediaCacheBlobs.byteLength,
+      relativeKey: mediaCacheBlobs.relativeKey,
+      state: mediaCacheBlobs.state,
+    })
+    .from(mediaCacheBlobs)
+    .where(eq(mediaCacheBlobs.sha256, input.sha256))
+    .for('update');
+  if (!blob) {
+    throw new MediaCacheLedgerError(
+      'ledger_invariant',
+      'Legacy local restore references a missing blob',
+    );
+  }
+  if (blob.byteLength !== input.byteLength || blob.relativeKey !== input.relativeKey) {
+    throw new MediaCacheLedgerError(
+      'blob_identity_conflict',
+      'Legacy local restore conflicts with immutable blob metadata',
+    );
+  }
+  if (blob.state === 'deleting') {
+    throw new MediaCacheLedgerError(
+      'blob_deleting',
+      'Legacy local blob is being evicted and cannot be restored',
+    );
+  }
+  if (blob.state === 'ready') return;
+
+  const runtime = await lockRuntime(transaction);
+  await transaction
+    .update(mediaCacheBlobs)
+    .set({
+      evictionExpiresAt: null,
+      evictionOwner: null,
+      evictionToken: null,
+      state: 'ready',
+      updatedAt: input.now,
+    })
+    .where(eq(mediaCacheBlobs.sha256, input.sha256));
+  await restoreRelatedBlobObjects(transaction, [input.sha256], new Map(), input.now);
+  const [updatedRuntime] = await transaction
+    .update(mediaCacheRuntime)
+    .set({
+      readyBytes: runtime.readyBytes + input.byteLength,
+      updatedAt: input.now,
+    })
+    .where(eq(mediaCacheRuntime.singletonKey, 'local'))
+    .returning({ readyBytes: mediaCacheRuntime.readyBytes });
+  if (!updatedRuntime) {
+    throw new MediaCacheLedgerError(
+      'ledger_invariant',
+      'Legacy local runtime disappeared during restore',
+    );
   }
 }
 

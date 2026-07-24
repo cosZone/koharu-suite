@@ -83,6 +83,103 @@ describe('LocalMediaBlobStore', () => {
     await opened.close();
   });
 
+  it('reads a staged blob through a backend-neutral handle', async () => {
+    const { store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('staged bytes'),
+    });
+
+    const handle = await store.readStaged(staged);
+
+    expect(handle.byteLength).toBe(Buffer.byteLength('staged bytes'));
+    await expect(new Response(handle.stream()).text()).resolves.toBe('staged bytes');
+    await expect(handle.close()).resolves.toBeUndefined();
+    await store.settle(staged, 'db_rolled_back');
+  });
+
+  it('reads a complete published blob through a backend-neutral handle', async () => {
+    const { store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('complete ', 'published blob'),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+
+    const handle = await store.read(published);
+
+    expect(handle.byteLength).toBe(Buffer.byteLength('complete published blob'));
+    await expect(new Response(handle.stream()).text()).resolves.toBe('complete published blob');
+    await expect(handle.close()).resolves.toBeUndefined();
+  });
+
+  it('reads an inclusive byte range from a published blob', async () => {
+    const { store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('0123456789'),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const handle = await store.read(published);
+
+    await expect(new Response(handle.stream({ end: 6, start: 3 })).text()).resolves.toBe('3456');
+  });
+
+  it('rejects repeated consumption of a blob read handle', async () => {
+    const { store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('consume once'),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const handle = await store.read(published);
+    const stream = handle.stream();
+
+    expect(() => handle.stream()).toThrow('already consumed or closed');
+    await stream.cancel();
+  });
+
+  it('closes an unconsumed blob read handle idempotently', async () => {
+    const { store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('close without consuming'),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const handle = await store.read(published);
+
+    await expect(handle.close()).resolves.toBeUndefined();
+    await expect(handle.close()).resolves.toBeUndefined();
+    expect(() => handle.stream()).toThrow('already consumed or closed');
+  });
+
+  it('closes the underlying blob file when its stream is cancelled', async () => {
+    const { store } = await createStore();
+    const content = 'x'.repeat(192 * 1024);
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: content.length,
+      source: chunks(content),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const handle = await store.read(published);
+    const reader = handle.stream().getReader();
+
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    await expect(reader.cancel(new Error('client disconnected'))).resolves.toBeUndefined();
+    await expect(handle.close()).resolves.toBeUndefined();
+  });
+
   it('durably evicts a published blob while an already-open response can finish', async () => {
     const { root, store } = await createStore();
     const content = 'open response survives eviction';

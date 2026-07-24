@@ -130,14 +130,32 @@ interface ReconciliationRun {
 }
 
 export interface MediaCacheStatus {
+  backends?: Array<{
+    enabled: boolean;
+    id: string;
+    kind: 'local' | 's3';
+    label: string;
+    lastReconciledAt: string | null;
+    locationStateCounts: Array<{ count: number; state: string }>;
+    maxBytes: string;
+    readPriority: number;
+    readable: boolean;
+    readyBytes: string;
+    updatedAt: string;
+    writable: boolean;
+    writePriority: number;
+  }>;
   commands: Array<{
     completedAt: string | null;
     createdAt: string;
     errorCode: string | null;
     id: string;
-    operation: 'evict' | 'reconcile';
+    operation: 'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore';
     result: Record<string, unknown> | null;
+    sourceBackendId?: string | null;
     state: 'failed' | 'pending' | 'running' | 'succeeded';
+    targetBackendId?: string | null;
+    targetBytes?: string | null;
     updatedAt: string;
   }>;
   enabled: boolean;
@@ -169,11 +187,27 @@ export interface MediaCacheObject {
   actualBytes: string | null;
   canonicalMediaId: string;
   declaredBytes: string | null;
+  evictedPolicy?: 'recache_on_access' | 'stay_evicted';
   id: string;
   kind: string;
+  locations?: Array<{
+    backendId: string;
+    lastAccessedAt: string;
+    state: 'copying' | 'corrupt' | 'deleting' | 'evicted' | 'missing' | 'ready';
+    updatedAt: string;
+    verifiedAt: string | null;
+    verifiedBytes: string | null;
+  }>;
   messageId: string;
   planId: string;
   planState: string;
+  protection?: {
+    active: boolean;
+    expired: boolean;
+    expiresAt: string | null;
+    protectedAt: string;
+    updatedAt: string;
+  } | null;
   reasonCode: string | null;
   state: string;
   updatedAt: string;
@@ -182,8 +216,46 @@ export interface MediaCacheObject {
 
 interface MediaCacheCommandReceipt {
   commandId: string;
-  operation: 'evict' | 'reconcile';
+  operation: 'evict' | 'migrate' | 'prune' | 'reconcile' | 'restore';
   state: 'pending';
+}
+
+interface MediaCachePrunePreview {
+  candidates: number;
+  hasMore: boolean;
+  projectedReadyBytes: string;
+  readyBytes: string;
+  removableBytes: string;
+  targetBackendId: string;
+  targetBytes: string;
+}
+
+type MediaCachePolicy = 'recache_on_access' | 'stay_evicted';
+
+export function mediaCachePrunePreviewMatches(
+  preview: MediaCachePrunePreview | null,
+  targetBackendId: string,
+  targetBytes: string,
+): boolean {
+  return (
+    preview !== null &&
+    preview.targetBackendId === targetBackendId &&
+    preview.targetBytes === targetBytes
+  );
+}
+
+export async function publishMediaCacheMutationReceipt(input: {
+  refresh(): Promise<void>;
+  refreshFailureNotice: string;
+  setNotice(notice: string): void;
+  successNotice: string;
+}): Promise<void> {
+  input.setNotice(input.successNotice);
+  try {
+    await input.refresh();
+  } catch {
+    input.setNotice(input.refreshFailureNotice);
+  }
 }
 
 type AuthStep = 'login' | 'two-factor';
@@ -927,9 +999,26 @@ interface MediaCachePanelProps {
   notice: string | null;
   objects: MediaCacheObject[];
   onAction(object: MediaCacheObject, action: 'evict' | 'retry', reason: string): void;
+  onCopy(
+    object: MediaCacheObject | null,
+    sourceBackendId: string,
+    targetBackendId: string,
+    reason: string,
+  ): void;
   onLoadMore(): void;
+  onPolicy(object: MediaCacheObject, policy: MediaCachePolicy, reason: string): void;
+  onProtect(object: MediaCacheObject, action: 'protect' | 'unprotect', reason: string): void;
+  onPrune(
+    action: 'apply' | 'preview',
+    targetBackendId: string,
+    targetBytes: string,
+    reason: string,
+  ): void;
+  onPrunePreviewClear(): void;
   onReasonChange(key: string, reason: string): void;
   onReconcile(reason: string): void;
+  onRestore(object: MediaCacheObject, targetBackendId: string, reason: string): void;
+  prunePreview: MediaCachePrunePreview | null;
   reasons: Record<string, string>;
   status: MediaCacheStatus;
 }
@@ -940,9 +1029,16 @@ export function MediaCachePanel({
   notice,
   objects,
   onAction,
+  onCopy,
   onLoadMore,
+  onPolicy,
+  onProtect,
+  onPrune,
+  onPrunePreviewClear,
   onReasonChange,
   onReconcile,
+  onRestore,
+  prunePreview,
   reasons,
   status,
 }: MediaCachePanelProps) {
@@ -950,6 +1046,26 @@ export function MediaCachePanel({
   const reservedBytes = Number(status.usage.reservedBytes);
   const maxBytes = Math.max(1, Number(status.usage.maxBytes));
   const reconcileReason = reasons.reconcile?.trim() ?? '';
+  const backends = status.backends ?? [];
+  const readableBackends = backends.filter((backend) => backend.enabled && backend.readable);
+  const writableBackends = backends.filter((backend) => backend.enabled && backend.writable);
+  const defaultSource = readableBackends[0]?.id ?? '';
+  const defaultTarget =
+    writableBackends.find((backend) => backend.id !== defaultSource)?.id ??
+    writableBackends[0]?.id ??
+    '';
+  const [copySource, setCopySource] = useState(defaultSource);
+  const [copyTarget, setCopyTarget] = useState(defaultTarget);
+  const [pruneBackend, setPruneBackend] = useState(writableBackends[0]?.id ?? '');
+  const [pruneTargetBytes, setPruneTargetBytes] = useState(writableBackends[0]?.readyBytes ?? '0');
+  const copyReason = reasons['storage-copy']?.trim() ?? '';
+  const pruneReason = reasons['storage-prune']?.trim() ?? '';
+  const prunePreviewMatches = mediaCachePrunePreviewMatches(
+    prunePreview,
+    pruneBackend,
+    pruneTargetBytes,
+  );
+  const busy = busyAction !== null;
 
   return (
     <section className="media-cache" aria-labelledby="media-cache-title">
@@ -993,6 +1109,48 @@ export function MediaCachePanel({
         {status.stateCounts.objects.length === 0 ? <li>暂无缓存对象</li> : null}
       </ul>
 
+      {backends.length > 0 ? (
+        <section className="media-cache__backends" aria-label="存储后端">
+          {backends.map((backend) => {
+            const backendMax = Math.max(1, Number(backend.maxBytes));
+            return (
+              <article key={backend.id}>
+                <header>
+                  <div>
+                    <strong>{backend.label}</strong>
+                    <code>
+                      {backend.kind} · {backend.id}
+                    </code>
+                  </div>
+                  <Badge tone={backend.enabled ? 'success' : 'neutral'}>
+                    {backend.enabled ? '在线' : '停用'}
+                  </Badge>
+                </header>
+                <div className="media-cache__backend-capacity">
+                  <span>
+                    {formatBytes(backend.readyBytes)} / {formatBytes(backend.maxBytes)}
+                  </span>
+                  <progress
+                    aria-label={`${backend.label} 容量`}
+                    max={backendMax}
+                    value={Math.min(backendMax, Math.max(0, Number(backend.readyBytes)))}
+                  />
+                </div>
+                <ul className="media-cache__counts" aria-label={`${backend.label} 位置状态`}>
+                  {backend.locationStateCounts.map((entry) => (
+                    <li key={entry.state}>
+                      <strong>{entry.count}</strong> {entry.state}
+                    </li>
+                  ))}
+                  <li>{backend.readable ? '可读' : '不可读'}</li>
+                  <li>{backend.writable ? '可写' : '只读'}</li>
+                </ul>
+              </article>
+            );
+          })}
+        </section>
+      ) : null}
+
       {notice ? (
         <p className="media-cache__notice" role="status">
           {notice}
@@ -1029,6 +1187,8 @@ export function MediaCachePanel({
                 <code>{command.id.slice(0, 8)}</code>
                 <span>
                   {command.operation} · {command.state}
+                  {command.sourceBackendId ? ` · ${command.sourceBackendId}` : ''}
+                  {command.targetBackendId ? ` → ${command.targetBackendId}` : ''}
                   {command.errorCode ? ` · ${command.errorCode}` : ''}
                 </span>
                 <time dateTime={command.updatedAt}>{formatDate(command.updatedAt)}</time>
@@ -1042,6 +1202,7 @@ export function MediaCachePanel({
         {objects.map((object) => {
           const reason = reasons[object.id]?.trim() ?? '';
           const canEvict = object.state === 'ready';
+          const isProtected = object.protection?.active === true;
           const canRetry = [
             'blocked',
             'evicted',
@@ -1050,7 +1211,27 @@ export function MediaCachePanel({
             'retry_wait',
             'skipped',
           ].includes(object.state);
-          const busy = busyAction !== null;
+          const locations = object.locations ?? [];
+          const readyLocation = locations.find(
+            (location) =>
+              location.state === 'ready' &&
+              readableBackends.some((backend) => backend.id === location.backendId),
+          );
+          const copyTargets = readyLocation
+            ? writableBackends.filter(
+                (backend) =>
+                  backend.id !== readyLocation.backendId &&
+                  !locations.some((location) => location.backendId === backend.id),
+              )
+            : [];
+          const restoreTargets = writableBackends.filter((backend) =>
+            locations.some(
+              (location) =>
+                location.backendId === backend.id &&
+                ['corrupt', 'evicted', 'missing'].includes(location.state),
+            ),
+          );
+          const hasStorageActions = status.backends !== undefined;
           return (
             <article key={object.id}>
               <header>
@@ -1081,7 +1262,34 @@ export function MediaCachePanel({
                     : '大小未知'}
                 {object.reasonCode ? ` · ${object.reasonCode}` : ''}
               </p>
-              {canEvict || canRetry ? (
+              {hasStorageActions ? (
+                <div className="media-cache__object-flags">
+                  <Badge tone={isProtected ? 'success' : 'neutral'}>
+                    {isProtected
+                      ? object.protection?.expiresAt
+                        ? `保护至 ${formatDate(object.protection.expiresAt)}`
+                        : '长期保护'
+                      : object.protection?.expired
+                        ? '保护已过期'
+                        : '未保护'}
+                  </Badge>
+                  <Badge tone={object.evictedPolicy === 'stay_evicted' ? 'warning' : 'neutral'}>
+                    {object.evictedPolicy === 'stay_evicted' ? '保持驱逐' : '按访问回填'}
+                  </Badge>
+                  {locations.map((location) => (
+                    <span
+                      className={`media-cache__location is-${location.state}`}
+                      key={location.backendId}
+                    >
+                      {location.backendId}: {location.state}
+                    </span>
+                  ))}
+                  {locations.length === 0 ? (
+                    <span className="media-cache__location">尚无物理位置</span>
+                  ) : null}
+                </div>
+              ) : null}
+              {canEvict || canRetry || hasStorageActions ? (
                 <>
                   <Field label="操作原因（必填，将写入审计记录）">
                     <Input
@@ -1104,14 +1312,79 @@ export function MediaCachePanel({
                     ) : null}
                     {canEvict ? (
                       <Button
-                        disabled={busy || reason.length === 0}
+                        disabled={busy || reason.length === 0 || isProtected}
                         onClick={() => onAction(object, 'evict', reason)}
+                        title={isProtected ? '请先移除对象保护' : undefined}
                         type="button"
                         variant="danger"
                       >
                         {busyAction === `${object.id}:evict` ? '正在驱逐…' : '驱逐本地副本'}
                       </Button>
                     ) : null}
+                    {hasStorageActions && !isProtected ? (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        onClick={() => onProtect(object, 'protect', reason)}
+                        type="button"
+                        variant="quiet"
+                      >
+                        {busyAction === `${object.id}:protect` ? '正在保护…' : '保护对象'}
+                      </Button>
+                    ) : null}
+                    {hasStorageActions && isProtected ? (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        onClick={() => onProtect(object, 'unprotect', reason)}
+                        type="button"
+                        variant="danger"
+                      >
+                        {busyAction === `${object.id}:unprotect` ? '正在移除…' : '移除保护'}
+                      </Button>
+                    ) : null}
+                    {hasStorageActions ? (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        onClick={() =>
+                          onPolicy(
+                            object,
+                            object.evictedPolicy === 'stay_evicted'
+                              ? 'recache_on_access'
+                              : 'stay_evicted',
+                            reason,
+                          )
+                        }
+                        type="button"
+                        variant="quiet"
+                      >
+                        {object.evictedPolicy === 'stay_evicted'
+                          ? '恢复按访问回填'
+                          : '驱逐后保持缺席'}
+                      </Button>
+                    ) : null}
+                    {copyTargets.map((target) => (
+                      <Button
+                        disabled={busy || reason.length === 0}
+                        key={`copy:${target.id}`}
+                        onClick={() =>
+                          onCopy(object, readyLocation?.backendId ?? '', target.id, reason)
+                        }
+                        type="button"
+                        variant="quiet"
+                      >
+                        复制到 {target.label}
+                      </Button>
+                    ))}
+                    {restoreTargets.map((target) => (
+                      <Button
+                        disabled={busy || reason.length === 0 || !readyLocation}
+                        key={`restore:${target.id}`}
+                        onClick={() => onRestore(object, target.id, reason)}
+                        type="button"
+                        variant="quiet"
+                      >
+                        恢复到 {target.label}
+                      </Button>
+                    ))}
                   </div>
                 </>
               ) : null}
@@ -1131,6 +1404,171 @@ export function MediaCachePanel({
           </Button>
         ) : null}
       </div>
+
+      {backends.length > 1 ? (
+        <div className="media-cache__storage-tools">
+          <section aria-labelledby="storage-copy-title">
+            <h3 id="storage-copy-title">批量复制</h3>
+            <p>按账本顺序复制一个有界批次；源位置会保留。</p>
+            <div className="media-cache__select-row">
+              <label>
+                源后端
+                <select
+                  disabled={busy}
+                  onChange={(event) => setCopySource(event.target.value)}
+                  value={copySource}
+                >
+                  {readableBackends.map((backend) => (
+                    <option key={backend.id} value={backend.id}>
+                      {backend.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                目标后端
+                <select
+                  disabled={busy}
+                  onChange={(event) => setCopyTarget(event.target.value)}
+                  value={copyTarget}
+                >
+                  {writableBackends.map((backend) => (
+                    <option key={backend.id} value={backend.id}>
+                      {backend.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <Field label="复制原因（必填）">
+              <Input
+                disabled={busy}
+                maxLength={500}
+                onChange={(event) => onReasonChange('storage-copy', event.target.value)}
+                placeholder="例如：建立 S3 耐久副本"
+                value={reasons['storage-copy'] ?? ''}
+              />
+            </Field>
+            <Button
+              disabled={
+                busy ||
+                copyReason.length === 0 ||
+                copySource.length === 0 ||
+                copyTarget.length === 0 ||
+                copySource === copyTarget
+              }
+              onClick={() => onCopy(null, copySource, copyTarget, copyReason)}
+              type="button"
+              variant="quiet"
+            >
+              {busyAction === 'storage-copy' ? '正在入队…' : '复制一个批次'}
+            </Button>
+          </section>
+
+          <section aria-labelledby="storage-prune-title">
+            <h3 id="storage-prune-title">按 LRU 整理空间</h3>
+            <p>预览严格零写；应用时会基于最新账本重新规划，结果可能变化。</p>
+            <div className="media-cache__select-row">
+              <label>
+                后端
+                <select
+                  disabled={busy}
+                  onChange={(event) => {
+                    setPruneBackend(event.target.value);
+                    onPrunePreviewClear();
+                    const backend = writableBackends.find(
+                      (candidate) => candidate.id === event.target.value,
+                    );
+                    setPruneTargetBytes(backend?.readyBytes ?? '0');
+                  }}
+                  value={pruneBackend}
+                >
+                  {writableBackends.map((backend) => (
+                    <option key={backend.id} value={backend.id}>
+                      {backend.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                目标字节数
+                <input
+                  disabled={busy}
+                  inputMode="numeric"
+                  min="0"
+                  onChange={(event) => {
+                    setPruneTargetBytes(event.target.value);
+                    onPrunePreviewClear();
+                  }}
+                  pattern="[0-9]+"
+                  value={pruneTargetBytes}
+                />
+              </label>
+            </div>
+            <div className="media-cache__actions">
+              <Button
+                disabled={busy || pruneBackend.length === 0 || !/^\d+$/.test(pruneTargetBytes)}
+                onClick={() => onPrune('preview', pruneBackend, pruneTargetBytes, '')}
+                type="button"
+                variant="quiet"
+              >
+                {busyAction === 'storage-prune-preview' ? '正在预览…' : '预览整理'}
+              </Button>
+              <Field label="应用原因（必填）">
+                <Input
+                  disabled={busy}
+                  maxLength={500}
+                  onChange={(event) => onReasonChange('storage-prune', event.target.value)}
+                  placeholder="例如：将热层收缩到 4 GiB"
+                  value={reasons['storage-prune'] ?? ''}
+                />
+              </Field>
+              <Button
+                disabled={
+                  busy ||
+                  pruneReason.length === 0 ||
+                  pruneBackend.length === 0 ||
+                  !/^\d+$/.test(pruneTargetBytes) ||
+                  !prunePreviewMatches
+                }
+                onClick={() => onPrune('apply', pruneBackend, pruneTargetBytes, pruneReason)}
+                type="button"
+                variant="danger"
+              >
+                {busyAction === 'storage-prune-apply' ? '正在入队…' : '应用重新规划'}
+              </Button>
+            </div>
+            {prunePreview ? (
+              <dl className="media-cache__prune-preview" aria-label="整理预览">
+                <div className="media-cache__prune-metric">
+                  <dt>后端</dt>
+                  <dd>{prunePreview.targetBackendId}</dd>
+                </div>
+                <div className="media-cache__prune-metric">
+                  <dt>目标</dt>
+                  <dd>{formatBytes(prunePreview.targetBytes)}</dd>
+                </div>
+                <div className="media-cache__prune-metric">
+                  <dt>候选</dt>
+                  <dd>{prunePreview.candidates}</dd>
+                </div>
+                <div className="media-cache__prune-metric">
+                  <dt>可释放</dt>
+                  <dd>{formatBytes(prunePreview.removableBytes)}</dd>
+                </div>
+                <div className="media-cache__prune-metric">
+                  <dt>预计剩余</dt>
+                  <dd>{formatBytes(prunePreview.projectedReadyBytes)}</dd>
+                </div>
+                <div className="media-cache__prune-metric">
+                  <dt>更多批次</dt>
+                  <dd>{prunePreview.hasMore ? '是' : '否'}</dd>
+                </div>
+              </dl>
+            ) : null}
+          </section>
+        </div>
+      ) : null}
 
       <div className="media-cache__reconcile">
         <Field label="对账原因（必填，将写入审计记录）">
@@ -1330,6 +1768,8 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [mediaCacheNextCursor, setMediaCacheNextCursor] = useState<string | null>(null);
   const [mediaCacheBusy, setMediaCacheBusy] = useState<string | null>(null);
   const [mediaCacheNotice, setMediaCacheNotice] = useState<string | null>(null);
+  const [mediaCachePrunePreview, setMediaCachePrunePreview] =
+    useState<MediaCachePrunePreview | null>(null);
   const [mediaCacheReasons, setMediaCacheReasons] = useState<Record<string, string>>({});
 
   useEffect(() => {
@@ -1637,6 +2077,18 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     setMediaCacheNextCursor(objectResult.nextCursor);
   }
 
+  async function refreshMediaCacheAfterSuccess(
+    successNotice: string,
+    refreshFailureNotice: string,
+  ): Promise<void> {
+    await publishMediaCacheMutationReceipt({
+      refresh: refreshMediaCache,
+      refreshFailureNotice,
+      setNotice: setMediaCacheNotice,
+      successNotice,
+    });
+  }
+
   async function loadMoreMediaCacheObjects() {
     if (!mediaCacheNextCursor) return;
     setMediaCacheBusy('more');
@@ -1680,19 +2132,211 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           method: 'POST',
         },
       );
-      await refreshMediaCache();
       setMediaCacheReasons((current) => {
         const next = { ...current };
         delete next[object.id];
         return next;
       });
-      setMediaCacheNotice(
-        action === 'evict' && 'commandId' in result
-          ? `驱逐命令已入队（${result.commandId}），将由 worker 执行。`
-          : '对象已重新进入缓存队列。',
-      );
+      if (action === 'evict' && 'commandId' in result) {
+        const successNotice = `驱逐命令已入队（${result.commandId}），将由 worker 执行。`;
+        await refreshMediaCacheAfterSuccess(
+          successNotice,
+          `驱逐命令已入队（${result.commandId}），但状态刷新失败；请稍后手动确认。`,
+        );
+      } else {
+        await refreshMediaCacheAfterSuccess(
+          '对象已重新进入缓存队列。',
+          '对象已重新进入缓存队列，但状态刷新失败；请稍后手动确认。',
+        );
+      }
     } catch (reasonValue) {
       setError(reasonValue instanceof Error ? reasonValue.message : '媒体缓存操作失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function protectMediaCacheObject(
+    object: MediaCacheObject,
+    action: 'protect' | 'unprotect',
+    reason: string,
+  ) {
+    if (
+      action === 'unprotect' &&
+      !window.confirm('移除对象保护？之后显式驱逐与空间整理都可能删除它的缓存位置。')
+    ) {
+      return;
+    }
+    setMediaCacheBusy(`${object.id}:${action}`);
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      await fetchJson<object>(`/api/v1/admin/media-cache/objects/${object.id}/${action}`, {
+        body: JSON.stringify({ reason }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      setMediaCacheReasons((current) => ({ ...current, [object.id]: '' }));
+      const successNotice = action === 'protect' ? '对象保护已启用。' : '对象保护已移除。';
+      await refreshMediaCacheAfterSuccess(
+        successNotice,
+        `${successNotice.slice(0, -1)}，但状态刷新失败；请稍后手动确认。`,
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '对象保护操作失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function setMediaCachePolicy(
+    object: MediaCacheObject,
+    policy: MediaCachePolicy,
+    reason: string,
+  ) {
+    if (
+      policy === 'stay_evicted' &&
+      !window.confirm('改为保持驱逐？访问这个对象时将不再自动重建缓存副本。')
+    ) {
+      return;
+    }
+    setMediaCacheBusy(`${object.id}:policy`);
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      await fetchJson<object>(`/api/v1/admin/media-cache/objects/${object.id}/policy`, {
+        body: JSON.stringify({ policy, reason }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      setMediaCacheReasons((current) => ({ ...current, [object.id]: '' }));
+      const successNotice =
+        policy === 'stay_evicted' ? '对象将保持驱逐状态。' : '对象已恢复按访问回填。';
+      await refreshMediaCacheAfterSuccess(
+        successNotice,
+        `${successNotice.slice(0, -1)}，但状态刷新失败；请稍后手动确认。`,
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '对象回填策略更新失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function copyMediaCacheStorage(
+    object: MediaCacheObject | null,
+    sourceBackendId: string,
+    targetBackendId: string,
+    reason: string,
+  ) {
+    const busyKey = object ? `${object.id}:copy:${targetBackendId}` : 'storage-copy';
+    setMediaCacheBusy(busyKey);
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      const result = await fetchJson<MediaCacheCommandReceipt>(
+        '/api/v1/admin/media-cache/migrate',
+        {
+          body: JSON.stringify({
+            ...(object ? { objectId: object.id } : {}),
+            reason,
+            sourceBackendId,
+            targetBackendId,
+          }),
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+        },
+      );
+      setMediaCacheReasons((current) => ({
+        ...current,
+        [object?.id ?? 'storage-copy']: '',
+      }));
+      await refreshMediaCacheAfterSuccess(
+        `复制命令已入队（${result.commandId}）。`,
+        `复制命令已入队（${result.commandId}），但状态刷新失败；请稍后手动确认。`,
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '存储复制入队失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function restoreMediaCacheObject(
+    object: MediaCacheObject,
+    targetBackendId: string,
+    reason: string,
+  ) {
+    setMediaCacheBusy(`${object.id}:restore:${targetBackendId}`);
+    setError(null);
+    setMediaCacheNotice(null);
+    try {
+      const result = await fetchJson<MediaCacheCommandReceipt>(
+        `/api/v1/admin/media-cache/objects/${object.id}/restore`,
+        {
+          body: JSON.stringify({ reason, targetBackendId }),
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+        },
+      );
+      setMediaCacheReasons((current) => ({ ...current, [object.id]: '' }));
+      await refreshMediaCacheAfterSuccess(
+        `恢复命令已入队（${result.commandId}）。`,
+        `恢复命令已入队（${result.commandId}），但状态刷新失败；请稍后手动确认。`,
+      );
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '对象恢复入队失败');
+    } finally {
+      setMediaCacheBusy(null);
+    }
+  }
+
+  async function pruneMediaCacheStorage(
+    action: 'apply' | 'preview',
+    targetBackendId: string,
+    targetBytes: string,
+    reason: string,
+  ) {
+    if (
+      action === 'apply' &&
+      !window.confirm('应用空间整理？系统会基于当前账本重新规划，并跳过受保护的对象。')
+    ) {
+      return;
+    }
+    setMediaCacheBusy(`storage-prune-${action}`);
+    setError(null);
+    setMediaCacheNotice(null);
+    if (action === 'preview') setMediaCachePrunePreview(null);
+    try {
+      if (action === 'preview') {
+        const preview = await fetchJson<MediaCachePrunePreview>(
+          '/api/v1/admin/media-cache/prune/preview',
+          {
+            body: JSON.stringify({ targetBackendId, targetBytes }),
+            headers: { 'Content-Type': 'application/json' },
+            method: 'POST',
+          },
+        );
+        setMediaCachePrunePreview(preview);
+        setMediaCacheNotice('整理预览已更新；应用时会重新规划。');
+      } else {
+        const result = await fetchJson<MediaCacheCommandReceipt>(
+          '/api/v1/admin/media-cache/prune',
+          {
+            body: JSON.stringify({ reason, targetBackendId, targetBytes }),
+            headers: { 'Content-Type': 'application/json' },
+            method: 'POST',
+          },
+        );
+        setMediaCachePrunePreview(null);
+        setMediaCacheReasons((current) => ({ ...current, 'storage-prune': '' }));
+        await refreshMediaCacheAfterSuccess(
+          `空间整理命令已入队（${result.commandId}）。`,
+          `空间整理命令已入队（${result.commandId}），但状态刷新失败；请稍后手动确认。`,
+        );
+      }
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : '空间整理操作失败');
     } finally {
       setMediaCacheBusy(null);
     }
@@ -1712,10 +2356,10 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           method: 'POST',
         },
       );
-      await refreshMediaCache();
       setMediaCacheReasons((current) => ({ ...current, reconcile: '' }));
-      setMediaCacheNotice(
+      await refreshMediaCacheAfterSuccess(
         `媒体缓存对账命令已入队（${result.commandId}），worker 会自动完成全部分页。`,
+        `媒体缓存对账命令已入队（${result.commandId}），但状态刷新失败；请稍后手动确认。`,
       );
     } catch (reasonValue) {
       setError(reasonValue instanceof Error ? reasonValue.message : '媒体缓存对账失败');
@@ -1915,11 +2559,18 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               notice={mediaCacheNotice}
               objects={mediaCacheObjects}
               onAction={actOnMediaCacheObject}
+              onCopy={copyMediaCacheStorage}
               onLoadMore={loadMoreMediaCacheObjects}
+              onPolicy={setMediaCachePolicy}
+              onProtect={protectMediaCacheObject}
+              onPrune={pruneMediaCacheStorage}
+              onPrunePreviewClear={() => setMediaCachePrunePreview(null)}
               onReasonChange={(key, reason) =>
                 setMediaCacheReasons((current) => ({ ...current, [key]: reason }))
               }
               onReconcile={reconcileMediaCache}
+              onRestore={restoreMediaCacheObject}
+              prunePreview={mediaCachePrunePreview}
               reasons={mediaCacheReasons}
               status={mediaCacheStatus}
             />

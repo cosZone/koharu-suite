@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import type { Database } from '../db/client.js';
-import type { LocalMediaBlobStore } from './blob-store.js';
 import {
   DesktopImportProvenanceError,
   PostgresDesktopMediaCacheRepository,
@@ -11,7 +10,7 @@ import { DesktopMediaSource, DesktopMediaSourceTooLargeError } from './desktop-s
 import type { MediaCacheDiscoveryResult } from './discovery-repository.js';
 import { PostgresMediaCacheLedgerRepository } from './ledger-repository.js';
 import { TelegramMediaSourceTooLargeError } from './telegram-source.js';
-import { MediaCacheWorker } from './worker.js';
+import { MediaCacheWorker, type MediaCacheWorkerBlobStore } from './worker.js';
 
 export interface DesktopImportMediaCacheInput {
   desktopRoot: string;
@@ -38,7 +37,7 @@ const MAX_WORKER_PASSES = 10_000;
 export class DesktopImportMediaCacheService {
   constructor(
     private readonly database: Database,
-    private readonly blobStore: LocalMediaBlobStore,
+    private readonly blobStore: MediaCacheWorkerBlobStore,
     private readonly discover: () => Promise<MediaCacheDiscoveryResult>,
   ) {}
 

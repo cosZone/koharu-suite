@@ -40,6 +40,7 @@ a {
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
+select:focus-visible,
 summary:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--persimmon) 45%, transparent);
   outline-offset: 3px;
@@ -944,6 +945,56 @@ button {
   color: var(--persimmon-dark);
 }
 
+.media-cache__backends {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  margin-top: 18px;
+}
+
+.media-cache__backends article {
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--moss);
+  border-radius: 4px 14px 4px 14px;
+  background: rgba(228, 212, 188, 0.26);
+}
+
+.media-cache__backends article > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.media-cache__backends header > div {
+  display: grid;
+  gap: 3px;
+}
+
+.media-cache__backends code {
+  color: var(--ink-soft);
+  font-size: 0.64rem;
+}
+
+.media-cache__backend-capacity {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.media-cache__backend-capacity span {
+  color: var(--ink-soft);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.7rem;
+}
+
+.media-cache__backend-capacity progress {
+  width: 100%;
+  height: 6px;
+  accent-color: var(--moss);
+}
+
 .media-cache__notice {
   margin: 18px 0 0;
   padding: 10px 13px;
@@ -1022,11 +1073,128 @@ button {
   font-size: 0.78rem;
 }
 
+.media-cache__object-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0 0 14px;
+}
+
+.media-cache__location {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.62rem;
+}
+
+.media-cache__location.is-ready {
+  border-color: rgba(79, 112, 79, 0.38);
+  color: var(--moss);
+}
+
+.media-cache__location.is-corrupt,
+.media-cache__location.is-missing {
+  border-color: rgba(173, 81, 52, 0.4);
+  color: var(--persimmon-dark);
+}
+
 .media-cache__actions {
   display: flex;
   flex-wrap: wrap;
   gap: 9px;
   margin-top: 12px;
+}
+
+.media-cache__storage-tools {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+
+.media-cache__storage-tools > section {
+  min-width: 0;
+  padding: 18px;
+  background: rgba(255, 249, 237, 0.92);
+}
+
+.media-cache__storage-tools h3 {
+  margin: 0;
+  font-family: "Iowan Old Style", Baskerville, "Noto Serif SC", "Songti SC", serif;
+  font-size: 1.15rem;
+  font-weight: 500;
+}
+
+.media-cache__storage-tools section > p {
+  margin: 7px 0 16px;
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+
+.media-cache__storage-tools .ks-ui-field {
+  margin-top: 12px;
+}
+
+.media-cache__storage-tools .media-cache__actions {
+  align-items: end;
+}
+
+.media-cache__storage-tools .media-cache__actions .ks-ui-field {
+  min-width: min(300px, 100%);
+  flex: 1;
+  margin-top: 0;
+}
+
+.media-cache__select-row {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.media-cache__select-row label {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 0.68rem;
+}
+
+.media-cache__select-row select,
+.media-cache__select-row input {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px 10px 4px 10px;
+  background: var(--paper-light);
+  color: var(--ink);
+}
+
+.media-cache__prune-preview {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 16px 0 0;
+}
+
+.media-cache__prune-metric {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.media-cache__prune-preview dt {
+  color: var(--ink-soft);
+  font-size: 0.62rem;
+}
+
+.media-cache__prune-preview dd {
+  margin: 4px 0 0;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.74rem;
 }
 
 .media-cache__reconcile {
@@ -1267,6 +1435,10 @@ details .uri {
   .operations__grid {
     grid-template-columns: 1fr;
   }
+
+  .media-cache__storage-tools {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 640px) {
@@ -1326,8 +1498,13 @@ details .uri {
   }
 
   .media-cache__usage,
-  .media-cache__reconcile {
+  .media-cache__reconcile,
+  .media-cache__select-row {
     grid-template-columns: 1fr;
+  }
+
+  .media-cache__prune-preview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .media-cache__failures li {

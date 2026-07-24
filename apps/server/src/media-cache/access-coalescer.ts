@@ -1,8 +1,10 @@
 const SHA256 = /^[0-9a-f]{64}$/u;
+const BACKEND_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
 const DEFAULT_COALESCE_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_ACCESS_BATCH = 100;
 
 export interface MediaCacheBlobAccess {
+  backendId: string;
   observedAt: Date;
   sha256: string;
 }
@@ -15,7 +17,7 @@ export class MediaCacheAccessCoalescer {
   readonly #intervalMs: number;
   readonly #lastWrittenAt = new Map<string, number>();
   readonly #now: () => Date;
-  readonly #pending = new Map<string, Date>();
+  readonly #pending = new Map<string, MediaCacheBlobAccess>();
   readonly #writer: MediaCacheAccessWriter;
   #flushing: Promise<void> | undefined;
 
@@ -32,11 +34,16 @@ export class MediaCacheAccessCoalescer {
     this.#writer = writer;
   }
 
-  observe(sha256: string, observedAt = this.#now()): void {
-    assertAccess(sha256, observedAt);
-    const current = this.#pending.get(sha256);
-    if (!current || current < observedAt) {
-      this.#pending.set(sha256, new Date(observedAt));
+  observe(backendId: string, sha256: string, observedAt = this.#now()): void {
+    assertAccess(backendId, sha256, observedAt);
+    const key = accessKey(backendId, sha256);
+    const current = this.#pending.get(key);
+    if (!current || current.observedAt < observedAt) {
+      this.#pending.set(key, {
+        backendId,
+        observedAt: new Date(observedAt),
+        sha256,
+      });
     }
   }
 
@@ -54,12 +61,15 @@ export class MediaCacheAccessCoalescer {
     }
     const nowMs = now.getTime();
     const snapshot = [...this.#pending]
-      .filter(([sha256]) => {
-        const lastWrittenAt = this.#lastWrittenAt.get(sha256);
+      .filter(([key]) => {
+        const lastWrittenAt = this.#lastWrittenAt.get(key);
         return lastWrittenAt === undefined || nowMs - lastWrittenAt >= this.#intervalMs;
       })
-      .map(([sha256, observedAt]) => ({ observedAt: new Date(observedAt), sha256 }))
-      .sort((left, right) => left.sha256.localeCompare(right.sha256));
+      .map(([, access]) => ({ ...access, observedAt: new Date(access.observedAt) }))
+      .sort(
+        (left, right) =>
+          left.backendId.localeCompare(right.backendId) || left.sha256.localeCompare(right.sha256),
+      );
     if (snapshot.length === 0) {
       this.#pruneHistory(nowMs);
       return;
@@ -69,11 +79,12 @@ export class MediaCacheAccessCoalescer {
       const batch = snapshot.slice(offset, offset + MAX_ACCESS_BATCH);
       await this.#writer.writeAccesses(batch);
       for (const access of batch) {
-        const pending = this.#pending.get(access.sha256);
-        if (pending?.getTime() === access.observedAt.getTime()) {
-          this.#pending.delete(access.sha256);
+        const key = accessKey(access.backendId, access.sha256);
+        const pending = this.#pending.get(key);
+        if (pending?.observedAt.getTime() === access.observedAt.getTime()) {
+          this.#pending.delete(key);
         }
-        this.#lastWrittenAt.set(access.sha256, nowMs);
+        this.#lastWrittenAt.set(key, nowMs);
       }
     }
     this.#pruneHistory(nowMs);
@@ -88,11 +99,15 @@ export class MediaCacheAccessCoalescer {
   }
 }
 
-function assertAccess(sha256: string, observedAt: Date): void {
-  if (!SHA256.test(sha256)) {
-    throw new TypeError('Media cache blob SHA-256 must be canonical lowercase hex');
+function assertAccess(backendId: string, sha256: string, observedAt: Date): void {
+  if (!BACKEND_ID.test(backendId) || !SHA256.test(sha256)) {
+    throw new TypeError('Media cache access must identify a backend and canonical blob SHA-256');
   }
   if (!Number.isFinite(observedAt.getTime())) {
     throw new TypeError('Media cache access time must be valid');
   }
+}
+
+function accessKey(backendId: string, sha256: string): string {
+  return `${backendId}\0${sha256}`;
 }

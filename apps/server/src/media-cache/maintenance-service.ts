@@ -9,12 +9,19 @@ import {
   mediaCacheRuntime,
 } from '../db/schema.js';
 import {
-  type LocalMediaBlobStore,
+  type DiscardPartialLeaseResult,
+  type MediaBlobEvictionResult,
   type MediaBlobIdentity,
   MediaBlobIntegrityError,
+  type MediaBlobLease,
+  type MediaBlobReadHandle,
+  type MediaBlobSettlement,
+  type StagedMediaBlob,
+  type StaleMediaLeasePage,
 } from './blob-store.js';
 import { MediaCacheEvictionService } from './eviction-repository.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import { reconcileLocalStorageLedger } from './storage-ledger-repository.js';
 
 const MAX_MAINTENANCE_BATCH = 100;
 const EVICTION_LEASE_MS = 2 * 60_000;
@@ -63,6 +70,19 @@ interface MaintenanceBlob extends MediaBlobIdentity {
   lastAccessedAt: Date;
 }
 
+export interface MediaCacheMaintenanceBlobStore {
+  discardPartialLease(lease: MediaBlobLease): Promise<DiscardPartialLeaseResult>;
+  evict(blob: MediaBlobIdentity): Promise<MediaBlobEvictionResult>;
+  listStaleLeases(input: {
+    before: Date;
+    cursor?: string;
+    limit: number;
+  }): Promise<StaleMediaLeasePage>;
+  read(blob: MediaBlobIdentity): Promise<MediaBlobReadHandle>;
+  recoverLease(lease: MediaBlobLease): Promise<readonly StagedMediaBlob[]>;
+  settle(staged: StagedMediaBlob, settlement: MediaBlobSettlement): Promise<void>;
+}
+
 type MediaCacheTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 
 export class MediaCacheMaintenanceService {
@@ -70,7 +90,7 @@ export class MediaCacheMaintenanceService {
 
   constructor(
     private readonly database: Database,
-    private readonly blobStore: LocalMediaBlobStore,
+    private readonly blobStore: MediaCacheMaintenanceBlobStore,
     private readonly owner: string,
   ) {
     const normalizedOwner = owner.trim();
@@ -273,6 +293,7 @@ export class MediaCacheMaintenanceService {
             reason: input.initiator.reason.trim(),
           });
         }
+        await reconcileLocalStorageLedger(transaction);
       }
       return {
         drift,
@@ -458,32 +479,45 @@ export class MediaCacheMaintenanceService {
   }
 
   private async checkBlob(blob: MaintenanceBlob): Promise<'checksum_mismatch' | 'missing' | null> {
-    let file: Awaited<ReturnType<LocalMediaBlobStore['open']>>;
-    try {
-      file = await this.blobStore.open(blob);
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-        return 'missing';
-      }
-      if (error instanceof MediaBlobIntegrityError) {
-        return isMissingBlobIntegrityError(error) ? 'missing' : 'checksum_mismatch';
-      }
-      throw error;
+    return checkMediaCacheBlob(this.blobStore, blob);
+  }
+}
+
+export async function checkMediaCacheBlob(
+  blobStore: Pick<MediaCacheMaintenanceBlobStore, 'read'>,
+  blob: MediaBlobIdentity,
+): Promise<'checksum_mismatch' | 'missing' | null> {
+  let handle: MediaBlobReadHandle;
+  try {
+    handle = await blobStore.read(blob);
+  } catch (error) {
+    return classifyBlobReadFailure(error);
+  }
+
+  try {
+    const hash = createHash('sha256');
+    for await (const chunk of handle.stream()) {
+      hash.update(chunk);
     }
-    try {
-      const hash = createHash('sha256');
-      const stream = file.createReadStream({ autoClose: false, start: 0 });
-      for await (const chunk of stream) {
-        hash.update(chunk);
-      }
-      return hash.digest('hex') === blob.sha256 ? null : 'checksum_mismatch';
-    } finally {
-      await file.close().catch(() => undefined);
-    }
+    return hash.digest('hex') === blob.sha256 ? null : 'checksum_mismatch';
+  } catch (error) {
+    return classifyBlobReadFailure(error);
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function classifyBlobReadFailure(error: unknown): 'checksum_mismatch' | 'missing' {
+  if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+    return 'missing';
+  }
+  if (error instanceof MediaBlobIntegrityError) {
+    return isMissingBlobIntegrityError(error) ? 'missing' : 'checksum_mismatch';
+  }
+  throw error;
+}
 
 function isMissingBlobIntegrityError(error: MediaBlobIntegrityError): boolean {
   return (

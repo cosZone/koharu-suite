@@ -139,10 +139,31 @@ const unavailableMediaCacheMutations: MediaCacheAdminMutations = {
   evict: async () => {
     throw new MediaCacheAdminConflictError('Media cache is disabled');
   },
+  migrate: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  previewPrune: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  protect: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  prune: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
   reconcile: async () => {
     throw new MediaCacheAdminNotSupportedError();
   },
+  restore: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
   retry: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  setEvictedPolicy: async () => {
+    throw new MediaCacheAdminConflictError('Media cache is disabled');
+  },
+  unprotect: async () => {
     throw new MediaCacheAdminConflictError('Media cache is disabled');
   },
 };
@@ -238,6 +259,54 @@ function reconciliationMutationStatus(error: unknown): 404 | 409 | null {
 const uuidSchema = z.uuid();
 const listLimitSchema = z.coerce.number().int().min(1).max(100).default(50);
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(500) }).strict();
+const storageBackendIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-z][a-z0-9_-]{0,63}$/u);
+const storageTargetBytesSchema = z
+  .string()
+  .regex(/^(0|[1-9]\d*)$/u)
+  .transform((value) => BigInt(value))
+  .pipe(
+    z
+      .bigint()
+      .min(1n)
+      .max(5n * 1024n * 1024n * 1024n * 1024n),
+  );
+const mediaCacheProtectSchema = reasonSchema
+  .extend({
+    expiresAt: z.iso
+      .datetime({ offset: true })
+      .transform((value) => new Date(value))
+      .optional(),
+  })
+  .strict();
+const mediaCachePolicySchema = reasonSchema
+  .extend({ policy: z.enum(['recache_on_access', 'stay_evicted']) })
+  .strict();
+const mediaCacheMigrateSchema = reasonSchema
+  .extend({
+    objectId: z.uuid().optional(),
+    sourceBackendId: storageBackendIdSchema,
+    targetBackendId: storageBackendIdSchema,
+  })
+  .strict()
+  .refine((body) => body.sourceBackendId !== body.targetBackendId);
+const mediaCacheRestoreSchema = reasonSchema
+  .extend({ targetBackendId: storageBackendIdSchema })
+  .strict();
+const mediaCachePrunePreviewSchema = z
+  .object({
+    targetBackendId: storageBackendIdSchema,
+    targetBytes: storageTargetBytesSchema,
+  })
+  .strict();
+const mediaCachePruneSchema = reasonSchema
+  .extend({
+    targetBackendId: storageBackendIdSchema,
+    targetBytes: storageTargetBytesSchema,
+  })
+  .strict();
 const mediaCacheReconcileSchema = reasonSchema;
 const mediaCacheObjectListSchema = z
   .object({
@@ -602,6 +671,197 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       }
     });
   }
+  app.post('/api/v1/admin/media-cache/objects/:id/protect', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = mediaCacheProtectSchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError(
+          'invalid_media_cache_action',
+          'A valid object id, reason, and expiry are required',
+        ),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.protect({
+          ...(body.data.expiresAt ? { expiresAt: body.data.expiresAt } : {}),
+          initiatorId: authorization.principal.actorId,
+          objectId: id.data,
+          reason: body.data.reason,
+        }),
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/objects/:id/unprotect', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = reasonSchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError('invalid_media_cache_action', 'A valid object id and reason are required'),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.unprotect({
+          initiatorId: authorization.principal.actorId,
+          objectId: id.data,
+          reason: body.data.reason,
+        }),
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/objects/:id/policy', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = mediaCachePolicySchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError(
+          'invalid_media_cache_action',
+          'A valid object id, reason, and policy are required',
+        ),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.setEvictedPolicy({
+          initiatorId: authorization.principal.actorId,
+          objectId: id.data,
+          policy: body.data.policy,
+          reason: body.data.reason,
+        }),
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/migrate', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const body = mediaCacheMigrateSchema.safeParse(await context.req.json().catch(() => null));
+    if (!body.success) {
+      return context.json(
+        apiError(
+          'invalid_media_cache_action',
+          'Valid copy source, target, and reason are required',
+        ),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.migrate({
+          initiatorId: authorization.principal.actorId,
+          ...(body.data.objectId ? { objectId: body.data.objectId } : {}),
+          reason: body.data.reason,
+          sourceBackendId: body.data.sourceBackendId,
+          targetBackendId: body.data.targetBackendId,
+        }),
+        202,
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/objects/:id/restore', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = mediaCacheRestoreSchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError(
+          'invalid_media_cache_action',
+          'A valid object id, target, and reason are required',
+        ),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.restore({
+          initiatorId: authorization.principal.actorId,
+          objectId: id.data,
+          reason: body.data.reason,
+          targetBackendId: body.data.targetBackendId,
+        }),
+        202,
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/prune/preview', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    const body = mediaCachePrunePreviewSchema.safeParse(await context.req.json().catch(() => null));
+    if (!body.success) {
+      return context.json(
+        apiError('invalid_media_cache_action', 'A valid prune target is required'),
+        400,
+      );
+    }
+    try {
+      return context.json(await resolved.mediaCacheMutations.previewPrune(body.data));
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
+  app.post('/api/v1/admin/media-cache/prune', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const body = mediaCachePruneSchema.safeParse(await context.req.json().catch(() => null));
+    if (!body.success) {
+      return context.json(
+        apiError('invalid_media_cache_action', 'A valid prune target and reason are required'),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.mediaCacheMutations.prune({
+          initiatorId: authorization.principal.actorId,
+          reason: body.data.reason,
+          targetBackendId: body.data.targetBackendId,
+          targetBytes: body.data.targetBytes,
+        }),
+        202,
+      );
+    } catch (error) {
+      return mediaCacheMutationFailure(context, error);
+    }
+  });
   app.post('/api/v1/admin/media-cache/reconcile', async (context) => {
     const authorization = await authorizeAdmin(context, 'admin:read');
     if ('response' in authorization) {

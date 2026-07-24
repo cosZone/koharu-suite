@@ -6,6 +6,7 @@ import {
 
 const FIRST_HASH = 'a'.repeat(64);
 const SECOND_HASH = 'b'.repeat(64);
+const LOCAL = 'local';
 
 function hashFor(index: number): string {
   return index.toString(16).padStart(64, '0');
@@ -17,27 +18,29 @@ describe('MediaCacheAccessCoalescer', () => {
     const write = vi.fn<MediaCacheAccessWriter['writeAccesses']>(async () => undefined);
     const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => now);
 
-    coalescer.observe(FIRST_HASH, new Date('2026-07-24T09:59:00.000Z'));
-    coalescer.observe(FIRST_HASH, new Date('2026-07-24T10:00:01.000Z'));
-    coalescer.observe(FIRST_HASH, new Date('2026-07-24T09:59:30.000Z'));
-    coalescer.observe(SECOND_HASH, new Date('2026-07-24T10:00:00.000Z'));
+    coalescer.observe(LOCAL, FIRST_HASH, new Date('2026-07-24T09:59:00.000Z'));
+    coalescer.observe(LOCAL, FIRST_HASH, new Date('2026-07-24T10:00:01.000Z'));
+    coalescer.observe(LOCAL, FIRST_HASH, new Date('2026-07-24T09:59:30.000Z'));
+    coalescer.observe(LOCAL, SECOND_HASH, new Date('2026-07-24T10:00:00.000Z'));
     await coalescer.flush();
 
     expect(write).toHaveBeenCalledWith([
-      { observedAt: new Date('2026-07-24T10:00:01.000Z'), sha256: FIRST_HASH },
-      { observedAt: new Date('2026-07-24T10:00:00.000Z'), sha256: SECOND_HASH },
+      { backendId: LOCAL, observedAt: new Date('2026-07-24T10:00:01.000Z'), sha256: FIRST_HASH },
+      { backendId: LOCAL, observedAt: new Date('2026-07-24T10:00:00.000Z'), sha256: SECOND_HASH },
     ]);
 
     now = new Date('2026-07-24T10:04:59.999Z');
-    coalescer.observe(FIRST_HASH, now);
+    coalescer.observe(LOCAL, FIRST_HASH, now);
     await coalescer.flush();
     expect(write).toHaveBeenCalledOnce();
 
     now = new Date('2026-07-24T10:05:00.000Z');
-    coalescer.observe(FIRST_HASH, now);
+    coalescer.observe(LOCAL, FIRST_HASH, now);
     await coalescer.flush();
     expect(write).toHaveBeenCalledTimes(2);
-    expect(write).toHaveBeenLastCalledWith([{ observedAt: now, sha256: FIRST_HASH }]);
+    expect(write).toHaveBeenLastCalledWith([
+      { backendId: LOCAL, observedAt: now, sha256: FIRST_HASH },
+    ]);
   });
 
   it('keeps pending accesses after a write failure and retries them', async () => {
@@ -50,13 +53,13 @@ describe('MediaCacheAccessCoalescer', () => {
       () => new Date('2026-07-24T10:00:00.000Z'),
     );
     const observedAt = new Date('2026-07-24T09:59:00.000Z');
-    coalescer.observe(FIRST_HASH, observedAt);
+    coalescer.observe(LOCAL, FIRST_HASH, observedAt);
 
     await expect(coalescer.flush()).rejects.toThrow('database unavailable');
     await expect(coalescer.flush()).resolves.toBeUndefined();
 
     expect(write).toHaveBeenCalledTimes(2);
-    expect(write).toHaveBeenLastCalledWith([{ observedAt, sha256: FIRST_HASH }]);
+    expect(write).toHaveBeenLastCalledWith([{ backendId: LOCAL, observedAt, sha256: FIRST_HASH }]);
   });
 
   it('does not lose a newer access observed while a flush is in flight', async () => {
@@ -69,11 +72,11 @@ describe('MediaCacheAccessCoalescer', () => {
         }),
     );
     const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => now);
-    coalescer.observe(FIRST_HASH, now);
+    coalescer.observe(LOCAL, FIRST_HASH, now);
     const flushing = coalescer.flush();
 
     const newer = new Date('2026-07-24T10:01:00.000Z');
-    coalescer.observe(FIRST_HASH, newer);
+    coalescer.observe(LOCAL, FIRST_HASH, newer);
     releaseWrite?.();
     await flushing;
 
@@ -82,7 +85,9 @@ describe('MediaCacheAccessCoalescer', () => {
     await coalescer.flush();
 
     expect(write).toHaveBeenCalledTimes(2);
-    expect(write).toHaveBeenLastCalledWith([{ observedAt: newer, sha256: FIRST_HASH }]);
+    expect(write).toHaveBeenLastCalledWith([
+      { backendId: LOCAL, observedAt: newer, sha256: FIRST_HASH },
+    ]);
   });
 
   it('flushes more than 100 shared blobs in stable SHA batches', async () => {
@@ -91,7 +96,7 @@ describe('MediaCacheAccessCoalescer', () => {
     const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => observedAt);
     const hashes = Array.from({ length: 205 }, (_, index) => hashFor(204 - index));
     for (const sha256 of hashes) {
-      coalescer.observe(sha256, observedAt);
+      coalescer.observe(LOCAL, sha256, observedAt);
     }
 
     await coalescer.flush();
@@ -111,7 +116,7 @@ describe('MediaCacheAccessCoalescer', () => {
       .mockResolvedValue(undefined);
     const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => observedAt);
     for (let index = 0; index < 150; index += 1) {
-      coalescer.observe(hashFor(index), observedAt);
+      coalescer.observe(LOCAL, hashFor(index), observedAt);
     }
 
     await expect(coalescer.flush()).rejects.toThrow('second batch unavailable');
@@ -121,5 +126,20 @@ describe('MediaCacheAccessCoalescer', () => {
     expect(write.mock.calls[2]?.[0].map((access) => access.sha256)).toEqual(
       Array.from({ length: 50 }, (_, index) => hashFor(index + 100)),
     );
+  });
+
+  it('coalesces the same blob independently for each backend', async () => {
+    const observedAt = new Date('2026-07-24T10:00:00.000Z');
+    const write = vi.fn<MediaCacheAccessWriter['writeAccesses']>(async () => undefined);
+    const coalescer = new MediaCacheAccessCoalescer({ writeAccesses: write }, () => observedAt);
+
+    coalescer.observe('s3-default', FIRST_HASH, observedAt);
+    coalescer.observe(LOCAL, FIRST_HASH, observedAt);
+    await coalescer.flush();
+
+    expect(write).toHaveBeenCalledWith([
+      { backendId: LOCAL, observedAt, sha256: FIRST_HASH },
+      { backendId: 's3-default', observedAt, sha256: FIRST_HASH },
+    ]);
   });
 });

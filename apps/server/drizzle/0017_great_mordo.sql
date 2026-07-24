@@ -1,0 +1,2 @@
+ALTER TABLE "media_cache_commands" ADD COLUMN "initiator_kind" varchar(32) DEFAULT 'owner_session' NOT NULL;--> statement-breakpoint
+ALTER TABLE "media_cache_commands" ADD CONSTRAINT "media_cache_commands_initiator_kind_check" CHECK ("media_cache_commands"."initiator_kind" in ('local_operator', 'owner_session'));

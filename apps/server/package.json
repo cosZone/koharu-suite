@@ -32,8 +32,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.910.0",
     "@better-auth/api-key": "catalog:",
     "@hono/node-server": "catalog:",
+    "@smithy/node-http-handler": "4.9.10",
     "@streamparser/json": "0.0.22",
     "@streamparser/json-node": "0.0.22",
     "abort-controller": "catalog:",
@@ -50,6 +52,7 @@
     "@testcontainers/postgresql": "catalog:",
     "@types/node": "catalog:",
     "drizzle-kit": "catalog:",
+    "testcontainers": "catalog:",
     "tsx": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
