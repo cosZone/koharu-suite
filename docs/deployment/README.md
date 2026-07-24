@@ -79,9 +79,9 @@ docker compose exec worker node dist/cli.js health worker
 `/healthz` 只证明 HTTP 进程存活；`/readyz` 还会探测 PostgreSQL。worker heartbeat 每 10 秒刷新，
 超过 30 秒视为 stale。反向代理只应把流量转到 server 的 3000 端口。
 
-## 可选本地媒体缓存
+## 可选媒体存储
 
-媒体缓存默认关闭。启用时在 `.env` 增加：
+媒体缓存默认关闭；local-only 仍是默认部署。启用本地 hot tier 时在 `.env` 增加：
 
 ```dotenv
 MEDIA_CACHE_ENABLED=true
@@ -99,6 +99,29 @@ server 只验证该布局且不会创建目录。非 Compose 部署必须先准�
 停止 server/worker 后在同一个停机窗口同时快照数据库和完整 volume。卷丢失、整体删除、权限修复、
 dry-run prune、reconcile 与 Telegram fallback 的详细流程见
 [媒体缓存运维手册](../media-cache/README.md)。
+
+需要 durable cached tier 时，再同时填写四项 S3 core settings。只填一部分会让 server/worker
+fail closed；S3 不能在 `MEDIA_CACHE_ENABLED=false` 时单独启用：
+
+```dotenv
+S3_ENDPOINT=https://s3.example.com
+S3_BUCKET=koharu-media
+S3_KEY=<access-key-id>
+S3_SECRET=<secret-access-key>
+S3_REGION=us-east-1
+S3_PREFIX=koharu/media-cache
+S3_FORCE_PATH_STYLE=true
+S3_ALLOW_INSECURE=false
+S3_MAX_BYTES=5368709120
+S3_CONNECT_TIMEOUT_MS=5000
+S3_REQUEST_TIMEOUT_MS=30000
+```
+
+本地容量上限为 5 GiB；S3 应用账本默认 5 GiB、最高 5 TiB。实现使用 AWS SDK v3，但 CI 只以固定
+MinIO 版本作为 compatibility baseline，不承诺所有 S3-compatible provider。目标 provider 上线前
+必须按运维手册执行 full/range read、条件创建、copy/restore、保护、prune preview/apply 和
+fallback smoke。公开媒体仍由 server proxy；不要暴露 bucket，也不要把 provider lifecycle 当成
+权威删除路径。
 
 ## 本地可重复 smoke
 
@@ -127,7 +150,10 @@ pg_restore --list "backups/koharu-before-upgrade.dump" >/dev/null
 ```
 
 同时记录当前镜像 digest、版本、commit 和 `docker compose config` 的脱敏副本。不要把展开后的
-secret 写进 Issue、PR 或日志。
+secret 写进 Issue、PR 或日志。普通备份只要求 PostgreSQL；如果必须保留 warm local/S3 cache，
+先停止 server/worker，再在同一停机窗口保存 PostgreSQL、完整 local volume 和
+`S3_BUCKET/S3_PREFIX` 的 provider-consistent snapshot。不同时间的 DB、filesystem 和 bucket
+listing 不能组成一致备份。
 
 ## 导入 Telegram Desktop 历史
 
@@ -203,6 +229,12 @@ curl --fail https://blog-admin.example.com/readyz
 4. 只有通过兼容性检查后，才把 `KOHARU_IMAGE` 恢复为升级前记录的 tag 或 digest。
 5. 启动旧 worker，确认 `kodama health worker` 成功且只有一个 lock owner。
 6. 启动旧 server，检查 `/readyz`、公开 API 与 Owner Desk。
+
+若回滚还需要停用 S3，先停止新 storage mutation，等待或让 worker 接管过期 lease，把仍需缓存的
+对象 copy/restore 到 `local` 并验证公开读取。随后停止 server/worker，同时清空
+`S3_ENDPOINT`、`S3_BUCKET`、`S3_KEY`、`S3_SECRET`，再以 local-only 配置重启。保留 additive
+backend/location/audit tables 供诊断，不运行 destructive down migration，也不要让 bucket
+lifecycle 代替应用账本删除对象。完整步骤见[媒体缓存运维手册](../media-cache/README.md)。
 
 additive migration 不等于旧 reader 的行为兼容；普通应用回滚仍不执行 destructive down migration。
 如果上述 tombstone floor 或 release notes 标注新旧 schema 不兼容，停止全部应用容器后恢复升级前
