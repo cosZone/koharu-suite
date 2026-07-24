@@ -333,29 +333,18 @@ export class LocalMediaBlobStore {
     return { removedBytes, removedFiles };
   }
 
+  async openStaged(staged: StagedMediaBlob): Promise<FileHandle> {
+    this.#assertOwned(staged);
+    const path = this.#stagedPath(staged.lease, staged.objectId);
+    await this.#assertRequiredDirectoryContained(dirname(path));
+    return openRegularFile(path, staged.byteLength);
+  }
+
   async open(blob: MediaBlobIdentity): Promise<FileHandle> {
     assertBlobIdentity(blob);
     const path = this.#resolveRelativeKey(blob.relativeKey);
     await this.#assertRequiredDirectoryContained(dirname(path));
-    let file: FileHandle;
-    try {
-      file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    } catch (error) {
-      if (hasErrorCode(error, 'ELOOP')) {
-        throw new MediaBlobIntegrityError('Content-addressed blob must not be a symbolic link');
-      }
-      throw error;
-    }
-    try {
-      const metadata = await file.stat();
-      if (!metadata.isFile() || metadata.size !== blob.byteLength) {
-        throw new MediaBlobIntegrityError('Content-addressed blob does not match its DB identity');
-      }
-      return file;
-    } catch (error) {
-      await file.close().catch(() => undefined);
-      throw error;
-    }
+    return openRegularFile(path, blob.byteLength);
   }
 
   #assertOwned(staged: StagedMediaBlob): asserts staged is OwnedStagedMediaBlob {
@@ -593,6 +582,28 @@ async function assertFileMatches(path: string, expectedHash: string, expectedByt
     throw new MediaBlobIntegrityError('Media blob SHA-256 does not match its identity');
   }
   return metadata;
+}
+
+async function openRegularFile(path: string, expectedBytes: number): Promise<FileHandle> {
+  let file: FileHandle;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (hasErrorCode(error, 'ELOOP')) {
+      throw new MediaBlobIntegrityError('Media blob must not be a symbolic link');
+    }
+    throw error;
+  }
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || metadata.size !== expectedBytes) {
+      throw new MediaBlobIntegrityError('Media blob does not match its expected identity');
+    }
+    return file;
+  } catch (error) {
+    await file.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 async function writeAll(file: FileHandle, chunk: Uint8Array): Promise<void> {

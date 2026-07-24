@@ -38,6 +38,7 @@
     "@streamparser/json-node": "0.0.22",
     "better-auth": "catalog:",
     "drizzle-orm": "catalog:",
+    "file-type": "catalog:",
     "grammy": "catalog:",
     "hono": "catalog:",
     "postgres": "catalog:",

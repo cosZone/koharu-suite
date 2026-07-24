@@ -56,6 +56,9 @@ describe('LocalMediaBlobStore', () => {
       maxBytes: Buffer.byteLength(content),
       source: chunks('koharu', '-', 'suite'),
     });
+    const stagedFile = await store.openStaged(staged);
+    await expect(stagedFile.readFile('utf8')).resolves.toBe(content);
+    await stagedFile.close();
     const published = await store.publish(staged);
 
     expect(staged).toMatchObject({
