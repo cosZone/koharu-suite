@@ -12,6 +12,9 @@ import { createApp } from '../../src/app.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaCacheBlobs,
+  mediaCacheObjects,
+  mediaCachePostPlans,
   messageMedia,
   messageRevisions,
   messages,
@@ -209,6 +212,166 @@ describe('database migrations', () => {
     expect(serializedDetail).not.toContain('telegramUpdateId');
     expect(serializedDetail).not.toContain('telegramMessageId');
     expect(serializedDetail).not.toContain('telegramFileId');
+  }, 30_000);
+
+  it('projects bounded cache status and opaque ready URLs for current revision media', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+
+    const database = connection.db;
+    const repository = new PostgresMessageRepository(database);
+    const post = normalizeChannelPost(channelPostFixture(), ALLOWED_CHANNEL_ID);
+    if (!post) {
+      throw new Error('Fixture did not normalize');
+    }
+
+    const ingested = await repository.ingest(post);
+    const [revision] = await database
+      .select({ id: messageRevisions.id })
+      .from(messageRevisions)
+      .where(eq(messageRevisions.messageId, ingested.messageId));
+    if (!revision) {
+      throw new Error('Fixture revision was not created');
+    }
+
+    const [photo] = await database
+      .select({ id: messageMedia.id })
+      .from(messageMedia)
+      .where(eq(messageMedia.revisionId, revision.id));
+    if (!photo) {
+      throw new Error('Fixture photo was not created');
+    }
+
+    const [video, unsupportedAudio] = await database
+      .insert(messageMedia)
+      .values([
+        {
+          kind: 'video',
+          position: 1,
+          revisionId: revision.id,
+          telegramFileId: 'sensitive-video-file-id',
+          telegramFileUniqueId: 'sensitive-video-unique-id',
+        },
+        {
+          kind: 'audio',
+          position: 2,
+          revisionId: revision.id,
+          telegramFileId: 'sensitive-audio-file-id',
+          telegramFileUniqueId: 'sensitive-audio-unique-id',
+        },
+      ])
+      .returning({ id: messageMedia.id });
+    if (!video || !unsupportedAudio) {
+      throw new Error('Additional media fixtures were not created');
+    }
+
+    const [plan] = await database
+      .insert(mediaCachePostPlans)
+      .values({
+        messageId: ingested.messageId,
+        revisionId: revision.id,
+      })
+      .returning({ id: mediaCachePostPlans.id });
+    if (!plan) {
+      throw new Error('Cache plan fixture was not created');
+    }
+
+    const originalHash = 'a'.repeat(64);
+    const thumbnailHash = 'b'.repeat(64);
+    await database.insert(mediaCacheBlobs).values([
+      {
+        byteLength: 4_096n,
+        detectedMime: 'image/jpeg',
+        relativeKey: `blobs/aa/aa/${originalHash}`,
+        sha256: originalHash,
+        state: 'ready',
+      },
+      {
+        byteLength: 1_024n,
+        detectedMime: 'image/webp',
+        relativeKey: `blobs/bb/bb/${thumbnailHash}`,
+        sha256: thumbnailHash,
+        state: 'ready',
+      },
+    ]);
+
+    const cacheObjects = await database
+      .insert(mediaCacheObjects)
+      .values([
+        {
+          actualBytes: 4_096n,
+          blobSha256: originalHash,
+          canonicalMediaId: photo.id,
+          postPlanId: plan.id,
+          recipeVersion: 1,
+          revisionId: revision.id,
+          state: 'ready',
+          variant: 'original',
+        },
+        {
+          actualBytes: 1_024n,
+          blobSha256: thumbnailHash,
+          canonicalMediaId: photo.id,
+          postPlanId: plan.id,
+          recipeVersion: 1,
+          revisionId: revision.id,
+          state: 'ready',
+          variant: 'thumbnail',
+        },
+        {
+          canonicalMediaId: video.id,
+          postPlanId: plan.id,
+          recipeVersion: 1,
+          revisionId: revision.id,
+          state: 'retry_wait',
+          variant: 'original',
+        },
+      ])
+      .returning({
+        canonicalMediaId: mediaCacheObjects.canonicalMediaId,
+        id: mediaCacheObjects.id,
+        variant: mediaCacheObjects.variant,
+      });
+    const readyOriginal = cacheObjects.find(
+      (object) => object.canonicalMediaId === photo.id && object.variant === 'original',
+    );
+    const readyThumbnail = cacheObjects.find(
+      (object) => object.canonicalMediaId === photo.id && object.variant === 'thumbnail',
+    );
+    if (!readyOriginal || !readyThumbnail) {
+      throw new Error('Ready object fixtures were not created');
+    }
+
+    const message = await repository.getMessage(ingested.messageId);
+    expect(message?.media).toEqual([
+      expect.objectContaining({
+        cacheStatus: 'ready',
+        id: photo.id,
+        originalUrl: `/api/v1/media/${readyOriginal.id}`,
+        thumbnailUrl: `/api/v1/media/${readyThumbnail.id}`,
+      }),
+      expect.objectContaining({
+        cacheStatus: 'pending',
+        id: video.id,
+        originalUrl: null,
+        thumbnailUrl: null,
+      }),
+      expect.objectContaining({
+        cacheStatus: 'unavailable',
+        id: unsupportedAudio.id,
+        originalUrl: null,
+        thumbnailUrl: null,
+      }),
+    ]);
+
+    const serialized = JSON.stringify(message);
+    expect(serialized).not.toContain(originalHash);
+    expect(serialized).not.toContain(thumbnailHash);
+    expect(serialized).not.toContain('blobs/');
+    expect(serialized).not.toContain('sensitive-video-file-id');
+    expect(serialized).not.toContain('sensitive-audio-file-id');
+    expect(serialized).not.toContain('telegramFile');
   }, 30_000);
 
   it('checkpoints allowed channel updates atomically and binds exactly one Bot', async () => {

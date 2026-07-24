@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { reconciliationFindings, reconciliationRuns } from '../db/schema.js';
+import { lockSourceEvidenceDiscovery } from '../messages/source-evidence-coordination.js';
 import type { ReconciliationCliApplyInput } from './cli.js';
 import type { PostgresReconciliationPersistenceRepository } from './persistence-repository.js';
 import { validateReconciliationRepairInput } from './repair.js';
@@ -37,6 +38,7 @@ export class ReconciliationApplyService {
         await transaction.execute(
           sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`,
         );
+        await lockSourceEvidenceDiscovery(transaction);
         const startedAt = new Date();
         const scope = reconciliationScope(input.channelIds);
         const persisted = await this.persistence.persistScanInLockedTransaction(transaction, {

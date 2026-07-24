@@ -13,6 +13,8 @@ import type { ServiceTokenScope } from './auth/service-token.js';
 import { type PublicApiConfig, parseTelegramChannelId } from './config.js';
 import { decodeMessageCursor, encodeMessageCursor, type MessageCursor } from './http/cursor.js';
 import { FixedWindowRateLimiter, matchCorsOrigin } from './http/public-policy.js';
+import { resolveMediaByteRange } from './media-cache/http-range.js';
+import type { PublicMediaReader } from './media-cache/public-reader.js';
 import type { MessageReader } from './messages/types.js';
 import type { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
 import type { DeterministicRepairService } from './reconciliation/repair.js';
@@ -36,6 +38,7 @@ export interface AppDependencies {
   admin: AdminReader;
   adminAssetsRoot?: string;
   auth: RuntimeAuth;
+  media: PublicMediaReader;
   messages: MessageReader;
   operations: Pick<
     PostgresAdminOperations,
@@ -103,6 +106,9 @@ const unavailableAuth: RuntimeAuth = {
     Response.json(apiError('auth_unavailable', 'Authentication is not configured'), {
       status: 503,
     }),
+};
+const unavailableMediaReader: PublicMediaReader = {
+  open: async () => null,
 };
 const unavailableOperations: AppDependencies['operations'] = {
   listBlockedTasks: async () => [],
@@ -224,6 +230,7 @@ function isPublicApiPath(path: string): boolean {
   return (
     path === '/api/v1/health' ||
     path === '/api/v1/channels' ||
+    path.startsWith('/api/v1/media/') ||
     path === '/api/v1/messages' ||
     path.startsWith('/api/v1/messages/')
   );
@@ -239,6 +246,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     admin: dependencies.admin ?? unavailableAdminReader,
     adminAssetsRoot: dependencies.adminAssetsRoot,
     auth: dependencies.auth ?? unavailableAuth,
+    media: dependencies.media ?? unavailableMediaReader,
     messages: dependencies.messages ?? unavailableMessageReader,
     operations: dependencies.operations ?? unavailableOperations,
     publicApi: dependencies.publicApi ?? defaultPublicApi,
@@ -299,16 +307,22 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     }
 
     const origin = matchCorsOrigin(context.req.header('Origin'), resolved.publicApi.corsOrigins);
+    if (resolved.publicApi.corsOrigins.size > 0) {
+      context.header('Vary', 'Origin');
+    }
     if (origin) {
       context.header('Access-Control-Allow-Origin', origin);
-      context.header('Access-Control-Allow-Methods', 'GET');
-      context.header('Access-Control-Allow-Headers', 'Content-Type');
-      context.header('Vary', 'Origin');
+      context.header('Access-Control-Allow-Methods', 'GET, HEAD');
+      context.header('Access-Control-Allow-Headers', 'Content-Type, Range, If-Range');
+      context.header(
+        'Access-Control-Expose-Headers',
+        'Content-Length, Content-Range, ETag, Accept-Ranges',
+      );
     }
     if (context.req.method === 'OPTIONS') {
       return context.body(null, 204);
     }
-    if (context.req.method !== 'GET') {
+    if (context.req.method !== 'GET' && context.req.method !== 'HEAD') {
       await next();
       return;
     }
@@ -341,6 +355,59 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
   app.get('/api/v1/channels', async (context) =>
     context.json({ items: await resolved.messages.listChannels() }),
   );
+  app.on(['GET', 'HEAD'], '/api/v1/media/:id', async (context) => {
+    const parsedObjectId = uuidSchema.safeParse(context.req.param('id'));
+    if (!parsedObjectId.success) {
+      return context.json(
+        apiError('invalid_media_id', 'id must be a suite media object UUID'),
+        400,
+      );
+    }
+    const opened = await resolved.media.open(parsedObjectId.data);
+    if (!opened) {
+      return context.json(apiError('media_not_found', 'Media was not found'), 404);
+    }
+
+    context.header('Content-Type', opened.contentType);
+    context.header('ETag', opened.etag);
+    context.header('X-Content-Type-Options', 'nosniff');
+    if (opened.variant === 'original') {
+      context.header('Accept-Ranges', 'bytes');
+    }
+
+    if (context.req.method === 'HEAD') {
+      context.header('Cache-Control', 'public, max-age=31536000, immutable');
+      context.header('Content-Length', String(opened.byteLength));
+      await opened.close();
+      return context.body(null, 200);
+    }
+
+    const requestedRange =
+      opened.variant === 'original' &&
+      (context.req.header('If-Range') === undefined ||
+        context.req.header('If-Range') === opened.etag)
+        ? resolveMediaByteRange(context.req.header('Range'), opened.byteLength)
+        : null;
+    if (requestedRange === 'unsatisfiable') {
+      context.header('Cache-Control', 'private, no-store');
+      context.header('Content-Range', `bytes */${opened.byteLength}`);
+      await opened.close();
+      return context.body(null, 416);
+    }
+    if (requestedRange) {
+      context.header('Cache-Control', 'public, max-age=31536000, immutable');
+      context.header('Content-Length', String(requestedRange.length));
+      context.header(
+        'Content-Range',
+        `bytes ${requestedRange.start}-${requestedRange.end}/${opened.byteLength}`,
+      );
+      return context.body(opened.stream(requestedRange), 206);
+    }
+
+    context.header('Cache-Control', 'public, max-age=31536000, immutable');
+    context.header('Content-Length', String(opened.byteLength));
+    return context.body(opened.stream(), 200);
+  });
   app.get('/api/v1/messages', async (context) => {
     const parsedChannelId = uuidSchema.safeParse(context.req.query('channel'));
     if (!parsedChannelId.success) {

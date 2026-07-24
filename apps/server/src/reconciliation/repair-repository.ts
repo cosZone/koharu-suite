@@ -21,6 +21,7 @@ import {
   fingerprintMessageSnapshot,
 } from '../messages/fingerprint.js';
 import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from '../messages/renderer.js';
+import { lockSourceEvidenceDiscovery } from '../messages/source-evidence-coordination.js';
 import type { NormalizedMessageSnapshot, SourceNeutralMedia } from '../messages/types.js';
 import { normalizeChannelUpdate } from '../telegram/normalize.js';
 import type {
@@ -49,6 +50,7 @@ export class PostgresDeterministicRepairRepository implements DeterministicRepai
   apply(input: ReconciliationRepairInput): Promise<ReconciliationRepairResult> {
     return this.database.transaction(async (transaction) => {
       await transaction.execute(sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`);
+      await lockSourceEvidenceDiscovery(transaction);
       return this.applyInTransaction(transaction, input);
     });
   }
@@ -58,6 +60,7 @@ export class PostgresDeterministicRepairRepository implements DeterministicRepai
     input: ReconciliationRepairInput,
     options: { runId?: string } = {},
   ): Promise<ReconciliationRepairResult> {
+    await lockSourceEvidenceDiscovery(transaction);
     const [initialFinding] = await transaction
       .select()
       .from(reconciliationFindings)

@@ -59,6 +59,7 @@ export interface PublishedMediaBlob extends MediaBlobIdentity {
 }
 
 export type MediaBlobSettlement = 'db_committed' | 'db_rolled_back';
+export type MediaBlobEvictionResult = 'absent' | 'removed';
 
 export interface DiscardPartialLeaseResult {
   removedBytes: number;
@@ -345,6 +346,46 @@ export class LocalMediaBlobStore {
     const path = this.#resolveRelativeKey(blob.relativeKey);
     await this.#assertRequiredDirectoryContained(dirname(path));
     return openRegularFile(path, blob.byteLength);
+  }
+
+  async evict(blob: MediaBlobIdentity): Promise<MediaBlobEvictionResult> {
+    assertBlobIdentity(blob);
+    const path = this.#resolveRelativeKey(blob.relativeKey);
+    const parent = dirname(path);
+    await this.#assertRequiredDirectoryContained(parent);
+    let file: FileHandle;
+    try {
+      file = await openRegularFile(path, blob.byteLength);
+    } catch (error) {
+      if (hasErrorCode(error, 'ENOENT')) {
+        await this.#syncDirectory(parent);
+        return 'absent';
+      }
+      throw error;
+    }
+
+    try {
+      const [openMetadata, pathMetadata] = await Promise.all([file.stat(), lstat(path)]);
+      if (
+        pathMetadata.isSymbolicLink() ||
+        !pathMetadata.isFile() ||
+        openMetadata.dev !== pathMetadata.dev ||
+        openMetadata.ino !== pathMetadata.ino
+      ) {
+        throw new MediaBlobIntegrityError('Media blob changed before eviction');
+      }
+      let result: MediaBlobEvictionResult = 'removed';
+      await unlink(path).catch((error: unknown) => {
+        if (!hasErrorCode(error, 'ENOENT')) {
+          throw error;
+        }
+        result = 'absent';
+      });
+      await this.#syncDirectory(parent);
+      return result;
+    } finally {
+      await file.close().catch(() => undefined);
+    }
   }
 
   #assertOwned(staged: StagedMediaBlob): asserts staged is OwnedStagedMediaBlob {

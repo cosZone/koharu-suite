@@ -36,12 +36,14 @@
     "@hono/node-server": "catalog:",
     "@streamparser/json": "0.0.22",
     "@streamparser/json-node": "0.0.22",
+    "abort-controller": "catalog:",
     "better-auth": "catalog:",
     "drizzle-orm": "catalog:",
     "file-type": "catalog:",
     "grammy": "catalog:",
     "hono": "catalog:",
     "postgres": "catalog:",
+    "sharp": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

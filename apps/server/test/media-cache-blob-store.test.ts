@@ -83,6 +83,46 @@ describe('LocalMediaBlobStore', () => {
     await opened.close();
   });
 
+  it('durably evicts a published blob while an already-open response can finish', async () => {
+    const { root, store } = await createStore();
+    const content = 'open response survives eviction';
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks(content),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const opened = await store.open(published);
+
+    await expect(store.evict(published)).resolves.toBe('removed');
+    await expect(readFile(join(root, published.relativeKey))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(opened.readFile('utf8')).resolves.toBe(content);
+    await opened.close();
+    await expect(store.evict(published)).resolves.toBe('absent');
+  });
+
+  it('refuses to evict a symlink substituted for a canonical blob', async () => {
+    const { root, store } = await createStore();
+    const staged = await store.stage({
+      ...identifiers(),
+      maxBytes: 1024,
+      source: chunks('published content'),
+    });
+    const published = await store.publish(staged);
+    await store.settle(staged, 'db_committed');
+    const blobPath = join(root, published.relativeKey);
+    const target = join(root, 'outside-target');
+    await rm(blobPath);
+    await writeFile(target, 'must survive');
+    await symlink(target, blobPath);
+
+    await expect(store.evict(published)).rejects.toBeInstanceOf(MediaBlobIntegrityError);
+    await expect(readFile(target, 'utf8')).resolves.toBe('must survive');
+  });
+
   it('cancels upstream and removes partial bytes when the stream exceeds the hard limit', async () => {
     const { store } = await createStore();
     const identity = identifiers();

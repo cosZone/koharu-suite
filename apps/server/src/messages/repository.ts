@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNull, lt, or, type SQL } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
+  mediaCacheObjects,
   messageMedia,
   messageRevisions,
   messageSourceMediaObservations,
@@ -12,6 +13,7 @@ import {
 import type { NormalizedChannelPost } from '../telegram/types.js';
 import { CURRENT_MESSAGE_FINGERPRINT_VERSION, fingerprintMessageSnapshot } from './fingerprint.js';
 import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from './renderer.js';
+import { lockSourceEvidenceDiscovery } from './source-evidence-coordination.js';
 import type {
   MessageListOptions,
   MessagePage,
@@ -47,6 +49,19 @@ export interface MessageWriter {
 type MessageRow = Awaited<ReturnType<PostgresMessageRepository['selectMessages']>>[number];
 type DatabaseTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
 type SourceMediaAvailability = typeof messageSourceMediaObservations.$inferInsert.availability;
+type PublicCacheObject = Pick<
+  typeof mediaCacheObjects.$inferSelect,
+  'canonicalMediaId' | 'id' | 'state' | 'variant'
+>;
+
+const PENDING_PUBLIC_CACHE_STATES = new Set<typeof mediaCacheObjects.$inferSelect.state>([
+  'awaiting_local_source',
+  'discovered',
+  'downloading',
+  'reserved',
+  'retry_wait',
+  'staging',
+]);
 
 function sourceMediaAvailability(media: SourceNeutralMedia): SourceMediaAvailability {
   switch (media.availabilityReason) {
@@ -153,14 +168,34 @@ function snapshotFromBotPost(post: NormalizedChannelPost): NormalizedMessageSnap
   };
 }
 
-function publicMedia(row: typeof messageMedia.$inferSelect): PublicMedia {
+function cacheObjectUrl(object: PublicCacheObject | undefined): string | null {
+  return object?.state === 'ready' ? `/api/v1/media/${object.id}` : null;
+}
+
+function publicMedia(
+  row: typeof messageMedia.$inferSelect,
+  cacheObjects: PublicCacheObject[],
+): PublicMedia {
+  const original = cacheObjects.find((object) => object.variant === 'original');
+  const thumbnail = cacheObjects.find((object) => object.variant === 'thumbnail');
+  const cacheStatus =
+    original?.state === 'ready'
+      ? 'ready'
+      : original && PENDING_PUBLIC_CACHE_STATES.has(original.state)
+        ? 'pending'
+        : 'unavailable';
+
   return {
+    cacheStatus,
     duration: row.duration,
     fileName: row.fileName,
     fileSize: row.fileSize?.toString() ?? null,
     height: row.height,
+    id: row.id,
     kind: row.kind,
     mimeType: row.mimeType,
+    originalUrl: cacheObjectUrl(original),
+    thumbnailUrl: cacheObjectUrl(thumbnail),
     width: row.width,
   };
 }
@@ -359,6 +394,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     snapshot: NormalizedMessageSnapshot,
     observation: SourceObservation,
   ): Promise<SourceWriteResult> {
+    await lockSourceEvidenceDiscovery(transaction);
     const now = new Date();
     const [channel] = await transaction
       .insert(telegramChannels)
@@ -880,10 +916,39 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       )
       .orderBy(messageMedia.position);
 
+    const cacheRows =
+      mediaRows.length === 0
+        ? []
+        : await this.database
+            .select({
+              canonicalMediaId: mediaCacheObjects.canonicalMediaId,
+              id: mediaCacheObjects.id,
+              state: mediaCacheObjects.state,
+              variant: mediaCacheObjects.variant,
+            })
+            .from(mediaCacheObjects)
+            .where(
+              and(
+                inArray(
+                  mediaCacheObjects.canonicalMediaId,
+                  mediaRows.map((row) => row.id),
+                ),
+                eq(mediaCacheObjects.recipeVersion, 1),
+                inArray(mediaCacheObjects.variant, ['original', 'thumbnail']),
+              ),
+            );
+
+    const cacheByMedia = new Map<string, PublicCacheObject[]>();
+    for (const row of cacheRows) {
+      const objects = cacheByMedia.get(row.canonicalMediaId) ?? [];
+      objects.push(row);
+      cacheByMedia.set(row.canonicalMediaId, objects);
+    }
+
     const mediaByRevision = new Map<string, PublicMedia[]>();
     for (const row of mediaRows) {
       const media = mediaByRevision.get(row.revisionId) ?? [];
-      media.push(publicMedia(row));
+      media.push(publicMedia(row, cacheByMedia.get(row.id) ?? []));
       mediaByRevision.set(row.revisionId, media);
     }
 
