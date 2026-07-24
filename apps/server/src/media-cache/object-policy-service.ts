@@ -335,7 +335,11 @@ async function readDatabaseClock(database: Database | MediaCacheTransaction): Pr
   const [clock] = await database.execute<{ now: Date | string }>(
     sql`select clock_timestamp() as now`,
   );
-  return normalizeDate(clock?.now, 'PostgreSQL clock');
+  const now = clock ? new Date(clock.now) : null;
+  if (!now || !Number.isFinite(now.getTime())) {
+    throw new MediaCacheObjectPolicyConflictError('PostgreSQL returned an invalid clock');
+  }
+  return now;
 }
 
 async function insertPolicyAction(
