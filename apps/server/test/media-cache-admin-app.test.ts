@@ -87,9 +87,42 @@ function mutations(): MediaCacheAdminMutations {
       operation: 'evict',
       state: 'pending',
     })),
+    migrate: vi.fn<MediaCacheAdminMutations['migrate']>(async () => ({
+      commandId: randomUUID(),
+      operation: 'migrate',
+      state: 'pending',
+    })),
+    previewPrune: vi.fn<MediaCacheAdminMutations['previewPrune']>(
+      async ({ targetBackendId, targetBytes }) => ({
+        candidates: 1,
+        hasMore: false,
+        projectedReadyBytes: targetBytes.toString(),
+        readyBytes: '256',
+        removableBytes: '128',
+        targetBackendId,
+        targetBytes: targetBytes.toString(),
+      }),
+    ),
+    protect: vi.fn<MediaCacheAdminMutations['protect']>(async ({ expiresAt, objectId }) => ({
+      alreadyApplied: false,
+      expiresAt: expiresAt ?? null,
+      objectId,
+      protected: true,
+      protectedAt: new Date('2026-07-24T08:00:00.000Z'),
+    })),
+    prune: vi.fn<MediaCacheAdminMutations['prune']>(async () => ({
+      commandId: randomUUID(),
+      operation: 'prune',
+      state: 'pending',
+    })),
     reconcile: vi.fn<MediaCacheAdminMutations['reconcile']>(async () => ({
       commandId: randomUUID(),
       operation: 'reconcile',
+      state: 'pending',
+    })),
+    restore: vi.fn<MediaCacheAdminMutations['restore']>(async () => ({
+      commandId: randomUUID(),
+      operation: 'restore',
       state: 'pending',
     })),
     retry: vi.fn<MediaCacheAdminMutations['retry']>(async ({ objectId }) => ({
@@ -97,6 +130,20 @@ function mutations(): MediaCacheAdminMutations {
       planId: PLAN_ID,
       state: 'retry_wait',
       variant: 'original',
+    })),
+    setEvictedPolicy: vi.fn<MediaCacheAdminMutations['setEvictedPolicy']>(
+      async ({ objectId, policy }) => ({
+        alreadyApplied: false,
+        objectId,
+        policy,
+      }),
+    ),
+    unprotect: vi.fn<MediaCacheAdminMutations['unprotect']>(async ({ objectId }) => ({
+      alreadyApplied: false,
+      expiresAt: null,
+      objectId,
+      protected: false,
+      protectedAt: null,
     })),
   };
 }
@@ -217,6 +264,213 @@ describe('media cache Admin API', () => {
         reason: 'owner-approved cache repair',
       });
     }
+  });
+
+  it('applies object protection and eviction policy synchronously for owner sessions', async () => {
+    const mediaCacheMutations = mutations();
+    const app = createApp({ auth: auth(owner), mediaCacheMutations });
+    const expiresAt = '2027-07-24T08:00:00.000Z';
+
+    const protect = await app.request(`/api/v1/admin/media-cache/objects/${OBJECT_ID}/protect`, {
+      body: JSON.stringify({ expiresAt, reason: '  protect shared blob  ' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(protect.status).toBe(200);
+    expect(mediaCacheMutations.protect).toHaveBeenCalledWith({
+      expiresAt: new Date(expiresAt),
+      initiatorId: owner.actorId,
+      objectId: OBJECT_ID,
+      reason: 'protect shared blob',
+    });
+
+    const policy = await app.request(`/api/v1/admin/media-cache/objects/${OBJECT_ID}/policy`, {
+      body: JSON.stringify({ policy: 'stay_evicted', reason: 'keep it cold' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(policy.status).toBe(200);
+    expect(mediaCacheMutations.setEvictedPolicy).toHaveBeenCalledWith({
+      initiatorId: owner.actorId,
+      objectId: OBJECT_ID,
+      policy: 'stay_evicted',
+      reason: 'keep it cold',
+    });
+
+    const unprotect = await app.request(
+      `/api/v1/admin/media-cache/objects/${OBJECT_ID}/unprotect`,
+      {
+        body: JSON.stringify({ reason: 'allow pruning' }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    );
+    expect(unprotect.status).toBe(200);
+    expect(mediaCacheMutations.unprotect).toHaveBeenCalledWith({
+      initiatorId: owner.actorId,
+      objectId: OBJECT_ID,
+      reason: 'allow pruning',
+    });
+  });
+
+  it('queues copy, restore, and prune commands with owner-owned validated targets', async () => {
+    const mediaCacheMutations = mutations();
+    const app = createApp({ auth: auth(owner), mediaCacheMutations });
+
+    const migrate = await app.request('/api/v1/admin/media-cache/migrate', {
+      body: JSON.stringify({
+        objectId: OBJECT_ID,
+        reason: 'copy object to durable tier',
+        sourceBackendId: 'local',
+        targetBackendId: 's3-default',
+      }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(migrate.status).toBe(202);
+    expect(mediaCacheMutations.migrate).toHaveBeenCalledWith({
+      initiatorId: owner.actorId,
+      objectId: OBJECT_ID,
+      reason: 'copy object to durable tier',
+      sourceBackendId: 'local',
+      targetBackendId: 's3-default',
+    });
+
+    const restore = await app.request(`/api/v1/admin/media-cache/objects/${OBJECT_ID}/restore`, {
+      body: JSON.stringify({ reason: 'restore hot copy', targetBackendId: 'local' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(restore.status).toBe(202);
+    expect(mediaCacheMutations.restore).toHaveBeenCalledWith({
+      initiatorId: owner.actorId,
+      objectId: OBJECT_ID,
+      reason: 'restore hot copy',
+      targetBackendId: 'local',
+    });
+
+    const prune = await app.request('/api/v1/admin/media-cache/prune', {
+      body: JSON.stringify({
+        reason: 'bound durable storage',
+        targetBackendId: 's3-default',
+        targetBytes: '5368709120',
+      }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(prune.status).toBe(202);
+    expect(mediaCacheMutations.prune).toHaveBeenCalledWith({
+      initiatorId: owner.actorId,
+      reason: 'bound durable storage',
+      targetBackendId: 's3-default',
+      targetBytes: 5_368_709_120n,
+    });
+  });
+
+  it('allows read-scoped service tokens to preview prune without granting mutations', async () => {
+    const mediaCacheMutations = mutations();
+    const app = createApp({ auth: auth(serviceToken), mediaCacheMutations });
+
+    const preview = await app.request('/api/v1/admin/media-cache/prune/preview', {
+      body: JSON.stringify({ targetBackendId: 's3-default', targetBytes: '128' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(preview.status).toBe(200);
+    await expect(preview.json()).resolves.toMatchObject({
+      projectedReadyBytes: '128',
+      targetBackendId: 's3-default',
+      targetBytes: '128',
+    });
+    expect(mediaCacheMutations.previewPrune).toHaveBeenCalledWith({
+      targetBackendId: 's3-default',
+      targetBytes: 128n,
+    });
+
+    for (const [path, body] of [
+      [
+        `/api/v1/admin/media-cache/objects/${OBJECT_ID}/protect`,
+        { reason: 'service cannot protect' },
+      ],
+      [
+        '/api/v1/admin/media-cache/migrate',
+        {
+          reason: 'service cannot copy',
+          sourceBackendId: 'local',
+          targetBackendId: 's3-default',
+        },
+      ],
+      [
+        '/api/v1/admin/media-cache/prune',
+        { reason: 'service cannot prune', targetBackendId: 'local', targetBytes: '0' },
+      ],
+    ] as const) {
+      const response = await app.request(path, {
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: 'owner_session_required' },
+      });
+    }
+    expect(mediaCacheMutations.protect).not.toHaveBeenCalled();
+    expect(mediaCacheMutations.migrate).not.toHaveBeenCalled();
+    expect(mediaCacheMutations.prune).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-canonical storage mutation bodies before calling the service', async () => {
+    const mediaCacheMutations = mutations();
+    const app = createApp({ auth: auth(owner), mediaCacheMutations });
+    const invalidRequests = [
+      {
+        body: { reason: 'same backend', sourceBackendId: 'local', targetBackendId: 'local' },
+        path: '/api/v1/admin/media-cache/migrate',
+      },
+      {
+        body: { extra: true, reason: 'extra field' },
+        path: `/api/v1/admin/media-cache/objects/${OBJECT_ID}/protect`,
+      },
+      {
+        body: { reason: 'bad target', targetBackendId: 'local', targetBytes: '01' },
+        path: '/api/v1/admin/media-cache/prune',
+      },
+      {
+        body: { reason: 'not decimal', targetBackendId: 'local', targetBytes: '5e9' },
+        path: '/api/v1/admin/media-cache/prune',
+      },
+      {
+        body: { reason: 'zero is not a target', targetBackendId: 'local', targetBytes: '0' },
+        path: '/api/v1/admin/media-cache/prune',
+      },
+      {
+        body: { targetBackendId: 'local', targetBytes: '0' },
+        path: '/api/v1/admin/media-cache/prune/preview',
+      },
+      {
+        body: {
+          targetBackendId: 's3-default',
+          targetBytes: (5n * 1024n * 1024n * 1024n * 1024n + 1n).toString(),
+        },
+        path: '/api/v1/admin/media-cache/prune/preview',
+      },
+    ];
+    for (const request of invalidRequests) {
+      const response = await app.request(request.path, {
+        body: JSON.stringify(request.body),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: 'invalid_media_cache_action' },
+      });
+    }
+    expect(mediaCacheMutations.migrate).not.toHaveBeenCalled();
+    expect(mediaCacheMutations.protect).not.toHaveBeenCalled();
+    expect(mediaCacheMutations.prune).not.toHaveBeenCalled();
+    expect(mediaCacheMutations.previewPrune).not.toHaveBeenCalled();
   });
 
   it('queues one worker-owned reconcile command and rejects server-side pagination input', async () => {
