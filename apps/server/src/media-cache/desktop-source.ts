@@ -89,11 +89,16 @@ export class DesktopMediaSource {
       }
       file = await this.fileSystem.open(canonicalSource, constants.O_RDONLY | constants.O_NOFOLLOW);
       const metadata = await file.stat({ bigint: true });
+      const openedPath =
+        process.platform === 'linux'
+          ? await this.fileSystem.realpath(`/proc/self/fd/${file.fd}`)
+          : canonicalSource;
       if (
         !metadata.isFile() ||
         metadata.size < 0n ||
         metadata.dev !== expectedMetadata.dev ||
-        metadata.ino !== expectedMetadata.ino
+        metadata.ino !== expectedMetadata.ino ||
+        !openedPath.startsWith(`${canonicalRoot}${sep}`)
       ) {
         throw new DesktopMediaSourceUnavailableError();
       }

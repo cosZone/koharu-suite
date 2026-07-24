@@ -128,12 +128,12 @@ describe('TelegramMediaSource', () => {
       signal,
     });
 
-    expect(api.getFile).toHaveBeenCalledWith('telegram-file-id', signal);
+    expect(api.getFile).toHaveBeenCalledWith('telegram-file-id', expect.any(AbortSignal));
     expect(fetch).toHaveBeenCalledWith(
       new URL(
         'http://bot-api.internal:8081/telegram/file/bot123456:secret-token/nested/media%20file.jpg',
       ),
-      { signal },
+      { signal: expect.any(AbortSignal) },
     );
     expect(Object.keys(opened).sort()).toEqual(['declaredBytes', 'stream']);
     expect(JSON.stringify(opened)).not.toContain('secret-token');
@@ -156,7 +156,7 @@ describe('TelegramMediaSource', () => {
 
     expect(fetch).toHaveBeenCalledWith(
       new URL('http://bot-files.internal:8082/download/bot123456:secret-token/photos/file_42.jpg'),
-      {},
+      { signal: expect.any(AbortSignal) },
     );
   });
 
@@ -444,6 +444,26 @@ describe('TelegramMediaSource', () => {
 
     await expect(pendingRead).rejects.toBe(reason);
     expect(cancel).toHaveBeenCalledWith(reason);
+  });
+
+  it('times out a stalled response body and releases the download slot', async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const source = new TelegramMediaSource({
+      api: fileApi(telegramFile()),
+      botToken: '123456:secret-token',
+      fetch: vi.fn(async () => new Response(body)),
+      timeoutMs: 10,
+    });
+    const opened = await source.open({
+      fileId: 'telegram-file-id',
+      maxBytes: 1_024,
+    });
+
+    await expect(opened.stream.getReader().read()).rejects.toBeInstanceOf(
+      TelegramMediaSourceTransientError,
+    );
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('forwards response chunks incrementally without buffering the body', async () => {

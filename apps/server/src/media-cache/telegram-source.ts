@@ -1,6 +1,7 @@
 import type { TelegramFileApi } from '../telegram/api.js';
 
 const DEFAULT_TELEGRAM_API_ROOT = 'https://api.telegram.org';
+const DEFAULT_TELEGRAM_DOWNLOAD_TIMEOUT_MS = 2 * 60_000;
 const MAX_SAFE_CONTENT_LENGTH = BigInt(Number.MAX_SAFE_INTEGER);
 
 export interface TelegramMediaSourceOptions {
@@ -9,6 +10,7 @@ export interface TelegramMediaSourceOptions {
   apiRoot?: string;
   fileRoot?: string;
   fetch?: typeof globalThis.fetch;
+  timeoutMs?: number;
 }
 
 export interface OpenTelegramMediaInput {
@@ -99,22 +101,24 @@ function telegramErrorStatus(error: unknown): number | null {
 
 function cancellableStream(
   source: ReadableStream<Uint8Array>,
-  signal?: AbortSignal,
+  signal: AbortSignal,
+  externalSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let finished = false;
 
   const cleanup = () => {
-    signal?.removeEventListener('abort', abort);
+    signal.removeEventListener('abort', abort);
   };
   const abort = () => {
     if (finished) {
       return;
     }
     finished = true;
-    const reason =
-      signal?.reason ?? new DOMException('Telegram media stream aborted', 'AbortError');
+    const reason = externalSignal?.aborted
+      ? externalSignal.reason
+      : new TelegramMediaSourceTransientError('Telegram file download timed out');
     controller?.error(reason);
     void reader.cancel(reason).catch(() => {});
   };
@@ -146,8 +150,10 @@ function cancellableStream(
           finished = true;
           cleanup();
           streamController.error(
-            signal?.aborted
-              ? signal.reason
+            signal.aborted
+              ? externalSignal?.aborted
+                ? externalSignal.reason
+                : new TelegramMediaSourceTransientError('Telegram file download timed out')
               : new TelegramMediaSourceTransientError('Telegram file download stream failed'),
           );
         }
@@ -155,8 +161,8 @@ function cancellableStream(
     },
     start(streamController) {
       controller = streamController;
-      signal?.addEventListener('abort', abort, { once: true });
-      if (signal?.aborted) {
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) {
         abort();
       }
     },
@@ -169,6 +175,7 @@ export class TelegramMediaSource {
   private readonly botToken: string;
   private readonly fetch: typeof globalThis.fetch;
   private readonly fileRoot: string | undefined;
+  private readonly timeoutMs: number;
 
   constructor(options: TelegramMediaSourceOptions) {
     this.api = options.api;
@@ -176,6 +183,10 @@ export class TelegramMediaSource {
     this.botToken = options.botToken;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.fileRoot = options.fileRoot;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TELEGRAM_DOWNLOAD_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new TypeError('Telegram media timeoutMs must be a positive safe integer');
+    }
   }
 
   async open(input: OpenTelegramMediaInput): Promise<OpenedTelegramMedia> {
@@ -183,12 +194,19 @@ export class TelegramMediaSource {
       throw new TypeError('Telegram media maxBytes must be a nonnegative safe integer');
     }
     input.signal?.throwIfAborted();
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const downloadSignal = input.signal
+      ? AbortSignal.any([input.signal, timeoutSignal])
+      : timeoutSignal;
     let file: Awaited<ReturnType<TelegramFileApi['getFile']>>;
     try {
-      file = await this.api.getFile(input.fileId, input.signal);
+      file = await this.api.getFile(input.fileId, downloadSignal);
     } catch (error) {
       if (input.signal?.aborted) {
         throw input.signal.reason;
+      }
+      if (downloadSignal.aborted) {
+        throw new TelegramMediaSourceTransientError('Telegram getFile request timed out');
       }
       const status = telegramErrorStatus(error);
       if (status !== null && !isTransientHttpStatus(status)) {
@@ -218,11 +236,14 @@ export class TelegramMediaSource {
           filePath: file.file_path,
           ...(this.fileRoot ? { fileRoot: this.fileRoot } : {}),
         }),
-        input.signal ? { signal: input.signal } : {},
+        { signal: downloadSignal },
       );
     } catch {
       if (input.signal?.aborted) {
         throw input.signal.reason;
+      }
+      if (downloadSignal.aborted) {
+        throw new TelegramMediaSourceTransientError('Telegram file download request timed out');
       }
       throw new TelegramMediaSourceTransientError('Telegram file download request failed');
     }
@@ -252,7 +273,7 @@ export class TelegramMediaSource {
     }
     return {
       declaredBytes,
-      stream: cancellableStream(response.body, input.signal),
+      stream: cancellableStream(response.body, downloadSignal, input.signal),
     };
   }
 }
