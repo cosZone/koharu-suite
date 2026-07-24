@@ -1,26 +1,39 @@
-import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
-import type { MediaCacheConfig } from '../config.js';
+import type { MediaCacheConfig, MediaS3Config } from '../config.js';
 import type { Database } from '../db/client.js';
 import { mediaCacheRuntime } from '../db/schema.js';
 import type { GrammyTelegramApi } from '../telegram/api.js';
+import {
+  BackendAwareCommittedBlobReader,
+  PostgresCommittedBlobLocationRepository,
+} from './backend-aware-reader.js';
 import { LocalMediaBlobStore } from './blob-store.js';
 import { MediaCacheCommandProcessor, PostgresMediaCacheCommandQueue } from './command-queue.js';
 import { PostgresMediaCacheDiscoveryRepository } from './discovery-repository.js';
-import { type MediaCacheBlobEvictor, MediaCacheEvictionService } from './eviction-repository.js';
+import { MediaCacheEvictionService } from './eviction-repository.js';
 import {
   MEDIA_CACHE_ADVISORY_LOCK,
   PostgresMediaCacheLedgerRepository,
 } from './ledger-repository.js';
+import {
+  LocalPersistentBlobBackend,
+  PersistentBlobBackendRegistry,
+  S3PersistentBlobBackend,
+} from './local-persistent-blob-backend.js';
 import { MediaCacheMaintenanceService } from './maintenance-service.js';
+import { S3MediaBlobBackend } from './s3-blob-backend.js';
+import { StorageLedgerRepository } from './storage-ledger-repository.js';
+import {
+  PostgresLegacyLocalRestoreFinalizer,
+  PostgresStorageOperationService,
+} from './storage-operation-service.js';
+import { PostgresStoragePruneService } from './storage-prune-service.js';
 import { TelegramMediaSource } from './telegram-source.js';
 import { PostgresMediaCacheThumbnailLedgerRepository } from './thumbnail-ledger-repository.js';
 import { MediaCacheWorker, type MediaCacheWorkerRunResult } from './worker.js';
 import { PostgresMediaCacheWorkerRepository } from './worker-repository.js';
 
 const DEFAULT_IDLE_INTERVAL_MS = 1_000;
-const EVICTION_LEASE_MS = 2 * 60_000;
-const MAX_CAPACITY_EVICTIONS_PER_PASS = 100;
 const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024;
 
 interface MediaCacheRunOnce {
@@ -32,7 +45,7 @@ interface MediaCacheCapacity {
   pruneConfiguredExcess(signal?: AbortSignal): Promise<void>;
 }
 
-interface MediaCacheCapacityBlobStore extends MediaCacheBlobEvictor {
+interface MediaCacheCapacityBlobStore {
   initialize(): Promise<void>;
 }
 
@@ -49,6 +62,7 @@ export interface CreateMediaCacheWorkerRuntimeInput {
   config: MediaCacheConfig;
   database: Database;
   leaseOwner: string;
+  mediaS3: MediaS3Config;
   telegramApi: GrammyTelegramApi;
 }
 
@@ -173,13 +187,22 @@ export function createMediaCacheWorkerRuntime(
 ): MediaCacheWorkerRuntime {
   assertRuntimeInput(input);
   const blobStore = new LocalMediaBlobStore(input.config.root);
+  const persistentBackends = createPersistentBlobBackendRegistry(blobStore, input.mediaS3);
+  const committedBlobReader = new BackendAwareCommittedBlobReader(
+    new PostgresCommittedBlobLocationRepository(input.database),
+    persistentBackends,
+  );
+  const storagePrune = new PostgresStoragePruneService(input.database, persistentBackends);
   const ledger = new PostgresMediaCacheLedgerRepository(input.database);
   const work = new PostgresMediaCacheWorkerRepository(input.database);
   const capacity = new PostgresMediaCacheCapacity(
     input.database,
     blobStore,
     input.config.maxBytes,
+    input.config.root,
     input.leaseOwner,
+    input.mediaS3,
+    storagePrune,
   );
   const commands = new MediaCacheCommandProcessor(
     input.database,
@@ -187,9 +210,16 @@ export function createMediaCacheWorkerRuntime(
     new MediaCacheEvictionService(input.database, blobStore),
     new MediaCacheMaintenanceService(input.database, blobStore, input.leaseOwner),
     input.leaseOwner,
+    new PostgresStorageOperationService(
+      input.database,
+      persistentBackends,
+      new PostgresLegacyLocalRestoreFinalizer(),
+      storagePrune,
+    ),
   );
   const runner = new MediaCacheWorker({
     blobStore,
+    committedBlobReader,
     discovery: new PostgresMediaCacheDiscoveryRepository(input.database),
     ledger,
     leaseOwner: input.leaseOwner,
@@ -205,22 +235,63 @@ export function createMediaCacheWorkerRuntime(
   return new MediaCacheWorkerRuntime({ capacity, commands, runner });
 }
 
-class PostgresMediaCacheCapacity implements MediaCacheCapacity {
-  readonly #eviction: MediaCacheEvictionService;
-  readonly #ledger: PostgresMediaCacheLedgerRepository;
+export function createPersistentBlobBackendRegistry(
+  blobStore: LocalMediaBlobStore,
+  mediaS3: MediaS3Config,
+): PersistentBlobBackendRegistry {
+  const local = new LocalPersistentBlobBackend(blobStore);
+  if (!mediaS3.enabled) {
+    return new PersistentBlobBackendRegistry([local]);
+  }
+  const s3 = new S3PersistentBlobBackend(
+    new S3MediaBlobBackend({
+      bucket: mediaS3.bucket,
+      connectTimeoutMs: mediaS3.connectTimeoutMs,
+      credentials: {
+        accessKeyId: mediaS3.accessKeyId,
+        secretAccessKey: mediaS3.secretAccessKey,
+      },
+      endpoint: mediaS3.endpoint,
+      forcePathStyle: mediaS3.forcePathStyle,
+      prefix: mediaS3.prefix,
+      region: mediaS3.region,
+      requestTimeoutMs: mediaS3.requestTimeoutMs,
+    }),
+  );
+  return new PersistentBlobBackendRegistry([local, s3]);
+}
 
+class PostgresMediaCacheCapacity implements MediaCacheCapacity {
   constructor(
     private readonly database: Database,
     private readonly blobStore: MediaCacheCapacityBlobStore,
     private readonly maxBytes: number,
+    private readonly configRoot: string,
     private readonly leaseOwner: string,
-  ) {
-    this.#eviction = new MediaCacheEvictionService(database, blobStore);
-    this.#ledger = new PostgresMediaCacheLedgerRepository(database);
-  }
+    private readonly mediaS3: MediaS3Config,
+    private readonly storagePrune: PostgresStoragePruneService,
+  ) {}
 
   async initialize(): Promise<void> {
     await this.blobStore.initialize();
+    await new StorageLedgerRepository(this.database).bootstrap({
+      local: {
+        maxBytes: BigInt(this.maxBytes),
+        root: this.configRoot,
+      },
+      ...(this.mediaS3.enabled
+        ? {
+            s3: {
+              bucket: this.mediaS3.bucket,
+              endpointOrigin: this.mediaS3.endpoint,
+              forcePathStyle: this.mediaS3.forcePathStyle,
+              maxBytes: BigInt(this.mediaS3.maxBytes),
+              prefix: this.mediaS3.prefix,
+              region: this.mediaS3.region,
+            },
+          }
+        : {}),
+    });
     const configuredMax = BigInt(this.maxBytes);
     await this.database.transaction(async (transaction) => {
       await transaction.execute(sql`select pg_advisory_xact_lock(${MEDIA_CACHE_ADVISORY_LOCK})`);
@@ -246,38 +317,19 @@ class PostgresMediaCacheCapacity implements MediaCacheCapacity {
   }
 
   async pruneConfiguredExcess(signal?: AbortSignal): Promise<void> {
-    for (let evictions = 0; evictions < MAX_CAPACITY_EVICTIONS_PER_PASS; evictions += 1) {
-      signal?.throwIfAborted();
-      const requiredHeadroom = await this.#ledger.requiredHeadroomBytes();
-      if (requiredHeadroom <= 0n) {
-        return;
-      }
-      const now = await this.#readDatabaseClock();
-      const result = await this.#eviction.evict({
-        evictionExpiresAt: new Date(now.getTime() + EVICTION_LEASE_MS),
-        evictionOwner: this.leaseOwner,
-        evictionToken: randomUUID(),
-        initiator: {
-          initiatorId: this.leaseOwner,
-          kind: 'worker',
-        },
-        selection: { kind: 'least_recently_used' },
-      });
-      if (!result) {
-        return;
-      }
-    }
-  }
-
-  async #readDatabaseClock(): Promise<Date> {
-    const [clock] = await this.database.execute<{ now: Date | string }>(
-      sql`select clock_timestamp() as now`,
-    );
-    const now = clock ? new Date(clock.now) : null;
-    if (!now || !Number.isFinite(now.getTime())) {
-      throw new Error('PostgreSQL returned an invalid media cache clock');
-    }
-    return now;
+    signal?.throwIfAborted();
+    await this.storagePrune.apply({
+      command: {
+        initiatorId: this.leaseOwner,
+        initiatorKind: 'worker',
+        operation: 'prune',
+        reason: 'configured local storage capacity',
+        targetBackendId: 'local',
+        targetBytes: BigInt(this.maxBytes),
+      },
+      renewLease: async () => signal?.throwIfAborted(),
+      ...(signal ? { signal } : {}),
+    });
   }
 }
 

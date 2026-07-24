@@ -113,6 +113,10 @@ export interface MediaCacheWorkerBlobStore {
   }) => Promise<StagedMediaBlob>;
 }
 
+export interface MediaCacheCommittedBlobReader {
+  read: (blob: MediaBlobIdentity) => Promise<MediaBlobReadHandle>;
+}
+
 export interface MediaCacheWorkerSource {
   open: (input: { fileId: string; maxBytes: number; signal?: AbortSignal }) => Promise<{
     declaredBytes: bigint | null;
@@ -123,6 +127,7 @@ export interface MediaCacheWorkerSource {
 export interface MediaCacheWorkerOptions {
   blobStore: MediaCacheWorkerBlobStore;
   claimAwaitingLocalSource?: boolean;
+  committedBlobReader?: MediaCacheCommittedBlobReader;
   discovery: MediaCacheWorkerDiscovery;
   failureRetryDisposition?: 'await_local_source' | 'retry';
   ledger: MediaCacheWorkerLedger;
@@ -157,6 +162,7 @@ interface StagedOriginal {
 export class MediaCacheWorker {
   private readonly blobStore: MediaCacheWorkerBlobStore;
   private readonly claimAwaitingLocalSource: boolean;
+  private readonly committedBlobReader: MediaCacheCommittedBlobReader;
   private readonly discovery: MediaCacheWorkerDiscovery;
   private readonly ledger: MediaCacheWorkerLedger;
   private readonly leaseDurationMs: number;
@@ -177,6 +183,7 @@ export class MediaCacheWorker {
   constructor(options: MediaCacheWorkerOptions) {
     this.blobStore = options.blobStore;
     this.claimAwaitingLocalSource = options.claimAwaitingLocalSource ?? false;
+    this.committedBlobReader = options.committedBlobReader ?? options.blobStore;
     this.discovery = options.discovery;
     this.ledger = options.ledger;
     this.leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
@@ -285,7 +292,7 @@ export class MediaCacheWorker {
       await this.blobStore.settle(staged, 'db_committed');
       return;
     }
-    const blob = await this.blobStore.read({
+    const blob = await this.committedBlobReader.read({
       byteLength: Number(snapshot.actualBytes),
       relativeKey: relativeKey(snapshot.blobSha256),
       sha256: snapshot.blobSha256,
@@ -326,7 +333,7 @@ export class MediaCacheWorker {
     let original: MediaBlobReadHandle | undefined;
     let staged: StagedMediaBlob | undefined;
     try {
-      original = await this.blobStore.read({
+      original = await this.committedBlobReader.read({
         byteLength: Number(claimed.original.byteLength),
         relativeKey: claimed.original.relativeKey,
         sha256: claimed.original.sha256,
@@ -628,7 +635,7 @@ export class MediaCacheWorker {
         await this.blobStore.settle(item, 'db_committed');
         continue;
       }
-      const blob = await this.blobStore.read({
+      const blob = await this.committedBlobReader.read({
         byteLength: Number(object.actualBytes),
         relativeKey: relativeKey(object.blobSha256),
         sha256: object.blobSha256,

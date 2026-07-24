@@ -5,17 +5,20 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
   telegramChannels,
 } from '../../src/db/schema.js';
 import {
+  type MediaCacheObjectPolicyConflictError,
   MediaCacheObjectPolicyNotFoundError,
   PostgresMediaCacheObjectPolicyService,
 } from '../../src/media-cache/object-policy-service.js';
@@ -126,6 +129,8 @@ describe('PostgreSQL media cache object policy service', () => {
     if (!connection) throw new Error('Database connection was not created');
     await connection.db.execute(sql`
       truncate table
+        ${mediaBlobLocations},
+        ${mediaStorageBackends},
         ${mediaCacheActions},
         ${mediaCacheObjectProtections},
         ${mediaCacheObjects},
@@ -348,6 +353,71 @@ describe('PostgreSQL media cache object policy service', () => {
       .where(eq(mediaCacheActions.objectId, objectId));
     expect(actions).toEqual([]);
   });
+
+  it.each(['legacy_blob', 'storage_location'] as const)(
+    'rejects protection without mutation while a shared %s is deleting',
+    async (deletingKind) => {
+      if (!connection) throw new Error('Database connection was not created');
+      const objectId = await createReadyObject();
+      if (deletingKind === 'legacy_blob') {
+        await connection.db
+          .update(mediaCacheBlobs)
+          .set({
+            evictionExpiresAt: new Date(Date.now() + 60_000),
+            evictionOwner: 'worker-private-id',
+            evictionToken: randomUUID(),
+            state: 'deleting',
+          })
+          .where(eq(mediaCacheBlobs.sha256, SHARED_SHA256));
+      } else {
+        await connection.db.insert(mediaStorageBackends).values({
+          configFingerprint: 'f'.repeat(64),
+          id: 's3-default',
+          kind: 's3',
+          label: 'S3',
+          maxBytes: 1024n,
+        });
+        await connection.db.insert(mediaBlobLocations).values({
+          backendId: 's3-default',
+          blobSha256: SHARED_SHA256,
+          lastAccessedAt: new Date(),
+          mutationExpiresAt: new Date(Date.now() + 60_000),
+          mutationOwner: 'worker-private-id',
+          mutationToken: randomUUID(),
+          state: 'deleting',
+          storageKey: `blobs/${SHARED_SHA256.slice(0, 2)}/${SHARED_SHA256.slice(2, 4)}/${SHARED_SHA256}`,
+        });
+      }
+
+      await expect(
+        service().protect({
+          initiator: {
+            id: 'owner-private-id',
+            kind: 'owner_session',
+            reason: 'private protection reason',
+          },
+          objectId,
+        }),
+      ).rejects.toEqual(
+        expect.objectContaining({
+          code: 'conflict',
+          message: 'Cannot protect a media cache object while its blob is being deleted',
+        }) satisfies Partial<MediaCacheObjectPolicyConflictError>,
+      );
+      await expect(
+        connection.db
+          .select()
+          .from(mediaCacheObjectProtections)
+          .where(eq(mediaCacheObjectProtections.objectId, objectId)),
+      ).resolves.toEqual([]);
+      await expect(
+        connection.db
+          .select()
+          .from(mediaCacheActions)
+          .where(eq(mediaCacheActions.objectId, objectId)),
+      ).resolves.toEqual([]);
+    },
+  );
 
   it('unprotects idempotently and does not manufacture a second audit action', async () => {
     if (!connection) throw new Error('Database connection was not created');

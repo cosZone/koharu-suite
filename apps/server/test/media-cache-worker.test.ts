@@ -772,11 +772,13 @@ describe('bounded media cache worker', () => {
     const original = await blobs.publish(originalStage);
     await blobs.settle(originalStage, 'db_committed');
     const complete = vi.fn(async () => undefined);
+    const committedRead = vi.fn((identity) => blobs.read(identity));
     const recordPublished = vi.fn(async (input: { publish: () => Promise<void> }) =>
       input.publish(),
     );
     const worker = new MediaCacheWorker({
       blobStore: blobs,
+      committedBlobReader: { read: committedRead },
       discovery: {
         discoverBatch: vi.fn(async () => ({
           cursor: null,
@@ -842,6 +844,11 @@ describe('bounded media cache worker', () => {
     expect(complete).toHaveBeenCalledWith({
       leaseToken: LEASE_TOKEN,
       objectId: THUMBNAIL_ID,
+    });
+    expect(committedRead).toHaveBeenCalledWith({
+      byteLength: original.byteLength,
+      relativeKey: original.relativeKey,
+      sha256: original.sha256,
     });
   });
 });

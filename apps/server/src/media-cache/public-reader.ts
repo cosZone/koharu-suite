@@ -36,7 +36,7 @@ export interface PublicMediaObjectRepository {
 }
 
 export interface MediaAccessObserver {
-  observe(sha256: string, observedAt?: Date): void;
+  observe(backendId: string, sha256: string, observedAt?: Date): void;
 }
 
 export interface OpenedPublicMedia {
@@ -53,7 +53,10 @@ export interface PublicMediaReader {
 }
 
 export interface PublicMediaBlobReader {
-  read(blob: MediaBlobIdentity): Promise<MediaBlobReadHandle>;
+  read(
+    blob: MediaBlobIdentity,
+    options?: { observeBackend?: (backendId: string) => void },
+  ): Promise<MediaBlobReadHandle>;
 }
 
 export class PostgresPublicMediaObjectRepository implements PublicMediaObjectRepository {
@@ -69,13 +72,7 @@ export class PostgresPublicMediaObjectRepository implements PublicMediaObjectRep
         variant: mediaCacheObjects.variant,
       })
       .from(mediaCacheObjects)
-      .innerJoin(
-        mediaCacheBlobs,
-        and(
-          eq(mediaCacheBlobs.sha256, mediaCacheObjects.blobSha256),
-          eq(mediaCacheBlobs.state, 'ready'),
-        ),
-      )
+      .innerJoin(mediaCacheBlobs, eq(mediaCacheBlobs.sha256, mediaCacheObjects.blobSha256))
       .innerJoin(messageMedia, eq(messageMedia.id, mediaCacheObjects.canonicalMediaId))
       .innerJoin(messageRevisions, eq(messageRevisions.id, mediaCacheObjects.revisionId))
       .innerJoin(
@@ -123,14 +120,15 @@ export class LocalPublicMediaReader implements PublicMediaReader {
     }
     let blob: MediaBlobReadHandle;
     try {
-      blob = await this.blobStore.read(blobIdentity(object));
+      blob = await this.blobStore.read(blobIdentity(object), {
+        observeBackend: (backendId) => this.accessObserver.observe(backendId, object.sha256),
+      });
     } catch (error) {
       if (error instanceof MediaBlobStoreError || hasFilesystemErrorCode(error)) {
         return null;
       }
       throw error;
     }
-    this.accessObserver.observe(object.sha256);
     return openedPublicMedia(blob, object, objectId);
   }
 }

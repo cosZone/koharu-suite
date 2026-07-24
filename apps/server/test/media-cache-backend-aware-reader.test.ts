@@ -126,15 +126,19 @@ describe('backend-aware committed blob reader', () => {
     });
     const local = backend({ id: 'local' });
     const observer = vi.fn();
+    const readObserver = vi.fn();
     const reader = new BackendAwareCommittedBlobReader(
       repository('s3-default', 'local'),
       new PersistentBlobBackendRegistry([s3, local]),
       observer,
     );
 
-    await expect(consume((await reader.read(identity)).stream())).resolves.toBe('koharu');
+    await expect(
+      consume((await reader.read(identity, { observeBackend: readObserver })).stream()),
+    ).resolves.toBe('koharu');
     expect(failedClose).toHaveBeenCalledOnce();
     expect(observer).toHaveBeenCalledExactlyOnceWith('local');
+    expect(readObserver).toHaveBeenCalledExactlyOnceWith('local');
 
     const readFailure = backend({
       id: 's3-default',

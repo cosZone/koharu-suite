@@ -1,8 +1,10 @@
-import { and, asc, eq, inArray, lte, notExists, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lte, notExists, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
+  mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
+  mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
@@ -13,11 +15,11 @@ import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
 import {
   claimLocalStorageDeletion,
   finalizeLocalStorageDeletion,
-  recordLocalStorageAccess,
   restoreLocalStorageDeletion,
 } from './storage-ledger-repository.js';
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+const BACKEND_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const MAX_ACCESS_BATCH = 100;
 const WORKER_EVICTION_REASON = 'lru_capacity_pressure';
@@ -76,7 +78,7 @@ interface RestoreMediaCacheEvictionInput {
 
 export class MediaCacheEvictionError extends Error {
   constructor(
-    readonly code: 'invalid_input' | 'ledger_invariant' | 'stale_lease',
+    readonly code: 'invalid_input' | 'ledger_invariant' | 'protected' | 'stale_lease',
     message: string,
   ) {
     super(message);
@@ -89,29 +91,54 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
 
   async writeAccesses(accesses: readonly MediaCacheBlobAccess[]): Promise<void> {
     assertAccessBatch(accesses);
-    const latestByHash = new Map<string, Date>();
+    const latestByLocation = new Map<string, MediaCacheBlobAccess>();
     for (const access of accesses) {
-      const current = latestByHash.get(access.sha256);
-      if (!current || current < access.observedAt) {
-        latestByHash.set(access.sha256, new Date(access.observedAt));
+      const key = `${access.backendId}\0${access.sha256}`;
+      const current = latestByLocation.get(key);
+      if (!current || current.observedAt < access.observedAt) {
+        latestByLocation.set(key, {
+          ...access,
+          observedAt: new Date(access.observedAt),
+        });
       }
     }
 
     await this.database.transaction(async (transaction) => {
       await lockLedger(transaction);
-      for (const [sha256, observedAt] of [...latestByHash].sort(([left], [right]) =>
-        left.localeCompare(right),
+      for (const access of [...latestByLocation.values()].sort(
+        (left, right) =>
+          left.backendId.localeCompare(right.backendId) || left.sha256.localeCompare(right.sha256),
       )) {
         const [accessed] = await transaction
-          .update(mediaCacheBlobs)
+          .update(mediaBlobLocations)
           .set({
-            lastAccessedAt: sql`greatest(${mediaCacheBlobs.lastAccessedAt}, ${observedAt.toISOString()}::timestamptz)`,
+            lastAccessedAt: sql`greatest(
+              ${mediaBlobLocations.lastAccessedAt},
+              ${access.observedAt.toISOString()}::timestamptz
+            )`,
             updatedAt: sql`clock_timestamp()`,
           })
-          .where(and(eq(mediaCacheBlobs.sha256, sha256), eq(mediaCacheBlobs.state, 'ready')))
-          .returning({ sha256: mediaCacheBlobs.sha256 });
-        if (accessed) {
-          await recordLocalStorageAccess(transaction, sha256, observedAt);
+          .where(
+            and(
+              eq(mediaBlobLocations.backendId, access.backendId),
+              eq(mediaBlobLocations.blobSha256, access.sha256),
+              eq(mediaBlobLocations.state, 'ready'),
+            ),
+          )
+          .returning({ sha256: mediaBlobLocations.blobSha256 });
+        if (accessed && access.backendId === 'local') {
+          await transaction
+            .update(mediaCacheBlobs)
+            .set({
+              lastAccessedAt: sql`greatest(
+                ${mediaCacheBlobs.lastAccessedAt},
+                ${access.observedAt.toISOString()}::timestamptz
+              )`,
+              updatedAt: sql`clock_timestamp()`,
+            })
+            .where(
+              and(eq(mediaCacheBlobs.sha256, access.sha256), eq(mediaCacheBlobs.state, 'ready')),
+            );
         }
       }
     });
@@ -130,6 +157,48 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
           'invalid_input',
           'Media cache eviction expiry must be in the future',
         );
+      }
+
+      const activeProtection = transaction
+        .select({ one: sql`1` })
+        .from(mediaCacheObjectProtections)
+        .innerJoin(
+          mediaCacheObjects,
+          eq(mediaCacheObjects.id, mediaCacheObjectProtections.objectId),
+        )
+        .where(
+          and(
+            eq(mediaCacheObjects.blobSha256, mediaCacheBlobs.sha256),
+            or(
+              isNull(mediaCacheObjectProtections.expiresAt),
+              gt(mediaCacheObjectProtections.expiresAt, now),
+            ),
+          ),
+        );
+      if (input.selection.kind === 'specific_blob') {
+        const [protectedReference] = await transaction
+          .select({ one: sql`1` })
+          .from(mediaCacheObjectProtections)
+          .innerJoin(
+            mediaCacheObjects,
+            eq(mediaCacheObjects.id, mediaCacheObjectProtections.objectId),
+          )
+          .where(
+            and(
+              eq(mediaCacheObjects.blobSha256, input.selection.sha256),
+              or(
+                isNull(mediaCacheObjectProtections.expiresAt),
+                gt(mediaCacheObjectProtections.expiresAt, now),
+              ),
+            ),
+          )
+          .limit(1);
+        if (protectedReference) {
+          throw new MediaCacheEvictionError(
+            'protected',
+            'Media cache blob eviction is blocked by an active object protection',
+          );
+        }
       }
 
       const pinnedBySettlement = transaction
@@ -159,7 +228,14 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
           sha256: mediaCacheBlobs.sha256,
         })
         .from(mediaCacheBlobs)
-        .where(and(claimableState, selectionCondition, notExists(pinnedBySettlement)))
+        .where(
+          and(
+            claimableState,
+            selectionCondition,
+            notExists(pinnedBySettlement),
+            notExists(activeProtection),
+          ),
+        )
         .orderBy(
           sql`case when ${mediaCacheBlobs.state} = 'deleting' then 0 else 1 end`,
           asc(mediaCacheBlobs.lastAccessedAt),
@@ -575,10 +651,14 @@ function assertAccessBatch(accesses: readonly MediaCacheBlobAccess[]): void {
     );
   }
   for (const access of accesses) {
-    if (!SHA256.test(access.sha256) || !Number.isFinite(access.observedAt.getTime())) {
+    if (
+      !BACKEND_ID.test(access.backendId) ||
+      !SHA256.test(access.sha256) ||
+      !Number.isFinite(access.observedAt.getTime())
+    ) {
       throw new MediaCacheEvictionError(
         'invalid_input',
-        'Media cache access entries require a canonical SHA-256 and valid timestamp',
+        'Media cache access entries require a backend, canonical SHA-256, and valid timestamp',
       );
     }
   }

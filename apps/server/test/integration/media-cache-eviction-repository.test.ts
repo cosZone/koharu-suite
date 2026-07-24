@@ -11,6 +11,7 @@ import {
   mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
+  mediaCacheObjectProtections,
   mediaCacheObjectSources,
   mediaCacheObjects,
   mediaCachePostPlans,
@@ -325,6 +326,7 @@ describe('PostgreSQL media cache eviction repository', () => {
         ${mediaBlobLocations},
         ${mediaStorageBackends},
         ${mediaCacheActions},
+        ${mediaCacheObjectProtections},
         ${mediaCacheObjectSources},
         ${mediaCacheObjects},
         ${mediaCacheBlobs},
@@ -348,13 +350,21 @@ describe('PostgreSQL media cache eviction repository', () => {
     const writer = createPostgresMediaCacheAccessWriter(connection.db);
 
     await writer.writeAccesses([
-      { observedAt: newest, sha256: SHA_A },
-      { observedAt: new Date('2026-07-24T02:00:00.000Z'), sha256: SHA_A },
+      { backendId: 'local', observedAt: newest, sha256: SHA_A },
+      {
+        backendId: 'local',
+        observedAt: new Date('2026-07-24T02:00:00.000Z'),
+        sha256: SHA_A,
+      },
     ]);
     await writer.writeAccesses([
-      { observedAt: new Date('2026-07-24T00:00:00.000Z'), sha256: SHA_A },
+      {
+        backendId: 'local',
+        observedAt: new Date('2026-07-24T00:00:00.000Z'),
+        sha256: SHA_A,
+      },
     ]);
-    await writer.writeAccesses([{ observedAt: newest, sha256: SHA_B }]);
+    await writer.writeAccesses([{ backendId: 'local', observedAt: newest, sha256: SHA_B }]);
 
     const [blob] = await connection.db
       .select({
@@ -377,11 +387,71 @@ describe('PostgreSQL media cache eviction repository', () => {
     await expect(
       writer.writeAccesses(
         Array.from({ length: 101 }, (_, index) => ({
+          backendId: 'local',
           observedAt: newest,
           sha256: index % 2 === 0 ? SHA_A : SHA_B,
         })),
       ),
     ).rejects.toMatchObject({ code: 'invalid_input' } satisfies Partial<MediaCacheEvictionError>);
+  });
+
+  it('updates only the selected ready location and keeps S3 access out of legacy local LRU', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const initial = new Date('2026-07-24T01:00:00.000Z');
+    const s3Access = new Date('2026-07-24T04:00:00.000Z');
+    await insertBlob(connection, SHA_A, 100n, initial);
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * 1024n * 1024n, root: '/var/lib/koharu/test-media' },
+    });
+    await connection.db.insert(mediaStorageBackends).values({
+      configFingerprint: 'f'.repeat(64),
+      id: 's3-default',
+      kind: 's3',
+      label: 'S3',
+      maxBytes: 1024n,
+      readyBytes: 100n,
+      readPriority: 100,
+      writePriority: 0,
+    });
+    await connection.db.insert(mediaBlobLocations).values({
+      backendId: 's3-default',
+      blobSha256: SHA_A,
+      lastAccessedAt: initial,
+      state: 'ready',
+      storageKey: `blobs/${SHA_A.slice(0, 2)}/${SHA_A.slice(2, 4)}/${SHA_A}`,
+      verifiedAt: initial,
+      verifiedByteLength: 100n,
+      verifiedSha256: SHA_A,
+    });
+
+    await createPostgresMediaCacheAccessWriter(connection.db).writeAccesses([
+      { backendId: 's3-default', observedAt: s3Access, sha256: SHA_A },
+    ]);
+
+    const rows = await connection.db
+      .select({
+        backendId: mediaBlobLocations.backendId,
+        blobLastAccessedAt: mediaCacheBlobs.lastAccessedAt,
+        locationLastAccessedAt: mediaBlobLocations.lastAccessedAt,
+      })
+      .from(mediaBlobLocations)
+      .innerJoin(mediaCacheBlobs, eq(mediaCacheBlobs.sha256, mediaBlobLocations.blobSha256))
+      .where(eq(mediaBlobLocations.blobSha256, SHA_A))
+      .orderBy(asc(mediaBlobLocations.backendId));
+    expect(rows).toEqual([
+      {
+        backendId: 'local',
+        blobLastAccessedAt: initial,
+        locationLastAccessedAt: initial,
+      },
+      {
+        backendId: 's3-default',
+        blobLastAccessedAt: initial,
+        locationLastAccessedAt: s3Access,
+      },
+    ]);
   });
 
   it('uses deterministic LRU order and excludes blobs pinned by settling or recovery', async () => {
@@ -429,6 +499,106 @@ describe('PostgreSQL media cache eviction repository', () => {
         initiator: { kind: 'worker' },
       }),
     ).resolves.toBeNull();
+  });
+
+  it('blocks explicit shared-blob eviction and makes LRU skip active protection', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    await insertBlob(connection, SHA_A, 100n, new Date('2026-07-24T01:00:00.000Z'));
+    await insertBlob(connection, SHA_B, 100n, new Date('2026-07-24T02:00:00.000Z'));
+    const protectedReference = await createReadyPlan(connection, {
+      blobSha256: SHA_A,
+      byteLength: 100n,
+    });
+    const sharedReference = await createReadyPlan(connection, {
+      blobSha256: SHA_A,
+      byteLength: 100n,
+    });
+    await connection.db.insert(mediaCacheObjectProtections).values({
+      objectId: protectedReference.objectId,
+      ownerId: 'owner-private-id',
+      ownerKind: 'owner_session',
+      reason: 'private protection reason',
+    });
+    await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 200n });
+    const evictedHashes: string[] = [];
+    const service = new MediaCacheEvictionService(connection.db, {
+      async evict(blob) {
+        evictedHashes.push(blob.sha256);
+        return 'removed';
+      },
+    });
+
+    await expect(
+      service.evict({
+        ...claimInput({ kind: 'specific_blob', sha256: SHA_A }),
+        initiator: {
+          initiatorId: 'local-console',
+          kind: 'local_operator',
+          reason: 'explicitly evict the cached blob',
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'protected',
+      message: 'Media cache blob eviction is blocked by an active object protection',
+    } satisfies Partial<MediaCacheEvictionError>);
+    expect(evictedHashes).toEqual([]);
+    const [unchangedBlob] = await connection.db
+      .select({
+        evictionToken: mediaCacheBlobs.evictionToken,
+        state: mediaCacheBlobs.state,
+      })
+      .from(mediaCacheBlobs)
+      .where(eq(mediaCacheBlobs.sha256, SHA_A));
+    expect(unchangedBlob).toEqual({ evictionToken: null, state: 'ready' });
+    const sharedObjects = await connection.db
+      .select({ id: mediaCacheObjects.id, state: mediaCacheObjects.state })
+      .from(mediaCacheObjects)
+      .where(eq(mediaCacheObjects.blobSha256, SHA_A))
+      .orderBy(asc(mediaCacheObjects.id));
+    expect(sharedObjects).toEqual(
+      [protectedReference.objectId, sharedReference.objectId]
+        .sort()
+        .map((id) => ({ id, state: 'ready' })),
+    );
+    const [beforeLru] = await connection.db.select().from(mediaCacheRuntime);
+    expect(beforeLru?.readyBytes).toBe(200n);
+
+    await expect(
+      service.evict({
+        ...claimInput(),
+        initiator: { kind: 'worker' },
+      }),
+    ).resolves.toMatchObject({ physicalBytesRemoved: 100n, readyBytes: 100n });
+    expect(evictedHashes).toEqual([SHA_B]);
+  });
+
+  it('allows specific eviction after a shared-object protection expires', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    await insertBlob(connection, SHA_A, 100n, new Date('2026-07-24T01:00:00.000Z'));
+    const protectedReference = await createReadyPlan(connection, {
+      blobSha256: SHA_A,
+      byteLength: 100n,
+    });
+    await connection.db.insert(mediaCacheObjectProtections).values({
+      expiresAt: new Date('2025-01-01T00:00:00.000Z'),
+      objectId: protectedReference.objectId,
+      ownerId: 'expired-owner',
+      ownerKind: 'owner_session',
+      protectedAt: new Date('2024-01-01T00:00:00.000Z'),
+      reason: 'expired protection',
+    });
+    await connection.db.insert(mediaCacheRuntime).values({ readyBytes: 100n });
+
+    await expect(
+      createDatabaseService(connection).evict({
+        ...claimInput({ kind: 'specific_blob', sha256: SHA_A }),
+        initiator: { kind: 'worker' },
+      }),
+    ).resolves.toMatchObject({ physicalBytesRemoved: 100n, readyBytes: 0n });
   });
 
   it('evicts one shared physical blob and subtracts every original plan exactly once', async () => {

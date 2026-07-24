@@ -18,6 +18,10 @@ export interface CommittedBlobLocationRepository {
 
 export type BackendReadObserver = (backendId: string) => void;
 
+export interface CommittedBlobReadOptions {
+  observeBackend?: BackendReadObserver;
+}
+
 export class PostgresCommittedBlobLocationRepository implements CommittedBlobLocationRepository {
   constructor(private readonly database: Database) {}
 
@@ -49,7 +53,10 @@ export class BackendAwareCommittedBlobReader {
     private readonly observeBackend?: BackendReadObserver,
   ) {}
 
-  async read(identity: MediaBlobIdentity): Promise<MediaBlobReadHandle> {
+  async read(
+    identity: MediaBlobIdentity,
+    options: CommittedBlobReadOptions = {},
+  ): Promise<MediaBlobReadHandle> {
     let backendIds: string[];
     try {
       backendIds = await this.repository.findReadableBackendIds(identity);
@@ -68,7 +75,10 @@ export class BackendAwareCommittedBlobReader {
     return fallbackReadHandle({
       candidates,
       identity,
-      observeBackend: this.observeBackend,
+      observeBackend: (backendId) => {
+        this.observeBackend?.(backendId);
+        options.observeBackend?.(backendId);
+      },
       opened,
     });
   }

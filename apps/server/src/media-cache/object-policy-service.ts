@@ -1,6 +1,12 @@
 import { and, eq, gt, isNull, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { mediaCacheActions, mediaCacheObjectProtections, mediaCacheObjects } from '../db/schema.js';
+import {
+  mediaBlobLocations,
+  mediaCacheActions,
+  mediaCacheBlobs,
+  mediaCacheObjectProtections,
+  mediaCacheObjects,
+} from '../db/schema.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -97,6 +103,7 @@ export class PostgresMediaCacheObjectPolicyService {
       const now = await readDatabaseClock(transaction);
       const expiresAt = validateProtectionExpiry(requestedExpiry, now);
       const object = await lockObject(transaction, objectId);
+      await assertBlobIsNotDeleting(transaction, object.blobSha256);
       const [before] = await transaction
         .select({
           expiresAt: mediaCacheObjectProtections.expiresAt,
@@ -294,6 +301,30 @@ async function lockObject(transaction: MediaCacheTransaction, objectId: string) 
     throw new MediaCacheObjectPolicyNotFoundError();
   }
   return object;
+}
+
+async function assertBlobIsNotDeleting(
+  transaction: MediaCacheTransaction,
+  blobSha256: string | null,
+): Promise<void> {
+  if (!blobSha256) {
+    return;
+  }
+  const [blob] = await transaction
+    .select({ state: mediaCacheBlobs.state })
+    .from(mediaCacheBlobs)
+    .where(eq(mediaCacheBlobs.sha256, blobSha256))
+    .for('update');
+  const locations = await transaction
+    .select({ state: mediaBlobLocations.state })
+    .from(mediaBlobLocations)
+    .where(eq(mediaBlobLocations.blobSha256, blobSha256))
+    .for('update');
+  if (blob?.state === 'deleting' || locations.some((location) => location.state === 'deleting')) {
+    throw new MediaCacheObjectPolicyConflictError(
+      'Cannot protect a media cache object while its blob is being deleted',
+    );
+  }
 }
 
 async function readActiveBlobProtection(
