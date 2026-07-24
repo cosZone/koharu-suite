@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { and, asc, eq, gt, inArray, notExists, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, notExists, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { mediaBlobLocations, mediaCacheBlobs, mediaStorageBackends } from '../db/schema.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
 
 export const LOCAL_STORAGE_BACKEND_ID = 'local';
 export const S3_STORAGE_BACKEND_ID = 's3-default';
+export const STORAGE_PRUNE_MUTATION_OWNER = 'storage-prune-worker';
 const BACKFILL_BATCH_SIZE = 500;
 
 export interface LocalStorageBackendConfig {
@@ -47,6 +48,13 @@ export interface LocalStorageLedgerBlob {
   lastAccessedAt: Date;
   relativeKey: string;
   sha256: string;
+}
+
+export class StorageLedgerDeletionConflictError extends Error {
+  constructor() {
+    super('The local media storage location is held by a prune deletion');
+    this.name = 'StorageLedgerDeletionConflictError';
+  }
 }
 
 type StorageBackendConfig =
@@ -205,6 +213,7 @@ export async function recordLocalStorageReady(
   const backend = await lockLocalBackend(transaction);
   if (!backend) return;
 
+  await assertLocalStorageWriteAllowed(transaction, blob.sha256);
   const existing = await lockLocalLocation(transaction, blob.sha256);
   const wasPhysical = existing?.state === 'deleting' || existing?.state === 'ready';
   await transaction
@@ -280,6 +289,7 @@ export async function claimLocalStorageDeletion(
   const backend = await lockLocalBackend(transaction);
   if (!backend) return;
 
+  await assertLocalStorageWriteAllowed(transaction, input.sha256);
   const existing = await lockLocalLocation(transaction, input.sha256);
   const wasPhysical = existing?.state === 'deleting' || existing?.state === 'ready';
   await transaction
@@ -432,7 +442,10 @@ export async function reconcileLocalStorageLedger(
     if (blobs.length === 0) break;
 
     const activeMutations = await transaction
-      .select({ blobSha256: mediaBlobLocations.blobSha256 })
+      .select({
+        blobSha256: mediaBlobLocations.blobSha256,
+        state: mediaBlobLocations.state,
+      })
       .from(mediaBlobLocations)
       .where(
         and(
@@ -441,13 +454,32 @@ export async function reconcileLocalStorageLedger(
             mediaBlobLocations.blobSha256,
             blobs.map((blob) => blob.sha256),
           ),
-          inArray(mediaBlobLocations.state, ['copying', 'deleting']),
-          gt(mediaBlobLocations.mutationExpiresAt, now),
+          or(
+            and(
+              inArray(mediaBlobLocations.state, ['copying', 'deleting']),
+              gt(mediaBlobLocations.mutationExpiresAt, now),
+            ),
+            eq(mediaBlobLocations.state, 'evicted'),
+            and(
+              eq(mediaBlobLocations.state, 'deleting'),
+              eq(mediaBlobLocations.mutationOwner, STORAGE_PRUNE_MUTATION_OWNER),
+            ),
+          ),
         ),
       );
-    const activelyMutatingHashes = new Set(activeMutations.map((location) => location.blobSha256));
+    const activelyMutatingHashes = new Set(
+      activeMutations
+        .filter((location) => location.state === 'copying' || location.state === 'deleting')
+        .map((location) => location.blobSha256),
+    );
+    const explicitlyEvictedHashes = new Set(
+      activeMutations
+        .filter((location) => location.state === 'evicted')
+        .map((location) => location.blobSha256),
+    );
     for (const blob of blobs) {
       if (activelyMutatingHashes.has(blob.sha256)) continue;
+      if (blob.state === 'ready' && explicitlyEvictedHashes.has(blob.sha256)) continue;
       const physicallyPresent = blob.state === 'ready' || blob.state === 'deleting';
       await transaction
         .insert(mediaBlobLocations)
@@ -493,6 +525,28 @@ export async function reconcileLocalStorageLedger(
   const readyBytes = await sumLocationReadyBytes(transaction, LOCAL_STORAGE_BACKEND_ID);
   await setLocalBackendReadyBytes(transaction, readyBytes, now, true);
   return { readyBytes, reconciled: true };
+}
+
+export async function assertLocalStorageWriteAllowed(
+  transaction: StorageLedgerTransaction,
+  sha256: string,
+): Promise<void> {
+  const [location] = await transaction
+    .select({
+      mutationOwner: mediaBlobLocations.mutationOwner,
+      state: mediaBlobLocations.state,
+    })
+    .from(mediaBlobLocations)
+    .where(
+      and(
+        eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+        eq(mediaBlobLocations.blobSha256, sha256),
+      ),
+    )
+    .for('update');
+  if (location?.state === 'deleting' && location.mutationOwner === STORAGE_PRUNE_MUTATION_OWNER) {
+    throw new StorageLedgerDeletionConflictError();
+  }
 }
 
 interface UpsertBackendInput {

@@ -16,6 +16,7 @@ import {
 import type {
   CommandStorageMigrateResult,
   CommandStorageOperationInput,
+  CommandStoragePruneResult,
   CommandStorageRestoreResult,
 } from './command-queue.js';
 import { MEDIA_CACHE_ADVISORY_LOCK, restoreLegacyLocalBlob } from './ledger-repository.js';
@@ -25,6 +26,7 @@ import {
   type PersistentBlobBackendRegistry,
   type PersistentStorageBackendId,
 } from './local-persistent-blob-backend.js';
+import { PostgresStoragePruneService } from './storage-prune-service.js';
 
 const COPY_LEASE_MS = 5 * 60_000;
 const MIGRATION_BATCH_SIZE = 100;
@@ -91,11 +93,16 @@ export class PostgresLegacyLocalRestoreFinalizer implements LegacyLocalRestoreFi
 }
 
 export class PostgresStorageOperationService {
+  private readonly pruneService: PostgresStoragePruneService;
+
   constructor(
     private readonly database: Database,
     private readonly backends: PersistentBlobBackendRegistry,
     private readonly legacyLocalRestore?: LegacyLocalRestoreFinalizer,
-  ) {}
+    pruneService?: PostgresStoragePruneService,
+  ) {
+    this.pruneService = pruneService ?? new PostgresStoragePruneService(database, backends);
+  }
 
   async migrate(
     input: CommandStorageOperationInput<'migrate'>,
@@ -151,6 +158,10 @@ export class PostgresStorageOperationService {
       sourceBackendId: pair.source.id,
       targetBackendId: pair.target.id,
     };
+  }
+
+  prune(input: CommandStorageOperationInput<'prune'>): Promise<CommandStoragePruneResult> {
+    return this.pruneService.apply(input);
   }
 
   async restore(

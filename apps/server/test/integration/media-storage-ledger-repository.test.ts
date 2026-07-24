@@ -6,8 +6,11 @@ import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/
 import { runMigrations } from '../../src/db/migrate.js';
 import { mediaBlobLocations, mediaCacheBlobs, mediaStorageBackends } from '../../src/db/schema.js';
 import {
+  claimLocalStorageDeletion,
   reconcileLocalStorageLedger,
+  recordLocalStorageReady,
   type S3StorageBackendConfig,
+  STORAGE_PRUNE_MUTATION_OWNER,
   StorageLedgerRepository,
 } from '../../src/media-cache/storage-ledger-repository.js';
 
@@ -345,6 +348,123 @@ describe('storage ledger bootstrap', () => {
       .from(mediaStorageBackends)
       .where(eq(mediaStorageBackends.id, 'local'));
     expect(local?.readyBytes).toBe(500n);
+  });
+
+  it('does not resurrect an explicitly evicted local hot location during reconcile', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const blobSha256 = await insertLegacyBlob(connection, {
+      byteLength: 450n,
+      seed: '8',
+      state: 'ready',
+    });
+    await repository(connection).bootstrap({
+      local: { maxBytes: 2n * GIB, root: '/var/lib/koharu/media' },
+    });
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        state: 'evicted',
+        verifiedAt: null,
+        verifiedByteLength: null,
+        verifiedSha256: null,
+      })
+      .where(eq(mediaBlobLocations.blobSha256, blobSha256));
+    await connection.db
+      .update(mediaStorageBackends)
+      .set({ readyBytes: 0n })
+      .where(eq(mediaStorageBackends.id, 'local'));
+
+    await connection.db.transaction(async (transaction) => {
+      await reconcileLocalStorageLedger(transaction);
+    });
+
+    const [location] = await connection.db
+      .select({
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, blobSha256));
+    const [local] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 'local'));
+    expect(location).toEqual({ state: 'evicted', verifiedByteLength: null });
+    expect(local?.readyBytes).toBe(0n);
+  });
+
+  it('preserves an expired prune deletion fence against publish, legacy eviction, and reconcile', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const blobSha256 = await insertLegacyBlob(connection, {
+      byteLength: 460n,
+      seed: '9',
+      state: 'ready',
+    });
+    await repository(connection).bootstrap({
+      local: { maxBytes: 2n * GIB, root: '/var/lib/koharu/media' },
+    });
+    const pruneToken = randomUUID();
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        mutationExpiresAt: new Date('2000-01-01T00:00:00.000Z'),
+        mutationOwner: STORAGE_PRUNE_MUTATION_OWNER,
+        mutationToken: pruneToken,
+        state: 'deleting',
+      })
+      .where(eq(mediaBlobLocations.blobSha256, blobSha256));
+
+    await expect(
+      connection.db.transaction((transaction) =>
+        recordLocalStorageReady(
+          transaction,
+          {
+            byteLength: 460n,
+            lastAccessedAt: UPDATED_AT,
+            relativeKey: storageKey(blobSha256),
+            sha256: blobSha256,
+          },
+          UPDATED_AT,
+        ),
+      ),
+    ).rejects.toThrow('held by a prune deletion');
+    await expect(
+      connection.db.transaction((transaction) =>
+        claimLocalStorageDeletion(transaction, {
+          byteLength: 460n,
+          lastAccessedAt: UPDATED_AT,
+          mutationExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+          mutationOwner: 'legacy-eviction',
+          mutationToken: randomUUID(),
+          now: UPDATED_AT,
+          relativeKey: storageKey(blobSha256),
+          sha256: blobSha256,
+        }),
+      ),
+    ).rejects.toThrow('held by a prune deletion');
+
+    await connection.db.transaction(async (transaction) => {
+      await reconcileLocalStorageLedger(transaction);
+    });
+
+    const [location] = await connection.db
+      .select({
+        mutationOwner: mediaBlobLocations.mutationOwner,
+        mutationToken: mediaBlobLocations.mutationToken,
+        state: mediaBlobLocations.state,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, blobSha256));
+    const [local] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 'local'));
+    expect(location).toEqual({
+      mutationOwner: STORAGE_PRUNE_MUTATION_OWNER,
+      mutationToken: pruneToken,
+      state: 'deleting',
+    });
+    expect(local?.readyBytes).toBe(460n);
   });
 
   it('records a capacity downshift even when the local backend is already over budget', async () => {

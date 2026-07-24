@@ -11,7 +11,10 @@ import {
   messages,
 } from '../db/schema.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
-import { recordLocalStorageReady } from './storage-ledger-repository.js';
+import {
+  assertLocalStorageWriteAllowed,
+  recordLocalStorageReady,
+} from './storage-ledger-repository.js';
 
 export { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
 
@@ -552,6 +555,9 @@ export class PostgresMediaCacheLedgerRepository {
         );
       }
 
+      for (const blob of uniqueBlobs) {
+        await assertLocalStorageWriteAllowed(transaction, blob.sha256);
+      }
       await input.publish();
       const postPublishNow = await readDatabaseClock(transaction);
       assertFencedRowsRemainLive(plan, claimedObjects, input.leaseToken, postPublishNow);

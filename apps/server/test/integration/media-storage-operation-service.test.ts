@@ -11,6 +11,7 @@ import {
   mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
+  mediaCacheObjectProtections,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
@@ -36,6 +37,7 @@ import {
   PostgresLegacyLocalRestoreFinalizer,
   PostgresStorageOperationService,
 } from '../../src/media-cache/storage-operation-service.js';
+import { PostgresStoragePruneService } from '../../src/media-cache/storage-prune-service.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const NOW = new Date('2026-07-24T10:00:00.000Z');
@@ -71,14 +73,13 @@ function blobIdentity(content: Buffer): MediaBlobIdentity {
 function memoryBackend(input: {
   close?: () => Promise<void>;
   content: Buffer;
+  delete?: PersistentBlobBackend['delete'];
   id: PersistentBlobBackend['id'];
   put?: (input: PersistentBlobPutInput) => Promise<{ outcome: 'already_present' | 'created' }>;
 }): PersistentBlobBackend {
   return {
     id: input.id,
-    async delete() {
-      return 'absent_or_deleted';
-    },
+    delete: input.delete ?? (async () => 'absent_or_deleted'),
     put:
       input.put ??
       (async (putInput) => {
@@ -243,6 +244,27 @@ function restoreInput(objectId: string): CommandStorageOperationInput<'restore'>
       sourceBackendId: null,
       targetBackendId: 'local',
       targetBytes: null,
+      token: randomUUID(),
+    },
+    renewLease: vi.fn(async () => undefined),
+  };
+}
+
+function pruneInput(
+  targetBackendId: 'local' | 's3-default',
+  targetBytes = 0n,
+): CommandStorageOperationInput<'prune'> & { renewLease: ReturnType<typeof vi.fn> } {
+  return {
+    command: {
+      id: randomUUID(),
+      initiatorId: 'owner',
+      initiatorKind: 'owner_session',
+      objectId: null,
+      operation: 'prune',
+      reason: 'apply backend byte target',
+      sourceBackendId: null,
+      targetBackendId,
+      targetBytes,
       token: randomUUID(),
     },
     renewLease: vi.fn(async () => undefined),
@@ -760,5 +782,443 @@ describe('PostgreSQL storage copy operations', () => {
       .where(eq(mediaStorageBackends.id, 's3-default'));
     expect(target).toEqual({ mutationToken: takeoverToken, state: 'copying' });
     expect(targetBackend?.readyBytes).toBe(0n);
+  });
+
+  it('keeps preview read-only and replans around shared protection added before apply', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('read-only prune preview');
+    const fixture = await insertBlobFixture({
+      content,
+      objectCount: 2,
+      sourceBackendId: 's3-default',
+    });
+    const removeS3 = vi.fn(async () => 'absent_or_deleted' as const);
+    const registry = new PersistentBlobBackendRegistry([
+      memoryBackend({ content, id: 'local' }),
+      memoryBackend({ content, delete: removeS3, id: 's3-default' }),
+    ]);
+    const service = new PostgresStoragePruneService(connection.db, registry);
+    const beforeLocations = await connection.db.select().from(mediaBlobLocations);
+    const beforeBackends = await connection.db.select().from(mediaStorageBackends);
+
+    await expect(
+      service.preview({ targetBackendId: 's3-default', targetBytes: 0n }),
+    ).resolves.toEqual({
+      candidates: 1,
+      hasMore: false,
+      projectedReadyBytes: '0',
+      readyBytes: String(content.byteLength),
+      removableBytes: String(content.byteLength),
+      targetBackendId: 's3-default',
+      targetBytes: '0',
+    });
+
+    expect(await connection.db.select().from(mediaBlobLocations)).toEqual(beforeLocations);
+    expect(await connection.db.select().from(mediaStorageBackends)).toEqual(beforeBackends);
+    expect(await connection.db.select().from(mediaCacheActions)).toEqual([]);
+    await connection.db.insert(mediaCacheObjectProtections).values({
+      objectId: fixture.objectIds[1] ?? '',
+      ownerId: 'owner',
+      ownerKind: 'owner_session',
+      reason: 'keep shared blob',
+    });
+    await expect(
+      new PostgresStorageOperationService(connection.db, registry).prune(pruneInput('s3-default')),
+    ).resolves.toMatchObject({
+      hasMore: true,
+      prunedBlobCount: 0,
+      prunedBytes: '0',
+      readyBytes: String(content.byteLength),
+    });
+    expect(removeS3).not.toHaveBeenCalled();
+  });
+
+  it('applies the target backend LRU order and stops at the requested bytes', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const oldest = await insertBlobFixture({
+      content: Buffer.from('aaaaaaaaaaaaaaaaaaaa'),
+      sourceBackendId: 's3-default',
+    });
+    const newest = await insertBlobFixture({
+      content: Buffer.from('bbbbbbbbbbbbbbbbbbbb'),
+      sourceBackendId: 's3-default',
+    });
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({ lastAccessedAt: new Date('2026-07-24T01:00:00.000Z') })
+      .where(eq(mediaBlobLocations.blobSha256, oldest.identity.sha256));
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({ lastAccessedAt: new Date('2026-07-24T02:00:00.000Z') })
+      .where(eq(mediaBlobLocations.blobSha256, newest.identity.sha256));
+    await connection.db
+      .update(mediaStorageBackends)
+      .set({ readyBytes: 40n })
+      .where(eq(mediaStorageBackends.id, 's3-default'));
+    const removed: string[] = [];
+    const removeS3: PersistentBlobBackend['delete'] = async (identity) => {
+      removed.push(identity.sha256);
+      return 'absent_or_deleted';
+    };
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content: Buffer.alloc(0), id: 'local' }),
+        memoryBackend({ content: Buffer.alloc(0), delete: removeS3, id: 's3-default' }),
+      ]),
+    );
+
+    await expect(service.prune(pruneInput('s3-default', 20n))).resolves.toMatchObject({
+      hasMore: false,
+      prunedBlobCount: 1,
+      prunedBytes: '20',
+      readyBytes: '20',
+    });
+    expect(removed).toEqual([oldest.identity.sha256]);
+    const locations = await connection.db
+      .select({
+        sha256: mediaBlobLocations.blobSha256,
+        state: mediaBlobLocations.state,
+      })
+      .from(mediaBlobLocations);
+    expect(locations).toEqual(
+      expect.arrayContaining([
+        { sha256: oldest.identity.sha256, state: 'evicted' },
+        { sha256: newest.identity.sha256, state: 'ready' },
+      ]),
+    );
+  });
+
+  it('does not prune a source while another backend has a fresh copy lease', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('copy fence source');
+    const fixture = await insertBlobFixture({ content, sourceBackendId: 'local' });
+    await connection.db.insert(mediaCacheRuntime).values({
+      readyBytes: BigInt(content.byteLength),
+      singletonKey: 'local',
+    });
+    await connection.db.insert(mediaBlobLocations).values({
+      backendId: 's3-default',
+      blobSha256: fixture.identity.sha256,
+      mutationExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+      mutationOwner: 'storage-operation-worker',
+      mutationToken: randomUUID(),
+      state: 'copying',
+      storageKey: fixture.identity.relativeKey,
+    });
+    const removeLocal = vi.fn(async () => 'absent_or_deleted' as const);
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content, delete: removeLocal, id: 'local' }),
+        memoryBackend({ content, id: 's3-default' }),
+      ]),
+    );
+
+    await expect(service.prune(pruneInput('local'))).resolves.toMatchObject({
+      hasMore: true,
+      prunedBlobCount: 0,
+      prunedBytes: '0',
+      readyBytes: String(content.byteLength),
+    });
+    expect(removeLocal).not.toHaveBeenCalled();
+    const [local] = await connection.db
+      .select({ state: mediaBlobLocations.state })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.backendId, 'local'));
+    expect(local?.state).toBe('ready');
+  });
+
+  it('prunes only the local hot location while a healthy S3 location remains logical-ready', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('tiered local prune');
+    const fixture = await insertBlobFixture({ content, sourceBackendId: 'local' });
+    await connection.db.insert(mediaBlobLocations).values({
+      backendId: 's3-default',
+      blobSha256: fixture.identity.sha256,
+      state: 'ready',
+      storageKey: fixture.identity.relativeKey,
+      verifiedAt: NOW,
+      verifiedByteLength: BigInt(content.byteLength),
+      verifiedSha256: fixture.identity.sha256,
+    });
+    await connection.db
+      .update(mediaStorageBackends)
+      .set({ readyBytes: BigInt(content.byteLength) })
+      .where(eq(mediaStorageBackends.id, 's3-default'));
+    await connection.db.insert(mediaCacheRuntime).values({
+      readyBytes: BigInt(content.byteLength),
+      singletonKey: 'local',
+    });
+    const removeLocal = vi.fn(async () => 'absent_or_deleted' as const);
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content, delete: removeLocal, id: 'local' }),
+        memoryBackend({ content, id: 's3-default' }),
+      ]),
+    );
+    const input = pruneInput('local');
+
+    await expect(service.prune(input)).resolves.toMatchObject({
+      hasMore: false,
+      prunedBlobCount: 1,
+      prunedBytes: String(content.byteLength),
+      readyBytes: '0',
+      targetBackendId: 'local',
+    });
+    expect(removeLocal).toHaveBeenCalledOnce();
+    expect(input.renewLease).toHaveBeenCalledOnce();
+
+    const locations = await connection.db
+      .select({
+        backendId: mediaBlobLocations.backendId,
+        state: mediaBlobLocations.state,
+      })
+      .from(mediaBlobLocations);
+    const backends = await connection.db
+      .select({
+        id: mediaStorageBackends.id,
+        readyBytes: mediaStorageBackends.readyBytes,
+      })
+      .from(mediaStorageBackends);
+    const [blob] = await connection.db
+      .select({ state: mediaCacheBlobs.state })
+      .from(mediaCacheBlobs);
+    const [object] = await connection.db
+      .select({ state: mediaCacheObjects.state })
+      .from(mediaCacheObjects);
+    const [runtime] = await connection.db
+      .select({ readyBytes: mediaCacheRuntime.readyBytes })
+      .from(mediaCacheRuntime);
+    const [action] = await connection.db
+      .select()
+      .from(mediaCacheActions)
+      .where(eq(mediaCacheActions.actionKind, 'prune'));
+    expect(locations).toEqual(
+      expect.arrayContaining([
+        { backendId: 'local', state: 'evicted' },
+        { backendId: 's3-default', state: 'ready' },
+      ]),
+    );
+    expect(backends).toEqual(
+      expect.arrayContaining([
+        { id: 'local', readyBytes: 0n },
+        { id: 's3-default', readyBytes: BigInt(content.byteLength) },
+      ]),
+    );
+    expect(blob?.state).toBe('ready');
+    expect(object?.state).toBe('ready');
+    expect(runtime?.readyBytes).toBe(0n);
+    expect(action).toMatchObject({
+      initiatorId: 'owner',
+      initiatorKind: 'owner_session',
+      reason: 'apply backend byte target',
+    });
+    expect(action?.afterState).toEqual({
+      backendId: 'local',
+      evictedObjectCount: 0,
+      lastHealthyLocation: false,
+      logicalEvictionDeferred: false,
+      physicalBytesRemoved: String(content.byteLength),
+      state: 'evicted',
+    });
+    expect(action?.beforeState).toEqual({
+      backendId: 'local',
+      byteLength: String(content.byteLength),
+      state: 'deleting',
+    });
+  });
+
+  it('preserves legacy local-only logical and physical eviction accounting', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    const content = Buffer.from('local-only prune');
+    await insertBlobFixture({
+      content,
+      objectCount: 2,
+      sourceBackendId: 'local',
+    });
+    await connection.db.insert(mediaCacheRuntime).values({
+      readyBytes: BigInt(content.byteLength),
+      singletonKey: 'local',
+    });
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([memoryBackend({ content, id: 'local' })]),
+    );
+
+    await expect(service.prune(pruneInput('local'))).resolves.toMatchObject({
+      hasMore: false,
+      prunedBlobCount: 1,
+      readyBytes: '0',
+    });
+    const [blob] = await connection.db
+      .select({ state: mediaCacheBlobs.state })
+      .from(mediaCacheBlobs);
+    const objects = await connection.db
+      .select({ state: mediaCacheObjects.state })
+      .from(mediaCacheObjects);
+    const [plan] = await connection.db
+      .select({ readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes })
+      .from(mediaCachePostPlans);
+    const [runtime] = await connection.db
+      .select({ readyBytes: mediaCacheRuntime.readyBytes })
+      .from(mediaCacheRuntime);
+    const [backend] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends);
+    expect(blob?.state).toBe('evicted');
+    expect(objects).toEqual([{ state: 'evicted' }, { state: 'evicted' }]);
+    expect(plan?.readyOriginalBytes).toBe(0n);
+    expect(runtime?.readyBytes).toBe(0n);
+    expect(backend?.readyBytes).toBe(0n);
+  });
+
+  it('logically evicts the shared blob only when S3 was its last healthy location', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('last S3 location');
+    await insertBlobFixture({
+      content,
+      objectCount: 2,
+      sourceBackendId: 's3-default',
+    });
+    await connection.db.insert(mediaCacheRuntime).values({ singletonKey: 'local' });
+    const removeS3 = vi.fn(async () => 'absent_or_deleted' as const);
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content, id: 'local' }),
+        memoryBackend({ content, delete: removeS3, id: 's3-default' }),
+      ]),
+    );
+
+    await expect(service.prune(pruneInput('s3-default'))).resolves.toMatchObject({
+      hasMore: false,
+      prunedBlobCount: 1,
+      readyBytes: '0',
+    });
+    const [blob] = await connection.db
+      .select({ state: mediaCacheBlobs.state })
+      .from(mediaCacheBlobs);
+    const objects = await connection.db
+      .select({ state: mediaCacheObjects.state })
+      .from(mediaCacheObjects);
+    const [plan] = await connection.db
+      .select({ readyOriginalBytes: mediaCachePostPlans.readyOriginalBytes })
+      .from(mediaCachePostPlans);
+    const [runtime] = await connection.db
+      .select({ readyBytes: mediaCacheRuntime.readyBytes })
+      .from(mediaCacheRuntime);
+    expect(blob?.state).toBe('evicted');
+    expect(objects).toEqual([{ state: 'evicted' }, { state: 'evicted' }]);
+    expect(plan?.readyOriginalBytes).toBe(0n);
+    expect(runtime?.readyBytes).toBe(0n);
+  });
+
+  it('finishes physical accounting without logical eviction if settlement pins after claim', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('settlement changed during delete');
+    await insertBlobFixture({ content, sourceBackendId: 's3-default' });
+    const [plan] = await connection.db
+      .select({ id: mediaCachePostPlans.id })
+      .from(mediaCachePostPlans);
+    if (!plan) throw new Error('Fixture plan was not created');
+    const removeS3 = vi.fn(async () => {
+      if (!connection) throw new Error('Database connection was not created');
+      await connection.db
+        .update(mediaCachePostPlans)
+        .set({
+          leaseExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+          leaseOwner: 'settlement-worker',
+          leaseToken: randomUUID(),
+          state: 'settling',
+        })
+        .where(eq(mediaCachePostPlans.id, plan.id));
+      return 'absent_or_deleted' as const;
+    });
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content, id: 'local' }),
+        memoryBackend({ content, delete: removeS3, id: 's3-default' }),
+      ]),
+    );
+
+    await expect(service.prune(pruneInput('s3-default'))).resolves.toMatchObject({
+      hasMore: false,
+      prunedBlobCount: 1,
+      readyBytes: '0',
+    });
+    const [blob] = await connection.db
+      .select({ state: mediaCacheBlobs.state })
+      .from(mediaCacheBlobs);
+    const [object] = await connection.db
+      .select({ state: mediaCacheObjects.state })
+      .from(mediaCacheObjects);
+    const [action] = await connection.db
+      .select({ afterState: mediaCacheActions.afterState })
+      .from(mediaCacheActions)
+      .where(eq(mediaCacheActions.actionKind, 'prune'));
+    expect(blob?.state).toBe('ready');
+    expect(object?.state).toBe('ready');
+    expect(action?.afterState).toMatchObject({
+      lastHealthyLocation: true,
+      logicalEvictionDeferred: true,
+      state: 'evicted',
+    });
+  });
+
+  it('keeps an ambiguous provider failure leased and fully accounted for retry', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    await insertBackend('local');
+    await insertBackend('s3-default');
+    const content = Buffer.from('ambiguous S3 delete');
+    const fixture = await insertBlobFixture({ content, sourceBackendId: 's3-default' });
+    const removeS3 = vi.fn(async () => {
+      throw new Error('provider timeout');
+    });
+    const service = new PostgresStorageOperationService(
+      connection.db,
+      new PersistentBlobBackendRegistry([
+        memoryBackend({ content, id: 'local' }),
+        memoryBackend({ content, delete: removeS3, id: 's3-default' }),
+      ]),
+    );
+
+    await expect(service.prune(pruneInput('s3-default'))).rejects.toThrow('provider timeout');
+    const [location] = await connection.db
+      .select({
+        mutationExpiresAt: mediaBlobLocations.mutationExpiresAt,
+        mutationToken: mediaBlobLocations.mutationToken,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, fixture.identity.sha256));
+    const [backend] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 's3-default'));
+    expect(location).toMatchObject({
+      state: 'deleting',
+      verifiedByteLength: BigInt(content.byteLength),
+    });
+    expect(location?.mutationToken).toBeTruthy();
+    expect(location?.mutationExpiresAt).toBeInstanceOf(Date);
+    expect(backend?.readyBytes).toBe(BigInt(content.byteLength));
+    expect(await connection.db.select().from(mediaCacheActions)).toEqual([]);
   });
 });

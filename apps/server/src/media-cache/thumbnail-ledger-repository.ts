@@ -8,7 +8,10 @@ import {
   messageMedia,
 } from '../db/schema.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
-import { recordLocalStorageReady } from './storage-ledger-repository.js';
+import {
+  assertLocalStorageWriteAllowed,
+  recordLocalStorageReady,
+} from './storage-ledger-repository.js';
 
 const THUMBNAIL_MAX_BYTES = 1024n * 1024n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -174,6 +177,7 @@ export class PostgresMediaCacheThumbnailLedgerRepository {
       if (runtime.readyBytes + physicalAdded > runtime.maxBytes) {
         throw new Error('Thumbnail publication exceeds the media cache budget');
       }
+      await assertLocalStorageWriteAllowed(tx, input.object.sha256);
       await input.publish();
       const afterPublish = await clock(tx);
       await lockedObject(tx, input.object.objectId, input.leaseToken, 'downloading', afterPublish);
