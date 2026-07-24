@@ -8,6 +8,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   unique,
@@ -363,12 +364,19 @@ export const messages = pgTable(
     telegramMessageId: bigint('telegram_message_id', { mode: 'bigint' }).notNull(),
     publishedAt: timestamp('published_at', { withTimezone: true }).notNull(),
     currentRevisionNumber: integer('current_revision_number').notNull().default(1),
+    tombstonedAt: timestamp('tombstoned_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     uniqueIndex('messages_channel_message_unique').on(table.channelId, table.telegramMessageId),
     index('messages_channel_published_idx').on(table.channelId, table.publishedAt, table.id),
+    index('messages_public_channel_published_idx').on(
+      table.channelId,
+      table.tombstonedAt,
+      table.publishedAt,
+      table.id,
+    ),
   ],
 );
 
@@ -510,6 +518,78 @@ export const messageSourceObservations = pgTable(
       'message_source_observations_fingerprint_version_check',
       sql`${table.contentFingerprintVersion} >= 0`,
     ),
+  ],
+);
+
+export const importRunObservations = pgTable(
+  'import_run_observations',
+  {
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => importRuns.id, { onDelete: 'restrict' }),
+    observationId: uuid('observation_id').notNull(),
+    sourceKind: varchar('source_kind', { length: 32 })
+      .$type<'telegram_desktop_json'>()
+      .notNull()
+      .default('telegram_desktop_json'),
+    replayed: boolean('replayed').notNull(),
+    resolutionAtRun: varchar('resolution_at_run', { length: 16 })
+      .$type<'conflict' | 'created' | 'matched' | 'stale'>()
+      .notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.observationId, table.sourceKind],
+      foreignColumns: [messageSourceObservations.id, messageSourceObservations.sourceKind],
+      name: 'import_run_observations_observation_source_fk',
+    }).onDelete('restrict'),
+    primaryKey({
+      columns: [table.runId, table.observationId],
+      name: 'import_run_observations_pk',
+    }),
+    index('import_run_observations_observation_idx').on(table.observationId, table.createdAt),
+    check(
+      'import_run_observations_source_kind_check',
+      sql`${table.sourceKind} = 'telegram_desktop_json'`,
+    ),
+    check(
+      'import_run_observations_resolution_check',
+      sql`${table.resolutionAtRun} in ('created', 'matched', 'stale', 'conflict')`,
+    ),
+  ],
+);
+
+export const importRunCoverages = pgTable(
+  'import_run_coverages',
+  {
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => importRuns.id, { onDelete: 'restrict' }),
+    telegramChatId: bigint('telegram_chat_id', { mode: 'bigint' })
+      .notNull()
+      .references(() => telegramChannelAllowlist.telegramChatId, { onDelete: 'restrict' }),
+    startMessageId: bigint('start_message_id', { mode: 'bigint' }).notNull(),
+    endMessageId: bigint('end_message_id', { mode: 'bigint' }).notNull(),
+    explicitlyComplete: boolean('explicitly_complete').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.runId, table.telegramChatId, table.startMessageId, table.endMessageId],
+      name: 'import_run_coverages_pk',
+    }),
+    index('import_run_coverages_channel_range_idx').on(
+      table.telegramChatId,
+      table.startMessageId,
+      table.endMessageId,
+      table.runId,
+    ),
+    check(
+      'import_run_coverages_range_check',
+      sql`${table.startMessageId} > 0 and ${table.endMessageId} >= ${table.startMessageId}`,
+    ),
+    check('import_run_coverages_explicit_check', sql`${table.explicitlyComplete} is true`),
   ],
 );
 
@@ -658,6 +738,7 @@ export const reconciliationFindings = pgTable(
         | 'disabled_window'
         | 'durable_blocked'
         | 'durable_pending'
+        | 'import_lineage_missing'
         | 'media_evidence_missing'
         | 'message_id_candidate'
         | 'observation_conflict'
@@ -693,6 +774,7 @@ export const reconciliationFindings = pgTable(
       sql`${table.kind} in (
         'durable_pending',
         'durable_blocked',
+        'import_lineage_missing',
         'operator_skipped',
         'disabled_window',
         'retention_risk',

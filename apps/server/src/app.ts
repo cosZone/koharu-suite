@@ -14,6 +14,9 @@ import { type PublicApiConfig, parseTelegramChannelId } from './config.js';
 import { decodeMessageCursor, encodeMessageCursor, type MessageCursor } from './http/cursor.js';
 import { FixedWindowRateLimiter, matchCorsOrigin } from './http/public-policy.js';
 import type { MessageReader } from './messages/types.js';
+import type { PostgresReconciliationPersistenceRepository } from './reconciliation/persistence-repository.js';
+import type { DeterministicRepairService } from './reconciliation/repair.js';
+import type { MessageTombstoneService } from './reconciliation/tombstone.js';
 import { VERSION } from './version.js';
 
 export interface HealthResponse {
@@ -49,6 +52,12 @@ export interface AppDependencies {
   };
   publicApi: PublicApiConfig;
   publicClientAddress: (context: Context) => string;
+  reconciliation: Pick<
+    PostgresReconciliationPersistenceRepository,
+    'ignoreFinding' | 'listFindings' | 'listRuns' | 'persistScan'
+  >;
+  repair: Pick<DeterministicRepairService, 'apply'>;
+  tombstone: Pick<MessageTombstoneService, 'hide' | 'unhide'>;
   readiness: () => Promise<void>;
 }
 
@@ -119,6 +128,29 @@ const defaultPublicApi: PublicApiConfig = {
   rateLimitWindowMs: 60_000,
   trustProxy: false,
 };
+const unavailableReconciliation: AppDependencies['reconciliation'] = {
+  ignoreFinding: async () => {
+    throw new Error('Reconciliation is not configured');
+  },
+  listFindings: async () => ({ items: [], nextCursor: null }),
+  listRuns: async () => ({ items: [], nextCursor: null }),
+  persistScan: async () => {
+    throw new Error('Reconciliation is not configured');
+  },
+};
+const unavailableRepair: AppDependencies['repair'] = {
+  apply: async () => {
+    throw new Error('Reconciliation repair is not configured');
+  },
+};
+const unavailableTombstone: AppDependencies['tombstone'] = {
+  hide: async () => {
+    throw new Error('Message tombstone service is not configured');
+  },
+  unhide: async () => {
+    throw new Error('Message tombstone service is not configured');
+  },
+};
 
 function defaultPublicClientAddress(context: Context): string {
   try {
@@ -137,9 +169,56 @@ function apiError(code: string, message: string): ApiErrorResponse {
   };
 }
 
+function reconciliationMutationStatus(error: unknown): 404 | 409 | null {
+  if (!(error instanceof Error)) return null;
+  if (error.message.includes('not found')) return 404;
+  if (
+    [
+      'Only ',
+      'Ignored ',
+      'cannot ',
+      'changed',
+      'concurrently',
+      'does not match',
+      'does not reproduce',
+      'exceeds',
+      'has no deterministic safe repair',
+      'outside',
+      'requires',
+      'unsupported',
+    ].some((fragment) => error.message.includes(fragment))
+  ) {
+    return 409;
+  }
+  return null;
+}
+
 const uuidSchema = z.uuid();
 const listLimitSchema = z.coerce.number().int().min(1).max(100).default(50);
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(500) }).strict();
+const reconciliationActionSchema = z
+  .object({
+    expectedEvidenceVersion: z.number().int().min(1),
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+const reconciliationScanSchema = z
+  .object({
+    telegramChannelIds: z
+      .array(
+        z
+          .string()
+          .trim()
+          .max(17)
+          .regex(/^-[1-9]\d*$/u),
+      )
+      .min(1)
+      .max(100),
+  })
+  .strict();
+const reconciliationTombstoneSchema = reconciliationActionSchema
+  .extend({ messageId: z.uuid() })
+  .strict();
 
 function isPublicApiPath(path: string): boolean {
   return (
@@ -164,6 +243,9 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     operations: dependencies.operations ?? unavailableOperations,
     publicApi: dependencies.publicApi ?? defaultPublicApi,
     publicClientAddress: dependencies.publicClientAddress ?? defaultPublicClientAddress,
+    reconciliation: dependencies.reconciliation ?? unavailableReconciliation,
+    repair: dependencies.repair ?? unavailableRepair,
+    tombstone: dependencies.tombstone ?? unavailableTombstone,
     readiness:
       dependencies.readiness ??
       (async () => {
@@ -439,6 +521,186 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     }
     return context.json(await resolved.operations.rerenderOutdated(authorization.principal));
   });
+  app.get('/api/v1/admin/reconciliation/findings', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    const parsed = z
+      .object({ cursor: z.uuid().optional(), limit: listLimitSchema })
+      .safeParse(context.req.query());
+    if (!parsed.success) {
+      return context.json(apiError('invalid_reconciliation_query', 'Invalid cursor or limit'), 400);
+    }
+    try {
+      return context.json(
+        await resolved.reconciliation.listFindings({
+          limit: parsed.data.limit,
+          ...(parsed.data.cursor ? { cursor: parsed.data.cursor } : {}),
+        }),
+      );
+    } catch (error) {
+      if (error instanceof RangeError) {
+        return context.json(apiError('invalid_reconciliation_query', error.message), 400);
+      }
+      throw error;
+    }
+  });
+  app.get('/api/v1/admin/reconciliation/runs', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    const parsed = z
+      .object({ cursor: z.uuid().optional(), limit: listLimitSchema })
+      .safeParse(context.req.query());
+    if (!parsed.success) {
+      return context.json(apiError('invalid_reconciliation_query', 'Invalid cursor or limit'), 400);
+    }
+    try {
+      return context.json(
+        await resolved.reconciliation.listRuns({
+          limit: parsed.data.limit,
+          ...(parsed.data.cursor ? { cursor: parsed.data.cursor } : {}),
+        }),
+      );
+    } catch (error) {
+      if (error instanceof RangeError) {
+        return context.json(apiError('invalid_reconciliation_query', error.message), 400);
+      }
+      throw error;
+    }
+  });
+  app.post('/api/v1/admin/reconciliation/scan', async (context) => {
+    const authorization = await authorizeAdmin(context, 'content:write');
+    if ('response' in authorization) return authorization.response;
+    const parsed = reconciliationScanSchema.safeParse(await context.req.json().catch(() => null));
+    if (!parsed.success) {
+      return context.json(
+        apiError('invalid_reconciliation_scan', 'Valid channel IDs are required'),
+        400,
+      );
+    }
+    let telegramChannelIds: bigint[];
+    try {
+      telegramChannelIds = parsed.data.telegramChannelIds.map(parseTelegramChannelId);
+    } catch {
+      return context.json(
+        apiError('invalid_reconciliation_scan', 'Valid channel IDs are required'),
+        400,
+      );
+    }
+    const result = await resolved.reconciliation.persistScan({
+      initiatorId: authorization.principal.actorId,
+      initiatorKind: authorization.principal.actorType,
+      telegramChannelIds,
+    });
+    return context.json(result);
+  });
+  app.post('/api/v1/admin/reconciliation/findings/:id/repair', async (context) => {
+    const authorization = await authorizeAdmin(context, 'content:write');
+    if ('response' in authorization) return authorization.response;
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = reconciliationActionSchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError('invalid_reconciliation_action', 'Valid id, version and reason are required'),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.repair.apply({
+          ...body.data,
+          findingId: id.data,
+          initiatorId: authorization.principal.actorId,
+          initiatorKind: authorization.principal.actorType,
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      const status = reconciliationMutationStatus(error);
+      if (status === 404) return context.json(apiError('finding_not_found', message), 404);
+      if (status === 409) {
+        return context.json(apiError('reconciliation_conflict', message), 409);
+      }
+      throw error;
+    }
+  });
+  app.post('/api/v1/admin/reconciliation/findings/:id/ignore', async (context) => {
+    const authorization = await authorizeAdmin(context, 'content:write');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const id = uuidSchema.safeParse(context.req.param('id'));
+    const body = reconciliationActionSchema.safeParse(await context.req.json().catch(() => null));
+    if (!id.success || !body.success) {
+      return context.json(
+        apiError('invalid_reconciliation_action', 'Valid id, version and reason are required'),
+        400,
+      );
+    }
+    try {
+      return context.json(
+        await resolved.reconciliation.ignoreFinding({
+          ...body.data,
+          findingId: id.data,
+          initiatorId: authorization.principal.actorId,
+          initiatorKind: 'owner_session',
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      const status = reconciliationMutationStatus(error);
+      if (status === 404) return context.json(apiError('finding_not_found', message), 404);
+      if (status === 409) {
+        return context.json(apiError('reconciliation_conflict', message), 409);
+      }
+      throw error;
+    }
+  });
+  for (const action of ['hide', 'unhide'] as const) {
+    app.post(`/api/v1/admin/reconciliation/findings/:id/${action}`, async (context) => {
+      const authorization = await authorizeAdmin(context, 'content:write');
+      if ('response' in authorization) return authorization.response;
+      if (authorization.principal.actorType !== 'owner_session') {
+        return context.json(
+          apiError('owner_session_required', 'An owner session is required'),
+          403,
+        );
+      }
+      const id = uuidSchema.safeParse(context.req.param('id'));
+      const body = reconciliationTombstoneSchema.safeParse(
+        await context.req.json().catch(() => null),
+      );
+      if (!id.success || !body.success) {
+        return context.json(
+          apiError(
+            'invalid_reconciliation_tombstone',
+            'Valid finding, message, version and reason are required',
+          ),
+          400,
+        );
+      }
+      try {
+        return context.json(
+          await resolved.tombstone[action]({
+            ...body.data,
+            findingId: id.data,
+            initiatorId: authorization.principal.actorId,
+            initiatorKind: 'owner_session',
+          }),
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '';
+        const status = reconciliationMutationStatus(error);
+        if (status === 404) {
+          return context.json(apiError('finding_or_message_not_found', message), 404);
+        }
+        if (status === 409) {
+          return context.json(apiError('reconciliation_conflict', message), 409);
+        }
+        throw error;
+      }
+    });
+  }
 
   if (resolved.adminAssetsRoot) {
     const staticMiddleware = serveStatic({

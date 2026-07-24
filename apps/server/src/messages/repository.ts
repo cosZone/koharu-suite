@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, lt, or, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, or, type SQL } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   messageMedia,
@@ -859,7 +859,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
           eq(messageRevisions.revisionNumber, messages.currentRevisionNumber),
         ),
       )
-      .where(where)
+      .where(and(where, isNull(messages.tombstonedAt)))
       .orderBy(desc(messages.publishedAt), desc(messages.id))
       .limit(limit);
   }

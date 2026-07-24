@@ -1,7 +1,14 @@
 import { asc, inArray } from 'drizzle-orm';
 import postgres from 'postgres';
 import type { Database } from '../db/client.js';
-import { importRuns, telegramChannelAllowlist } from '../db/schema.js';
+import {
+  importRunCoverages,
+  importRunObservations,
+  importRuns,
+  telegramChannelAllowlist,
+} from '../db/schema.js';
+import type { SourceResolution } from '../messages/types.js';
+import type { TelegramDesktopCompleteRange } from './coverage.js';
 import type { TelegramDesktopImportReport } from './report.js';
 
 const TELEGRAM_DESKTOP_IMPORT_ADVISORY_LOCK = 6_309_648_946_926_689;
@@ -13,6 +20,13 @@ export interface ImportConfiguredChannel {
   telegramChatId: bigint;
   title: string;
   username: string | null;
+}
+
+export interface ImportRunObservationLink {
+  observationId: string;
+  replayed: boolean;
+  resolutionAtRun: SourceResolution;
+  runId: string;
 }
 
 function reportJson(report: TelegramDesktopImportReport): Record<string, unknown> {
@@ -116,6 +130,51 @@ export class PostgresTelegramDesktopImportRepository {
       throw new Error('Failed to create Telegram Desktop import run');
     }
     return run.id;
+  }
+
+  async linkRunObservation(
+    transaction: ImportTransaction,
+    link: ImportRunObservationLink,
+  ): Promise<void> {
+    await transaction
+      .insert(importRunObservations)
+      .values({
+        observationId: link.observationId,
+        replayed: link.replayed,
+        resolutionAtRun: link.resolutionAtRun,
+        runId: link.runId,
+      })
+      .onConflictDoNothing({
+        target: [importRunObservations.runId, importRunObservations.observationId],
+      });
+  }
+
+  async persistRunCoverages(
+    runId: string,
+    ranges: readonly TelegramDesktopCompleteRange[],
+  ): Promise<void> {
+    if (ranges.length === 0) {
+      return;
+    }
+    await this.database
+      .insert(importRunCoverages)
+      .values(
+        ranges.map((range) => ({
+          endMessageId: range.endMessageId,
+          explicitlyComplete: true,
+          runId,
+          startMessageId: range.startMessageId,
+          telegramChatId: range.telegramChatId,
+        })),
+      )
+      .onConflictDoNothing({
+        target: [
+          importRunCoverages.runId,
+          importRunCoverages.telegramChatId,
+          importRunCoverages.startMessageId,
+          importRunCoverages.endMessageId,
+        ],
+      });
   }
 
   async updateRun(

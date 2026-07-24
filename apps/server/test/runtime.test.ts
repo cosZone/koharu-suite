@@ -50,6 +50,20 @@ function workerDependencies(
         order.push('poller:stop');
       }),
     },
+    reconciliationRunner: {
+      start: vi.fn(() => {
+        order.push('reconciliation:start');
+        return pending();
+      }),
+      stop: vi.fn(async () => {
+        order.push('reconciliation:stop');
+      }),
+    },
+    reconciliationSchedule: {
+      initialize: vi.fn(async () => {
+        order.push('reconciliation:initialize');
+      }),
+    },
     workers: {
       done: pending(),
       start: vi.fn(() => {
@@ -110,6 +124,8 @@ describe('worker runtime', () => {
       'telegram-identity',
       'heartbeat:starting',
       'poller:initialize',
+      'reconciliation:initialize',
+      'reconciliation:start',
       'poller:start',
       'tasks:start',
       'heartbeat:running',
@@ -117,8 +133,9 @@ describe('worker runtime', () => {
 
     await Promise.all([runtime.stop(), runtime.stop()]);
     await expect(runtime.done).resolves.toBeUndefined();
-    expect(order.slice(7)).toEqual([
+    expect(order.slice(9)).toEqual([
       'heartbeat:stopping',
+      'reconciliation:stop',
       'poller:stop',
       'tasks:stop',
       'polling-database',
@@ -166,6 +183,7 @@ describe('worker runtime', () => {
     await expect(done).resolves.toBe(lockError);
     expect(order).toEqual([
       'lock',
+      'reconciliation:stop',
       'poller:stop',
       'tasks:stop',
       'polling-database',
@@ -176,5 +194,27 @@ describe('worker runtime', () => {
     expect(dependencies.poller.initialize).not.toHaveBeenCalled();
     expect(dependencies.poller.start).not.toHaveBeenCalled();
     expect(dependencies.workers.start).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and stops the full worker when reconciliation exits unexpectedly', async () => {
+    const order: string[] = [];
+    const reconciliationError = new Error('scheduled reconciliation stopped');
+    const dependencies = workerDependencies(order, {
+      reconciliationRunner: {
+        start: vi.fn(() => Promise.reject(reconciliationError)),
+        stop: vi.fn(async () => {
+          order.push('reconciliation:stop');
+        }),
+      },
+    });
+    const runtime = new WorkerRuntime('worker-three', dependencies, 60_000);
+    const done = runtime.done.catch((error: unknown) => error);
+
+    await runtime.start();
+    await expect(done).resolves.toBe(reconciliationError);
+    await vi.waitFor(() => expect(dependencies.poller.stop).toHaveBeenCalledOnce());
+    expect(dependencies.reconciliationRunner.stop).toHaveBeenCalledOnce();
+    expect(dependencies.workers.stop).toHaveBeenCalledOnce();
+    expect(dependencies.closeMainDatabase).toHaveBeenCalledOnce();
   });
 });

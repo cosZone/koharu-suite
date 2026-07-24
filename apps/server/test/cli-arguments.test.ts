@@ -11,6 +11,8 @@ describe('CLI arguments', () => {
         '-1001234567890',
         '--channel=-1009876543210',
         '--apply',
+        '--complete-range',
+        '-1001234567890:1:500',
       ]),
     ).toEqual([
       'import',
@@ -18,6 +20,7 @@ describe('CLI arguments', () => {
       '--channel=-1001234567890',
       '--channel=-1009876543210',
       '--apply',
+      '--complete-range=-1001234567890:1:500',
     ]);
 
     expect(normalizeCliArguments(['channel', 'add', '--telegram-id', '-1001234567890'])).toEqual([

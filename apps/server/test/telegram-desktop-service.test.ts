@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { TelegramDesktopCompleteRange } from '../src/imports/coverage.js';
 import type { ImportTransaction } from '../src/imports/import-repository.js';
 import {
   type DesktopMessageRecord,
@@ -68,8 +69,15 @@ class FakeRepository {
   acquired = 0;
   asserted = 0;
   createdRuns = 0;
+  links: Array<{
+    observationId: string;
+    replayed: boolean;
+    resolutionAtRun: string;
+    runId: string;
+  }> = [];
   transactions = 0;
   updates: string[] = [];
+  coverages: TelegramDesktopCompleteRange[][] = [];
 
   acquireApplyLock = async () => {
     this.acquired += 1;
@@ -91,6 +99,22 @@ class FakeRepository {
   createRun = async () => {
     this.createdRuns += 1;
     return '019b-import-run';
+  };
+
+  linkRunObservation = async (
+    _transaction: ImportTransaction,
+    link: {
+      observationId: string;
+      replayed: boolean;
+      resolutionAtRun: 'conflict' | 'created' | 'matched' | 'stale';
+      runId: string;
+    },
+  ) => {
+    this.links.push(link);
+  };
+
+  persistRunCoverages = async (_runId: string, ranges: readonly TelegramDesktopCompleteRange[]) => {
+    this.coverages.push([...ranges]);
   };
 
   updateRun = async (_id: string, _report: unknown, status: string) => {
@@ -288,8 +312,67 @@ describe('Telegram Desktop import service', () => {
       scanned: 253,
     });
     expect(repository.transactions).toBe(2);
+    expect(repository.links).toHaveLength(251);
+    expect(repository.links[0]).toEqual({
+      observationId: '019b-observation',
+      replayed: false,
+      resolutionAtRun: 'created',
+      runId: '019b-import-run',
+    });
     expect(repository.asserted).toBe(6);
     expect(repository.updates.at(-1)).toBe('partial');
+    expect(repository.coverages).toEqual([]);
+  });
+
+  it('persists normalized complete ranges only after a clean applied run', async () => {
+    const repository = new FakeRepository();
+    const service = new TelegramDesktopImportService(
+      repository,
+      {
+        ingestSnapshotInTransaction: async (
+          _transaction: ImportTransaction,
+          candidate: NormalizedMessageSnapshot,
+        ): Promise<SourceWriteResult> => ({
+          channelId: '019b-channel',
+          createdMessage: true,
+          createdRevision: true,
+          messageId: candidate.message.telegramMessageId.toString(),
+          observationId: '019b-observation',
+          replayed: false,
+          resolution: 'created',
+          revisionId: '019b-revision',
+        }),
+        previewSnapshot: async () => {
+          throw new Error('apply must not preview');
+        },
+      },
+      parser([{ id: '1' }]),
+    );
+
+    const report = await service.run({
+      apply: true,
+      channelIds: [-1_002_234_260_754n],
+      completeRanges: [
+        {
+          endMessageId: 10n,
+          startMessageId: 1n,
+          telegramChatId: -1_002_234_260_754n,
+        },
+      ],
+      inputPath: await inputFile(),
+    });
+
+    expect(report.status).toBe('clean');
+    expect(repository.coverages).toEqual([
+      [
+        {
+          endMessageId: 10n,
+          startMessageId: 1n,
+          telegramChatId: -1_002_234_260_754n,
+        },
+      ],
+    ]);
+    expect(repository.updates.at(-1)).toBe('completed');
   });
 
   it('isolates only explicitly recoverable item write errors', async () => {

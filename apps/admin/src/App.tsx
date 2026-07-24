@@ -109,6 +109,26 @@ interface RerenderResult {
   updated: number;
 }
 
+interface ReconciliationFinding {
+  evidenceVersion: number;
+  id: string;
+  kind: string;
+  messageId: string | null;
+  messageTombstoned: boolean;
+  sanitizedDetails: { reason?: string };
+  severity: 'error' | 'warning';
+  state: 'ignored' | 'open' | 'resolved';
+  telegramChatId: string | null;
+}
+
+interface ReconciliationRun {
+  completedAt: string | null;
+  id: string;
+  mode: string;
+  startedAt: string;
+  status: string;
+}
+
 type AuthStep = 'login' | 'two-factor';
 type VerifyMethod = 'recovery' | 'totp';
 
@@ -829,6 +849,157 @@ function OperationsPanel({
   );
 }
 
+interface ReconciliationPanelProps {
+  busy: boolean;
+  findings: ReconciliationFinding[];
+  notice: string | null;
+  nextCursor: string | null;
+  onAction(finding: ReconciliationFinding, action: 'hide' | 'ignore' | 'repair' | 'unhide'): void;
+  onReasonChange(findingId: string, reason: string): void;
+  onLoadMore(): void;
+  onScan(): void;
+  reasons: Record<string, string>;
+  runs: ReconciliationRun[];
+}
+
+export function ReconciliationPanel({
+  busy,
+  findings,
+  notice,
+  nextCursor,
+  onAction,
+  onLoadMore,
+  onReasonChange,
+  onScan,
+  reasons,
+  runs,
+}: ReconciliationPanelProps) {
+  const categoryCounts = Object.entries(
+    findings.reduce<Record<string, number>>((counts, finding) => {
+      counts[finding.kind] = (counts[finding.kind] ?? 0) + 1;
+      return counts;
+    }, {}),
+  ).sort(([left], [right]) => left.localeCompare(right));
+
+  return (
+    <section className="reconciliation" aria-labelledby="reconciliation-title">
+      <div className="reconciliation__heading">
+        <div>
+          <Kicker>RECONCILIATION</Kicker>
+          <h2 id="reconciliation-title">对账与恢复</h2>
+          <p>只展示脱敏 evidence。数字缺口是线索；安全扫描只更新 findings，不修改文章。</p>
+          <p>隐藏后公开 API 返回 404，但 finding、来源证据与审计记录会继续保留。</p>
+        </div>
+        <Button disabled={busy} onClick={onScan} type="button">
+          {busy ? '处理中…' : '运行安全扫描'}
+        </Button>
+      </div>
+      {notice ? (
+        <p className="reconciliation__notice" role="status">
+          {notice}
+        </p>
+      ) : null}
+      <div className="reconciliation__summary">
+        <span>
+          已加载 {findings.length} 条 · Open{' '}
+          {findings.filter((item) => item.state === 'open').length}
+        </span>
+        <span>
+          最近运行 {runs[0] ? `${runs[0].status} · ${formatDate(runs[0].startedAt)}` : '—'}
+        </span>
+        <span>需要历史补洞时，请导出 Telegram Desktop JSON 后重新扫描。</span>
+      </div>
+      <ul className="reconciliation__categories" aria-label="已加载 Finding 类别统计">
+        {categoryCounts.map(([kind, count]) => (
+          <li key={kind}>
+            <strong>{count}</strong> {kind}
+          </li>
+        ))}
+        {categoryCounts.length === 0 ? <li>当前无类别数据</li> : null}
+      </ul>
+      <div className="reconciliation__list">
+        {findings.map((finding) => {
+          const repairable = [
+            'current_pointer_invalid',
+            'derived_html_drift',
+            'import_lineage_missing',
+            'media_evidence_missing',
+          ].includes(finding.kind);
+          const tombstoneable =
+            finding.kind === 'desktop_absence_candidate' && finding.messageId !== null;
+          return (
+            <article
+              className={`reconciliation-item${finding.severity === 'error' ? ' is-error' : ''}`}
+              key={finding.id}
+            >
+              <header>
+                <Badge tone="warning">{finding.kind}</Badge>
+                <span>
+                  {finding.state} · evidence v{finding.evidenceVersion}
+                </span>
+              </header>
+              <p>{finding.sanitizedDetails.reason ?? '需要 Owner 检查此 evidence。'}</p>
+              {finding.state === 'open' || tombstoneable ? (
+                <>
+                  <Field label="审计原因">
+                    <Input
+                      maxLength={500}
+                      onChange={(event) => onReasonChange(finding.id, event.target.value)}
+                      placeholder="说明为何修复或忽略"
+                      value={reasons[finding.id] ?? ''}
+                    />
+                  </Field>
+                  <div className="reconciliation-item__actions">
+                    {finding.state === 'open' && repairable ? (
+                      <Button
+                        disabled={busy}
+                        onClick={() => onAction(finding, 'repair')}
+                        type="button"
+                      >
+                        确定性修复
+                      </Button>
+                    ) : null}
+                    {tombstoneable ? (
+                      <Button
+                        disabled={busy}
+                        onClick={() =>
+                          onAction(finding, finding.messageTombstoned ? 'unhide' : 'hide')
+                        }
+                        type="button"
+                        variant="quiet"
+                      >
+                        {finding.messageTombstoned ? '恢复公开访问' : '隐藏并公开返回 404'}
+                      </Button>
+                    ) : null}
+                    {finding.state === 'open' ? (
+                      <Button
+                        disabled={busy}
+                        onClick={() => onAction(finding, 'ignore')}
+                        type="button"
+                        variant="quiet"
+                      >
+                        Owner 忽略
+                      </Button>
+                    ) : null}
+                  </div>
+                </>
+              ) : null}
+            </article>
+          );
+        })}
+        {findings.length === 0 ? (
+          <EmptyState tone="success">尚无 finding。运行扫描以建立当前基线。</EmptyState>
+        ) : null}
+        {nextCursor ? (
+          <Button disabled={busy} onClick={onLoadMore} type="button" variant="quiet">
+            {busy ? '加载更多 findings（加载中…）' : '加载更多 findings'}
+          </Button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Promise<void> }) {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -842,6 +1013,12 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [rawLoading, setRawLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [reconciliationFindings, setReconciliationFindings] = useState<ReconciliationFinding[]>([]);
+  const [reconciliationNextCursor, setReconciliationNextCursor] = useState<string | null>(null);
+  const [reconciliationRuns, setReconciliationRuns] = useState<ReconciliationRun[]>([]);
+  const [reconciliationBusy, setReconciliationBusy] = useState<string | null>(null);
+  const [reconciliationNotice, setReconciliationNotice] = useState<string | null>(null);
+  const [reconciliationReasons, setReconciliationReasons] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const controller = new AbortController();
@@ -856,14 +1033,33 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
       fetchJson<{ items: ConfiguredChannel[] }>('/api/v1/admin/channels', {
         signal: controller.signal,
       }),
+      fetchJson<{ items: ReconciliationFinding[]; nextCursor: string | null }>(
+        '/api/v1/admin/reconciliation/findings?limit=20',
+        { signal: controller.signal },
+      ),
+      fetchJson<{ items: ReconciliationRun[] }>('/api/v1/admin/reconciliation/runs?limit=5', {
+        signal: controller.signal,
+      }),
     ])
-      .then(([nextStatus, channelResult, taskResult, configuredChannelResult]) => {
-        setStatus(nextStatus);
-        setChannels(channelResult.items);
-        setBlockedTasks(taskResult.items);
-        setConfiguredChannels(configuredChannelResult.items);
-        setSelectedChannel(channelResult.items[0]?.id ?? null);
-      })
+      .then(
+        ([
+          nextStatus,
+          channelResult,
+          taskResult,
+          configuredChannelResult,
+          findingResult,
+          runResult,
+        ]) => {
+          setStatus(nextStatus);
+          setChannels(channelResult.items);
+          setBlockedTasks(taskResult.items);
+          setConfiguredChannels(configuredChannelResult.items);
+          setReconciliationFindings(findingResult.items);
+          setReconciliationNextCursor(findingResult.nextCursor);
+          setReconciliationRuns(runResult.items);
+          setSelectedChannel(channelResult.items[0]?.id ?? null);
+        },
+      )
       .catch((reason: unknown) => {
         if (reason instanceof DOMException && reason.name === 'AbortError') {
           return;
@@ -1010,6 +1206,98 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
         : current,
     );
     return result;
+  }
+
+  async function refreshReconciliation() {
+    const [findingResult, runResult] = await Promise.all([
+      fetchJson<{ items: ReconciliationFinding[]; nextCursor: string | null }>(
+        '/api/v1/admin/reconciliation/findings?limit=20',
+      ),
+      fetchJson<{ items: ReconciliationRun[] }>('/api/v1/admin/reconciliation/runs?limit=5'),
+    ]);
+    setReconciliationFindings(findingResult.items);
+    setReconciliationNextCursor(findingResult.nextCursor);
+    setReconciliationRuns(runResult.items);
+  }
+
+  async function runReconciliationScan() {
+    const channelIds = configuredChannels.map((channel) => channel.telegramChatId);
+    if (channelIds.length === 0) {
+      setError('请先配置至少一个 Telegram 频道。');
+      return;
+    }
+    setReconciliationBusy('scan');
+    setError(null);
+    try {
+      await fetchJson<{ runId: string }>('/api/v1/admin/reconciliation/scan', {
+        body: JSON.stringify({ telegramChannelIds: channelIds }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      await refreshReconciliation();
+      setReconciliationNotice('对账扫描完成，finding 已按同一快照更新。');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '对账扫描失败');
+    } finally {
+      setReconciliationBusy(null);
+    }
+  }
+
+  async function loadMoreReconciliationFindings() {
+    if (!reconciliationNextCursor) return;
+    setReconciliationBusy('more');
+    setError(null);
+    try {
+      const result = await fetchJson<{
+        items: ReconciliationFinding[];
+        nextCursor: string | null;
+      }>(
+        `/api/v1/admin/reconciliation/findings?limit=20&cursor=${encodeURIComponent(reconciliationNextCursor)}`,
+      );
+      setReconciliationFindings((current) => [...current, ...result.items]);
+      setReconciliationNextCursor(result.nextCursor);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法加载更多 findings');
+    } finally {
+      setReconciliationBusy(null);
+    }
+  }
+
+  async function actOnFinding(
+    finding: ReconciliationFinding,
+    action: 'hide' | 'ignore' | 'repair' | 'unhide',
+  ) {
+    const reason = reconciliationReasons[finding.id]?.trim() ?? '';
+    if (!reason) {
+      setError('修复或忽略 finding 前必须填写审计原因。');
+      return;
+    }
+    const verb = {
+      hide: '隐藏消息并让公开 API 返回 404',
+      ignore: '忽略此 finding',
+      repair: '执行确定性修复',
+      unhide: '恢复消息的公开访问',
+    }[action];
+    if (!window.confirm(`${verb}？来源证据会保留，此操作会写入审计记录。`)) return;
+    setReconciliationBusy(`${finding.id}:${action}`);
+    setError(null);
+    try {
+      await fetchJson<object>(`/api/v1/admin/reconciliation/findings/${finding.id}/${action}`, {
+        body: JSON.stringify({
+          expectedEvidenceVersion: finding.evidenceVersion,
+          ...(action === 'hide' || action === 'unhide' ? { messageId: finding.messageId } : {}),
+          reason,
+        }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      await refreshReconciliation();
+      setReconciliationNotice(`${verb}已完成。`);
+    } catch (reasonValue) {
+      setError(reasonValue instanceof Error ? reasonValue.message : `${verb}失败`);
+    } finally {
+      setReconciliationBusy(null);
+    }
   }
 
   async function signOut() {
@@ -1194,6 +1482,21 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
             onChannelToggle={toggleConfiguredChannel}
             onRerender={rerenderOutdated}
             onTaskAction={actOnTask}
+          />
+
+          <ReconciliationPanel
+            busy={reconciliationBusy !== null}
+            findings={reconciliationFindings}
+            notice={reconciliationNotice}
+            nextCursor={reconciliationNextCursor}
+            onAction={actOnFinding}
+            onLoadMore={loadMoreReconciliationFindings}
+            onReasonChange={(findingId, reason) =>
+              setReconciliationReasons((current) => ({ ...current, [findingId]: reason }))
+            }
+            onScan={runReconciliationScan}
+            reasons={reconciliationReasons}
+            runs={reconciliationRuns}
           />
 
           {status ? (

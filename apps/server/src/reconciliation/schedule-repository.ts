@@ -1,7 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { reconciliationRuns, reconciliationSchedule } from '../db/schema.js';
+import {
+  reconciliationRuns,
+  reconciliationSchedule,
+  telegramChannelAllowlist,
+} from '../db/schema.js';
+import {
+  addReconciliationReportIssue,
+  createReconciliationReport,
+  finishReconciliationReport,
+  RECONCILIATION_REPORT_FINDING_LIMIT,
+  RECONCILIATION_REPORT_ISSUE_LIMIT,
+  RECONCILIATION_REPORT_SCHEMA_VERSION,
+  RECONCILIATION_REPORT_TEXT_LIMIT,
+  type ReconciliationReport,
+  sanitizeReconciliationReportText,
+} from './report.js';
 
 const SCHEDULE_KEY = 'telegram';
 const DEFAULT_INTERVAL_SECONDS = 3_600;
@@ -30,7 +45,7 @@ export interface ReconciliationScheduleLease extends ReconciliationScheduleState
 
 interface FinishInput {
   leaseToken: string;
-  report?: Record<string, unknown>;
+  report?: ReconciliationReport;
   runId: string;
 }
 
@@ -38,6 +53,20 @@ type ScheduleTransaction = Parameters<Parameters<Database['transaction']>[0]>[0]
 
 export class PostgresReconciliationScheduleRepository {
   constructor(private readonly database: Database) {}
+
+  async listConfiguredChannelScope(): Promise<string[]> {
+    const rows = await this.database
+      .select({ telegramChatId: telegramChannelAllowlist.telegramChatId })
+      .from(telegramChannelAllowlist)
+      .orderBy(asc(telegramChannelAllowlist.telegramChatId))
+      .limit(SCHEDULE_SCOPE_CHANNEL_LIMIT + 1);
+    if (rows.length > SCHEDULE_SCOPE_CHANNEL_LIMIT) {
+      throw new RangeError(
+        `Scheduled reconciliation supports at most ${SCHEDULE_SCOPE_CHANNEL_LIMIT} configured channels`,
+      );
+    }
+    return rows.map(({ telegramChatId }) => telegramChatId.toString());
+  }
 
   async initialize(
     input: { enabled?: boolean; intervalSeconds?: number; nextRunAt?: Date; now?: Date } = {},
@@ -106,11 +135,36 @@ export class PostgresReconciliationScheduleRepository {
       const normalizedScope = normalizeScheduleScope(scope);
 
       if (schedule.claimedRunId) {
+        const [expiredRun] = await transaction
+          .select()
+          .from(reconciliationRuns)
+          .where(eq(reconciliationRuns.id, schedule.claimedRunId))
+          .limit(1)
+          .for('update');
+        if (
+          !expiredRun ||
+          expiredRun.completedAt !== null ||
+          expiredRun.initiatorKind !== 'worker' ||
+          expiredRun.initiatorId !== `${schedule.leaseOwner}:${schedule.leaseToken}` ||
+          expiredRun.mode !== 'scheduled_scan' ||
+          expiredRun.status !== 'running'
+        ) {
+          throw new Error('Expired reconciliation lease is not bound to a running worker run');
+        }
+        const completedAt = new Date();
         const [interrupted] = await transaction
           .update(reconciliationRuns)
           .set({
-            completedAt: sql`clock_timestamp()`,
-            report: { reason: 'lease_expired' },
+            completedAt,
+            report: reportJson(
+              interruptedScheduleReport(
+                expiredRun.scope,
+                expiredRun.startedAt,
+                completedAt,
+                'scheduled_lease_expired',
+                'The scheduled reconciliation lease expired before completion',
+              ),
+            ),
             status: 'interrupted',
           })
           .where(
@@ -128,15 +182,21 @@ export class PostgresReconciliationScheduleRepository {
         }
       }
 
+      const startedAt = new Date();
+      const initialReport = createReconciliationReport({
+        channelIds: normalizedScope,
+        mode: 'scheduled-scan',
+        startedAt,
+      });
       const [run] = await transaction
         .insert(reconciliationRuns)
         .values({
           initiatorId: `${instanceId}:${leaseToken}`,
           initiatorKind: 'worker',
           mode: 'scheduled_scan',
-          report: {},
+          report: reportJson(initialReport),
           scope: normalizedScope,
-          startedAt: sql`clock_timestamp()`,
+          startedAt,
           status: 'running',
         })
         .returning({ id: reconciliationRuns.id });
@@ -240,6 +300,8 @@ export class PostgresReconciliationScheduleRepository {
           initiatorId: reconciliationRuns.initiatorId,
           initiatorKind: reconciliationRuns.initiatorKind,
           mode: reconciliationRuns.mode,
+          scope: reconciliationRuns.scope,
+          startedAt: reconciliationRuns.startedAt,
           status: reconciliationRuns.status,
         })
         .from(reconciliationRuns)
@@ -256,12 +318,16 @@ export class PostgresReconciliationScheduleRepository {
       ) {
         throw new Error('Reconciliation run is not the active token-bound scheduled worker run');
       }
+      const completedAt = new Date();
+      const report =
+        input.report ?? terminalScheduleReport(run.scope, run.startedAt, completedAt, input.status);
+      assertTerminalScheduleReport(report, run.scope, input.status);
 
       await transaction
         .update(reconciliationRuns)
         .set({
-          completedAt: sql`clock_timestamp()`,
-          report: input.report ?? {},
+          completedAt,
+          report: reportJson(report),
           status: input.status,
         })
         .where(eq(reconciliationRuns.id, input.runId));
@@ -383,4 +449,149 @@ function normalizeScheduleScope(values: readonly string[]): string[] {
   return [...unique.entries()]
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([, value]) => value);
+}
+
+function terminalScheduleReport(
+  scope: readonly string[],
+  startedAt: Date,
+  completedAt: Date,
+  status: ReconciliationScheduleStatus,
+): ReconciliationReport {
+  const report = createReconciliationReport({
+    channelIds: scope,
+    mode: 'scheduled-scan',
+    startedAt,
+  });
+  if (status === 'partial' || status === 'failed') {
+    addReconciliationReportIssue(report, {
+      code: status === 'partial' ? 'scheduled_scan_partial' : 'scheduled_scan_failed',
+      sanitizedReason:
+        status === 'partial'
+          ? 'Scheduled reconciliation completed with incomplete evidence'
+          : 'Scheduled reconciliation failed before producing a report',
+    });
+  }
+  return finishReconciliationReport(report, {
+    completedAt,
+    fatal: status === 'failed',
+    interrupted: status === 'interrupted',
+  });
+}
+
+function interruptedScheduleReport(
+  scope: readonly string[],
+  startedAt: Date,
+  completedAt: Date,
+  code: string,
+  reason: string,
+): ReconciliationReport {
+  const report = createReconciliationReport({
+    channelIds: scope,
+    mode: 'scheduled-scan',
+    startedAt,
+  });
+  addReconciliationReportIssue(report, { code, sanitizedReason: reason });
+  return finishReconciliationReport(report, { completedAt, interrupted: true });
+}
+
+function assertTerminalScheduleReport(
+  report: ReconciliationReport,
+  runScope: readonly string[],
+  status: ReconciliationScheduleStatus,
+): void {
+  const expectedStatus = {
+    completed: 'clean',
+    failed: 'fatal',
+    interrupted: 'interrupted',
+    partial: 'partial',
+  } as const satisfies Record<ReconciliationScheduleStatus, ReconciliationReport['status']>;
+  if (
+    report.schemaVersion !== RECONCILIATION_REPORT_SCHEMA_VERSION ||
+    report.mode !== 'scheduled-scan' ||
+    report.completedAt === null ||
+    report.status !== expectedStatus[status] ||
+    report.counts.repaired !== 0
+  ) {
+    throw new TypeError('Scheduled reconciliation report does not match its terminal run state');
+  }
+  if (
+    report.findings.length > RECONCILIATION_REPORT_FINDING_LIMIT ||
+    report.issues.length > RECONCILIATION_REPORT_ISSUE_LIMIT
+  ) {
+    throw new RangeError('Scheduled reconciliation report exceeds its bounded sample limits');
+  }
+  const countValues = Object.values(report.counts);
+  if (countValues.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new TypeError('Scheduled reconciliation report counts must be non-negative integers');
+  }
+  if (
+    report.findings.some(
+      (finding) =>
+        finding.sanitizedReason.length > RECONCILIATION_REPORT_TEXT_LIMIT ||
+        sanitizeReconciliationReportText(finding.sanitizedReason) !== finding.sanitizedReason,
+    ) ||
+    report.issues.some(
+      (issue) =>
+        issue.sanitizedReason.length > RECONCILIATION_REPORT_TEXT_LIMIT ||
+        sanitizeReconciliationReportText(issue.sanitizedReason) !== issue.sanitizedReason,
+    )
+  ) {
+    throw new TypeError('Scheduled reconciliation report contains unsanitized text');
+  }
+  const startedAt = Date.parse(report.startedAt);
+  const completedAt = Date.parse(report.completedAt);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || completedAt < startedAt) {
+    throw new TypeError('Scheduled reconciliation report has an invalid time range');
+  }
+  const expectedScope = [...new Set(runScope)].sort();
+  const actualScope = [...report.scope.channelIds].sort();
+  if (
+    report.scope.channelIdsTruncated ||
+    actualScope.length !== expectedScope.length ||
+    actualScope.some((channelId, index) => channelId !== expectedScope[index])
+  ) {
+    throw new TypeError('Scheduled reconciliation report scope does not match its claimed run');
+  }
+}
+
+function reportJson(report: ReconciliationReport): Record<string, unknown> {
+  return {
+    completedAt: report.completedAt,
+    counts: {
+      errors: report.counts.errors,
+      findings: report.counts.findings,
+      ignored: report.counts.ignored,
+      itemErrors: report.counts.itemErrors,
+      open: report.counts.open,
+      repaired: report.counts.repaired,
+      resolved: report.counts.resolved,
+      scanned: report.counts.scanned,
+      warnings: report.counts.warnings,
+    },
+    findings: report.findings.map((finding) => ({
+      channelId: finding.channelId,
+      evidenceVersion: finding.evidenceVersion,
+      kind: finding.kind,
+      ...(finding.messageId === undefined ? {} : { messageId: finding.messageId }),
+      ...(finding.observationId === undefined ? {} : { observationId: finding.observationId }),
+      sanitizedReason: finding.sanitizedReason,
+      severity: finding.severity,
+      stableKey: finding.stableKey,
+      state: finding.state,
+    })),
+    findingsTruncated: report.findingsTruncated,
+    issues: report.issues.map((issue) => ({
+      code: issue.code,
+      sanitizedReason: issue.sanitizedReason,
+    })),
+    issuesTruncated: report.issuesTruncated,
+    mode: report.mode,
+    schemaVersion: report.schemaVersion,
+    scope: {
+      channelIds: [...report.scope.channelIds],
+      channelIdsTruncated: report.scope.channelIdsTruncated,
+    },
+    startedAt: report.startedAt,
+    status: report.status,
+  };
 }

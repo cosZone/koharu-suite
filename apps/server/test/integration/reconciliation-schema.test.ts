@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  importRunObservations,
   importRuns,
   messageMedia,
   messageRevisions,
@@ -29,6 +30,10 @@ import { channelPostFixture } from '../fixtures/telegram.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const TELEGRAM_CHANNEL_ID = -1_001_234_567_890n;
+
+interface LegacyIdRow extends Record<string, unknown> {
+  id: string;
+}
 
 describe('G2.2 reconciliation schema', () => {
   let container: StartedPostgreSqlContainer | undefined;
@@ -313,14 +318,11 @@ describe('G2.2 reconciliation schema', () => {
           telegramUpdateId,
           updateType: 'channel_post',
         });
-        const [botMessage] = await legacyConnection.db
-          .insert(messages)
-          .values({
-            channelId: channel.id,
-            publishedAt: new Date('2026-07-24T00:00:00.000Z'),
-            telegramMessageId: 42n,
-          })
-          .returning({ id: messages.id });
+        const [botMessage] = await legacyConnection.db.execute<LegacyIdRow>(sql`
+          insert into messages (channel_id, telegram_message_id, published_at)
+          values (${channel.id}, ${42n}, ${'2026-07-24T00:00:00.000Z'}::timestamptz)
+          returning id
+        `);
         if (!botMessage) {
           throw new Error('Legacy Bot message was not created');
         }
@@ -401,14 +403,11 @@ describe('G2.2 reconciliation schema', () => {
         if (!importRun) {
           throw new Error('Legacy import run was not created');
         }
-        const [desktopMessage] = await legacyConnection.db
-          .insert(messages)
-          .values({
-            channelId: channel.id,
-            publishedAt: new Date('2026-07-24T00:01:00.000Z'),
-            telegramMessageId: 43n,
-          })
-          .returning({ id: messages.id });
+        const [desktopMessage] = await legacyConnection.db.execute<LegacyIdRow>(sql`
+          insert into messages (channel_id, telegram_message_id, published_at)
+          values (${channel.id}, ${43n}, ${'2026-07-24T00:01:00.000Z'}::timestamptz)
+          returning id
+        `);
         if (!desktopMessage) {
           throw new Error('Legacy Desktop message was not created');
         }
@@ -475,14 +474,11 @@ describe('G2.2 reconciliation schema', () => {
         }
         crossSourceObservationId = crossSourceObservation.id;
 
-        const [ambiguousDesktopMessage] = await legacyConnection.db
-          .insert(messages)
-          .values({
-            channelId: channel.id,
-            publishedAt: new Date('2026-07-24T00:03:00.000Z'),
-            telegramMessageId: 44n,
-          })
-          .returning({ id: messages.id });
+        const [ambiguousDesktopMessage] = await legacyConnection.db.execute<LegacyIdRow>(sql`
+          insert into messages (channel_id, telegram_message_id, published_at)
+          values (${channel.id}, ${44n}, ${'2026-07-24T00:03:00.000Z'}::timestamptz)
+          returning id
+        `);
         if (!ambiguousDesktopMessage) {
           throw new Error('Legacy ambiguous Desktop message was not created');
         }
@@ -546,6 +542,13 @@ describe('G2.2 reconciliation schema', () => {
       await runMigrations(legacyUrl.toString());
       const upgradedConnection = createDatabaseConnection(legacyUrl.toString());
       try {
+        const upgradedMessages = await upgradedConnection.db
+          .select({ id: messages.id, tombstonedAt: messages.tombstonedAt })
+          .from(messages);
+        const runLineage = await upgradedConnection.db
+          .select()
+          .from(importRunObservations)
+          .orderBy(importRunObservations.createdAt, importRunObservations.observationId);
         const evidence = await upgradedConnection.db
           .select({
             availability: messageSourceMediaObservations.availability,
@@ -561,6 +564,26 @@ describe('G2.2 reconciliation schema', () => {
             messageSourceMediaObservations.position,
           );
         expect(evidence).toHaveLength(3);
+        expect(upgradedMessages).toHaveLength(3);
+        expect(upgradedMessages.every((message) => message.tombstonedAt === null)).toBe(true);
+        expect(runLineage).toHaveLength(4);
+        expect(runLineage).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              observationId: crossSourceObservationId,
+              replayed: false,
+              resolutionAtRun: 'matched',
+              sourceKind: 'telegram_desktop_json',
+            }),
+            ...ambiguousDesktopObservationIds.map((observationId) =>
+              expect.objectContaining({
+                observationId,
+                replayed: false,
+                sourceKind: 'telegram_desktop_json',
+              }),
+            ),
+          ]),
+        );
         expect(evidence).toEqual(
           expect.arrayContaining([
             expect.objectContaining({

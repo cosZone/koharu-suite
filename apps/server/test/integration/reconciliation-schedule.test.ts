@@ -3,7 +3,11 @@ import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
-import { reconciliationRuns, reconciliationSchedule } from '../../src/db/schema.js';
+import {
+  reconciliationRuns,
+  reconciliationSchedule,
+  telegramChannelAllowlist,
+} from '../../src/db/schema.js';
 import { PostgresReconciliationScheduleRepository } from '../../src/reconciliation/schedule-repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
@@ -29,6 +33,31 @@ describe('reconciliation durable schedule lease', () => {
     }
     await connection.db.delete(reconciliationSchedule);
     await connection.db.delete(reconciliationRuns);
+    await connection.db.delete(telegramChannelAllowlist);
+  });
+
+  it('loads every configured channel in stable order including disabled archives', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    await connection.db.insert(telegramChannelAllowlist).values([
+      {
+        enabled: true,
+        telegramChatId: -1_001n,
+        title: 'Active',
+        username: 'active',
+      },
+      {
+        disabledAt: new Date('2026-07-24T10:00:00.000Z'),
+        enabled: false,
+        telegramChatId: -1_002n,
+        title: 'Archive',
+        username: 'archive',
+      },
+    ]);
+    const repository = new PostgresReconciliationScheduleRepository(connection.db);
+
+    await expect(repository.listConfiguredChannelScope()).resolves.toEqual(['-1002', '-1001']);
   });
 
   it('initializes idempotently and does not claim disabled or not-due work', async () => {
@@ -108,11 +137,22 @@ describe('reconciliation durable schedule lease', () => {
     const [interrupted] = await connection.db
       .select({
         completedAt: reconciliationRuns.completedAt,
+        report: reconciliationRuns.report,
         status: reconciliationRuns.status,
       })
       .from(reconciliationRuns)
       .where(eq(reconciliationRuns.id, first.claimedRunId));
     expect(interrupted).toMatchObject({
+      report: {
+        issues: [
+          expect.objectContaining({
+            code: 'scheduled_lease_expired',
+          }),
+        ],
+        mode: 'scheduled-scan',
+        schemaVersion: 1,
+        status: 'interrupted',
+      },
       status: 'interrupted',
     });
     expect(interrupted?.completedAt).not.toBeNull();
@@ -182,7 +222,6 @@ describe('reconciliation durable schedule lease', () => {
     await expect(
       repository.complete('worker-one', {
         leaseToken: first.leaseToken,
-        report: { schemaVersion: 1 },
         runId: first.claimedRunId,
         status: 'completed',
       }),
@@ -203,7 +242,16 @@ describe('reconciliation durable schedule lease', () => {
       .from(reconciliationRuns)
       .where(eq(reconciliationRuns.id, first.claimedRunId));
     expect(completed).toMatchObject({
-      report: { schemaVersion: 1 },
+      report: {
+        completedAt: expect.any(String),
+        mode: 'scheduled-scan',
+        schemaVersion: 1,
+        scope: {
+          channelIds: ['-1001'],
+          channelIdsTruncated: false,
+        },
+        status: 'clean',
+      },
       status: 'completed',
     });
     expect(completed?.completedAt).not.toBeNull();

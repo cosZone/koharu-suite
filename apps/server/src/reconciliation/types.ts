@@ -1,6 +1,7 @@
 export const RECONCILIATION_EVIDENCE_KINDS = [
   'durable_pending',
   'durable_blocked',
+  'import_lineage_missing',
   'operator_skipped',
   'disabled_window',
   'retention_risk',
@@ -30,6 +31,7 @@ export const RECONCILIATION_EVIDENCE_CONFIDENCE = {
   disabled_window: 'risk',
   durable_blocked: 'certain',
   durable_pending: 'certain',
+  import_lineage_missing: 'certain',
   media_evidence_missing: 'rebuildable_or_unknown',
   message_id_candidate: 'weak_signal',
   observation_conflict: 'certain_difference',

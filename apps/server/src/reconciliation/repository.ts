@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
+  importRunCoverages,
+  importRunObservations,
+  importRuns,
   messageMedia,
   messageRevisions,
   messageSourceMediaObservations,
   messageSourceObservations,
   messages,
+  operationAuditEvents,
   telegramChannelAllowlist,
   telegramChannels,
   telegramIngestTasks,
@@ -49,9 +53,24 @@ export interface ReconciliationScanner {
   ): Promise<ReconciliationScanSnapshot>;
 }
 
+export interface ReconciliationSnapshotScanner {
+  scanSnapshotInTransaction(
+    transaction: ReconciliationTransaction,
+    telegramChannelIds: readonly bigint[],
+    now: Date,
+    visit: ReconciliationCandidateVisitor,
+  ): Promise<ReconciliationScanSnapshot>;
+}
+
 export class ReconciliationScopeError extends Error {}
 
-type ReconciliationTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+export type ReconciliationTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+type ChannelAuditScanRow = {
+  action: typeof operationAuditEvents.$inferSelect.action;
+  createdAt: Date;
+  id: string;
+  targetId: string;
+};
 type TaskScanRow = {
   blockedAt: Date | null;
   id: string;
@@ -73,6 +92,19 @@ type ObservationScanRow = {
   id: string;
   messageId: string;
   resolution: 'conflict' | 'created' | 'matched' | 'stale';
+};
+type LineageScanRow = {
+  channelId: bigint;
+  id: string;
+  messageId: string;
+};
+type DesktopAbsenceScanRow = {
+  channelId: bigint;
+  endMessageId: bigint;
+  messageId: string;
+  runId: string;
+  startMessageId: bigint;
+  telegramMessageId: bigint;
 };
 type MissingMediaScanRow = {
   channelId: bigint;
@@ -100,25 +132,24 @@ export class PostgresReconciliationRepository implements ReconciliationScanner {
     now: Date,
     visit: ReconciliationCandidateVisitor,
   ): Promise<ReconciliationScanSnapshot> {
-    const scope = uniqueTelegramIds(telegramChannelIds);
-    if (scope.length === 0) {
-      throw new ReconciliationScopeError('At least one Telegram channel ID is required');
-    }
-    if (scope.length > RECONCILIATION_SCAN_CHANNEL_LIMIT) {
-      throw new ReconciliationScopeError(
-        `A scan may include at most ${RECONCILIATION_SCAN_CHANNEL_LIMIT} channels`,
-      );
-    }
-
     return this.database.transaction(
       async (transaction) => {
         await transaction.execute(
           sql`select pg_advisory_xact_lock(${RECONCILIATION_ADVISORY_LOCK})`,
         );
-        return this.scanSnapshot(transaction, scope, now, visit);
+        return this.scanSnapshotInTransaction(transaction, telegramChannelIds, now, visit);
       },
       { accessMode: 'read only', isolationLevel: 'repeatable read' },
     );
+  }
+
+  async scanSnapshotInTransaction(
+    transaction: ReconciliationTransaction,
+    telegramChannelIds: readonly bigint[],
+    now: Date,
+    visit: ReconciliationCandidateVisitor,
+  ): Promise<ReconciliationScanSnapshot> {
+    return this.scanSnapshot(transaction, reconciliationScope(telegramChannelIds), now, visit);
   }
 
   private async scanSnapshot(
@@ -142,10 +173,87 @@ export class PostgresReconciliationRepository implements ReconciliationScanner {
     }
     scanned += configured.length;
 
-    for (const channel of configured) {
-      if (!channel.enabled) {
+    const configuredIds = configured.map((channel) => channel.telegramChatId.toString());
+    const channelsWithDisableAudit = new Set<string>();
+    const openDisable = new Map<string, ChannelAuditScanRow>();
+    await forEachPage<ChannelAuditScanRow>(
+      (cursor) =>
+        transaction
+          .select({
+            action: operationAuditEvents.action,
+            createdAt: operationAuditEvents.createdAt,
+            id: operationAuditEvents.id,
+            targetId: operationAuditEvents.targetId,
+          })
+          .from(operationAuditEvents)
+          .where(
+            and(
+              eq(operationAuditEvents.targetType, 'channel'),
+              inArray(operationAuditEvents.targetId, configuredIds),
+              inArray(operationAuditEvents.action, ['channel.disable', 'channel.enable']),
+              cursor
+                ? or(
+                    gt(operationAuditEvents.createdAt, cursor.createdAt),
+                    and(
+                      eq(operationAuditEvents.createdAt, cursor.createdAt),
+                      or(
+                        gt(operationAuditEvents.action, cursor.action),
+                        and(
+                          eq(operationAuditEvents.action, cursor.action),
+                          gt(operationAuditEvents.id, cursor.id),
+                        ),
+                      ),
+                    ),
+                  )
+                : undefined,
+            ),
+          )
+          .orderBy(
+            asc(operationAuditEvents.createdAt),
+            asc(operationAuditEvents.action),
+            asc(operationAuditEvents.id),
+          )
+          .limit(RECONCILIATION_SCAN_BATCH_SIZE),
+      async (audit) => {
+        scanned += 1;
+        if (audit.action === 'channel.disable') {
+          channelsWithDisableAudit.add(audit.targetId);
+          openDisable.set(audit.targetId, audit);
+          return;
+        }
+        if (audit.action !== 'channel.enable') {
+          return;
+        }
+        const disabled = openDisable.get(audit.targetId);
+        if (!disabled) {
+          return;
+        }
         await visit({
-          channelId: channel.telegramChatId.toString(),
+          channelId: audit.targetId,
+          evidenceIds: [disabled.id],
+          evidenceVersion: 1,
+          kind: 'disabled_window',
+          sanitizedReason: 'The channel was disabled during a historical unobserved window',
+          severity: 'warning',
+        });
+        openDisable.delete(audit.targetId);
+      },
+    );
+    for (const [channelId, disabled] of openDisable) {
+      await visit({
+        channelId,
+        evidenceIds: [disabled.id],
+        evidenceVersion: 1,
+        kind: 'disabled_window',
+        sanitizedReason: 'The channel is currently disabled and may have an unobserved window',
+        severity: 'warning',
+      });
+    }
+    for (const channel of configured) {
+      const channelId = channel.telegramChatId.toString();
+      if (!channel.enabled && !channelsWithDisableAudit.has(channelId)) {
+        await visit({
+          channelId,
           evidenceIds: [channel.disabledAt?.toISOString() ?? 'unknown-disabled-window'],
           evidenceVersion: 1,
           kind: 'disabled_window',
@@ -349,6 +457,128 @@ export class PostgresReconciliationRepository implements ReconciliationScanner {
       },
     );
 
+    await forEachPage<LineageScanRow>(
+      (cursor) =>
+        transaction
+          .select({
+            channelId: telegramChannels.telegramChatId,
+            id: messageSourceObservations.id,
+            messageId: messageSourceObservations.messageId,
+          })
+          .from(messageSourceObservations)
+          .innerJoin(telegramChannels, eq(telegramChannels.id, messageSourceObservations.channelId))
+          .where(
+            and(
+              inArray(telegramChannels.telegramChatId, scope),
+              eq(messageSourceObservations.sourceKind, 'telegram_desktop_json'),
+              isNotNull(messageSourceObservations.importRunId),
+              sql`not exists (
+                select 1
+                from ${importRunObservations}
+                where ${importRunObservations.runId} = ${messageSourceObservations.importRunId}
+                  and ${importRunObservations.observationId} = ${messageSourceObservations.id}
+              )`,
+              cursor ? gt(messageSourceObservations.id, cursor.id) : undefined,
+            ),
+          )
+          .orderBy(asc(messageSourceObservations.id))
+          .limit(RECONCILIATION_SCAN_BATCH_SIZE),
+      async (observation) => {
+        scanned += 1;
+        await visit({
+          channelId: observation.channelId.toString(),
+          evidenceVersion: 1,
+          kind: 'import_lineage_missing',
+          messageId: observation.messageId,
+          observationId: observation.id,
+          sanitizedReason:
+            'A Desktop observation is missing its deterministic import run lineage link',
+          severity: 'error',
+        });
+      },
+    );
+
+    await forEachPage<DesktopAbsenceScanRow>(
+      (cursor) =>
+        transaction
+          .select({
+            channelId: importRunCoverages.telegramChatId,
+            endMessageId: importRunCoverages.endMessageId,
+            messageId: messages.id,
+            runId: importRunCoverages.runId,
+            startMessageId: importRunCoverages.startMessageId,
+            telegramMessageId: messages.telegramMessageId,
+          })
+          .from(importRunCoverages)
+          .innerJoin(importRuns, eq(importRuns.id, importRunCoverages.runId))
+          .innerJoin(
+            telegramChannels,
+            eq(telegramChannels.telegramChatId, importRunCoverages.telegramChatId),
+          )
+          .innerJoin(
+            messages,
+            and(
+              eq(messages.channelId, telegramChannels.id),
+              gte(messages.telegramMessageId, importRunCoverages.startMessageId),
+              lte(messages.telegramMessageId, importRunCoverages.endMessageId),
+            ),
+          )
+          .where(
+            and(
+              inArray(importRunCoverages.telegramChatId, scope),
+              eq(importRunCoverages.explicitlyComplete, true),
+              eq(importRuns.status, 'completed'),
+              sql`not exists (
+                select 1
+                from ${importRunObservations}
+                inner join ${messageSourceObservations}
+                  on ${messageSourceObservations.id} = ${importRunObservations.observationId}
+                where ${importRunObservations.runId} = ${importRunCoverages.runId}
+                  and ${messageSourceObservations.messageId} = ${messages.id}
+              )`,
+              cursor
+                ? sql`(
+                    ${importRunCoverages.telegramChatId},
+                    ${importRunCoverages.startMessageId},
+                    ${importRunCoverages.endMessageId},
+                    ${importRunCoverages.runId},
+                    ${messages.telegramMessageId}
+                  ) > (
+                    ${cursor.channelId},
+                    ${cursor.startMessageId},
+                    ${cursor.endMessageId},
+                    ${cursor.runId},
+                    ${cursor.telegramMessageId}
+                  )`
+                : undefined,
+            ),
+          )
+          .orderBy(
+            asc(importRunCoverages.telegramChatId),
+            asc(importRunCoverages.startMessageId),
+            asc(importRunCoverages.endMessageId),
+            asc(importRunCoverages.runId),
+            asc(messages.telegramMessageId),
+          )
+          .limit(RECONCILIATION_SCAN_BATCH_SIZE),
+      async (absence) => {
+        scanned += 1;
+        await visit({
+          channelId: absence.channelId.toString(),
+          evidenceIds: [
+            absence.runId,
+            `${absence.startMessageId.toString()}:${absence.endMessageId.toString()}`,
+          ],
+          evidenceVersion: 1,
+          kind: 'desktop_absence_candidate',
+          messageId: absence.messageId,
+          sanitizedReason:
+            'An explicitly complete Desktop range has no run lineage for this canonical message',
+          severity: 'warning',
+        });
+      },
+    );
+
     let lastMissingMediaObservationId: string | undefined;
     await forEachPage<MissingMediaScanRow>(
       (cursor) =>
@@ -510,8 +740,19 @@ async function forEachPage<T>(
   }
 }
 
-function uniqueTelegramIds(values: readonly bigint[]): bigint[] {
-  return [...new Set(values)].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+export function reconciliationScope(values: readonly bigint[]): bigint[] {
+  const scope = [...new Set(values)].sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  if (scope.length === 0) {
+    throw new ReconciliationScopeError('At least one Telegram channel ID is required');
+  }
+  if (scope.length > RECONCILIATION_SCAN_CHANNEL_LIMIT) {
+    throw new ReconciliationScopeError(
+      `A scan may include at most ${RECONCILIATION_SCAN_CHANNEL_LIMIT} channels`,
+    );
+  }
+  return scope;
 }
 
 function hashEvidence(value: string | null): string {
