@@ -8,6 +8,7 @@ import {
   messageMedia,
 } from '../db/schema.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import { recordLocalStorageReady } from './storage-ledger-repository.js';
 
 const THUMBNAIL_MAX_BYTES = 1024n * 1024n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -196,6 +197,16 @@ export class PostgresMediaCacheThumbnailLedgerRepository {
           })
           .where(eq(mediaCacheBlobs.sha256, blob.sha256));
       }
+      await recordLocalStorageReady(
+        tx,
+        {
+          byteLength: input.object.byteLength,
+          lastAccessedAt: afterPublish,
+          relativeKey: input.object.relativeKey,
+          sha256: input.object.sha256,
+        },
+        afterPublish,
+      );
       await tx
         .update(mediaCacheObjects)
         .set({

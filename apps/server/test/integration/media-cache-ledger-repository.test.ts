@@ -8,12 +8,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheObjectSources,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -27,6 +29,7 @@ import {
   PostgresMediaCacheLedgerRepository,
 } from '../../src/media-cache/ledger-repository.js';
 import { PostgresPublicMediaObjectRepository } from '../../src/media-cache/public-reader.js';
+import { StorageLedgerRepository } from '../../src/media-cache/storage-ledger-repository.js';
 import { PostgresMediaCacheThumbnailLedgerRepository } from '../../src/media-cache/thumbnail-ledger-repository.js';
 import { MediaCacheWorker } from '../../src/media-cache/worker.js';
 import { PostgresMediaCacheWorkerRepository } from '../../src/media-cache/worker-repository.js';
@@ -180,6 +183,8 @@ describe('PostgreSQL media cache ledger repository', () => {
   beforeEach(async () => {
     await connection?.db.execute(sql`
       truncate table
+        ${mediaBlobLocations},
+        ${mediaStorageBackends},
         ${mediaCacheActions},
         ${mediaCacheObjectSources},
         ${mediaCacheObjects},
@@ -243,6 +248,9 @@ describe('PostgreSQL media cache ledger repository', () => {
     const fixture = await createPlanFixture(connection, 1, ['video', 'video', 'video']);
     const repository = new PostgresMediaCacheLedgerRepository(connection.db);
     const leaseToken = randomUUID();
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * MIB, root: '/var/lib/koharu/test-media' },
+    });
 
     const claim = await repository.claimPostPlan({
       leaseExpiresAt: leaseExpiry(),
@@ -271,6 +279,33 @@ describe('PostgreSQL media cache ledger repository', () => {
       readyBytes: 48n * MIB,
       reservedBytes: 50n * MIB,
     });
+    const locations = await connection.db
+      .select({
+        state: mediaBlobLocations.state,
+        storageKey: mediaBlobLocations.storageKey,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+        verifiedSha256: mediaBlobLocations.verifiedSha256,
+      })
+      .from(mediaBlobLocations);
+    expect(locations).toHaveLength(3);
+    expect(locations).toEqual(
+      expect.arrayContaining(
+        Array.from({ length: 3 }, (_, index) => {
+          const sha256 = String(index + 1).repeat(64);
+          return {
+            state: 'ready',
+            storageKey: `blobs/${sha256.slice(0, 2)}/${sha256.slice(2, 4)}/${sha256}`,
+            verifiedByteLength: 16n * MIB,
+            verifiedSha256: sha256,
+          };
+        }),
+      ),
+    );
+    const [localBackend] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 'local'));
+    expect(localBackend?.readyBytes).toBe(48n * MIB);
 
     const completed = await repository.completeSettlement({
       leaseToken,
@@ -478,6 +513,9 @@ describe('PostgreSQL media cache ledger repository', () => {
     const repository = new PostgresMediaCacheLedgerRepository(connection.db);
     const firstToken = randomUUID();
     const secondToken = randomUUID();
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * MIB, root: '/var/lib/koharu/test-media' },
+    });
 
     await repository.claimPostPlan({
       leaseExpiresAt: leaseExpiry(),
@@ -525,6 +563,11 @@ describe('PostgreSQL media cache ledger repository', () => {
       readyBytes: 6n * MIB,
       reservedBytes: 10n * MIB,
     });
+    const [localBackend] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 'local'));
+    expect(localBackend?.readyBytes).toBe(6n * MIB);
     await expect(
       repository.completeSettlement({
         leaseToken: secondToken,
@@ -553,6 +596,9 @@ describe('PostgreSQL media cache ledger repository', () => {
     });
     const repository = new PostgresMediaCacheLedgerRepository(connection.db);
     const leaseToken = randomUUID();
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * MIB, root: '/var/lib/koharu/test-media' },
+    });
     await repository.claimPostPlan({
       leaseExpiresAt: leaseExpiry(),
       leaseOwner: 'worker-1',
@@ -571,6 +617,20 @@ describe('PostgreSQL media cache ledger repository', () => {
       physicalBytesAdded: 5n * MIB,
       readyBytes: 5n * MIB,
       reservedBytes: 10n * MIB,
+    });
+    const [localLocation] = await connection.db
+      .select({
+        readyBytes: mediaStorageBackends.readyBytes,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .innerJoin(mediaStorageBackends, eq(mediaStorageBackends.id, mediaBlobLocations.backendId))
+      .where(eq(mediaBlobLocations.blobSha256, sha256));
+    expect(localLocation).toEqual({
+      readyBytes: 5n * MIB,
+      state: 'ready',
+      verifiedByteLength: 5n * MIB,
     });
   });
 
@@ -1579,6 +1639,9 @@ describe('PostgreSQL media cache ledger repository', () => {
       throw new Error('Database connection was not created');
     }
     const fixture = await createPlanFixture(connection, 22, ['photo']);
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * MIB, root: '/var/lib/koharu/test-media' },
+    });
     const originals = new PostgresMediaCacheLedgerRepository(connection.db);
     const originalToken = randomUUID();
     await originals.claimPostPlan({
@@ -1643,6 +1706,14 @@ describe('PostgreSQL media cache ledger repository', () => {
       readyBytes: 1n * MIB + 500n,
       reservedBytes: 0n,
     });
+    const thumbnailLocation = await connection.db
+      .select({
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, thumbnailSha));
+    expect(thumbnailLocation).toEqual([{ state: 'ready', verifiedByteLength: 500n }]);
     const [plan] = await connection.db
       .select()
       .from(mediaCachePostPlans)

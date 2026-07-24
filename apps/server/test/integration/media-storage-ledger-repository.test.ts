@@ -6,6 +6,7 @@ import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/
 import { runMigrations } from '../../src/db/migrate.js';
 import { mediaBlobLocations, mediaCacheBlobs, mediaStorageBackends } from '../../src/db/schema.js';
 import {
+  reconcileLocalStorageLedger,
   type S3StorageBackendConfig,
   StorageLedgerRepository,
 } from '../../src/media-cache/storage-ledger-repository.js';
@@ -244,6 +245,106 @@ describe('storage ledger bootstrap', () => {
     expect(second.local.readyBytes).toBe(0n);
     expect(counts).toEqual({ backends: '2', locations: '1' });
     expect(localLocation?.state).toBe('evicted');
+  });
+
+  it('preserves fresh local mutation leases and only repairs expired locations', async () => {
+    if (!connection) throw new Error('Database connection was not created');
+    const copyingSha = await insertLegacyBlob(connection, {
+      byteLength: 100n,
+      seed: '5',
+      state: 'evicted',
+    });
+    const deletingSha = await insertLegacyBlob(connection, {
+      byteLength: 200n,
+      seed: '6',
+      state: 'ready',
+    });
+    const expiredSha = await insertLegacyBlob(connection, {
+      byteLength: 300n,
+      seed: '7',
+      state: 'ready',
+    });
+    await repository(connection).bootstrap({
+      local: { maxBytes: 2n * GIB, root: '/var/lib/koharu/media' },
+    });
+    const copyingToken = randomUUID();
+    const deletingToken = randomUUID();
+    const expiredToken = randomUUID();
+    const freshExpiry = new Date(Date.now() + 60_000);
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        mutationExpiresAt: freshExpiry,
+        mutationOwner: 'copy-worker',
+        mutationToken: copyingToken,
+        state: 'copying',
+      })
+      .where(eq(mediaBlobLocations.blobSha256, copyingSha));
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        mutationExpiresAt: freshExpiry,
+        mutationOwner: 'delete-worker',
+        mutationToken: deletingToken,
+        state: 'deleting',
+      })
+      .where(eq(mediaBlobLocations.blobSha256, deletingSha));
+    await connection.db
+      .update(mediaBlobLocations)
+      .set({
+        mutationExpiresAt: new Date('2000-01-01T00:00:00.000Z'),
+        mutationOwner: 'expired-worker',
+        mutationToken: expiredToken,
+        state: 'copying',
+        verifiedAt: null,
+        verifiedByteLength: null,
+        verifiedSha256: null,
+      })
+      .where(eq(mediaBlobLocations.blobSha256, expiredSha));
+    await connection.db
+      .update(mediaStorageBackends)
+      .set({ readyBytes: 9_999n })
+      .where(eq(mediaStorageBackends.id, 'local'));
+
+    await connection.db.transaction(async (transaction) => {
+      await reconcileLocalStorageLedger(transaction);
+    });
+
+    const locations = await connection.db
+      .select({
+        mutationToken: mediaBlobLocations.mutationToken,
+        sha256: mediaBlobLocations.blobSha256,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.backendId, 'local'))
+      .orderBy(asc(mediaBlobLocations.blobSha256));
+    expect(locations).toEqual([
+      {
+        mutationToken: copyingToken,
+        sha256: copyingSha,
+        state: 'copying',
+        verifiedByteLength: null,
+      },
+      {
+        mutationToken: deletingToken,
+        sha256: deletingSha,
+        state: 'deleting',
+        verifiedByteLength: 200n,
+      },
+      {
+        mutationToken: null,
+        sha256: expiredSha,
+        state: 'ready',
+        verifiedByteLength: 300n,
+      },
+    ]);
+    const [local] = await connection.db
+      .select({ readyBytes: mediaStorageBackends.readyBytes })
+      .from(mediaStorageBackends)
+      .where(eq(mediaStorageBackends.id, 'local'));
+    expect(local?.readyBytes).toBe(500n);
   });
 
   it('records a capacity downshift even when the local backend is already over budget', async () => {

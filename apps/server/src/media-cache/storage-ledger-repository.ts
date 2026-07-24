@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { and, asc, eq, gt, inArray, notExists, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { mediaBlobLocations, mediaCacheBlobs, mediaStorageBackends } from '../db/schema.js';
-import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-lock.js';
 
 export const LOCAL_STORAGE_BACKEND_ID = 'local';
 export const S3_STORAGE_BACKEND_ID = 's3-default';
@@ -40,6 +40,13 @@ export interface BootstrappedStorageBackend {
 export interface BootstrappedStorageLedger {
   local: BootstrappedStorageBackend;
   s3?: BootstrappedStorageBackend;
+}
+
+export interface LocalStorageLedgerBlob {
+  byteLength: bigint;
+  lastAccessedAt: Date;
+  relativeKey: string;
+  sha256: string;
 }
 
 type StorageBackendConfig =
@@ -182,6 +189,311 @@ export class StorageLedgerRepository {
 }
 
 type StorageLedgerTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+
+/**
+ * Keeps the additive local location ledger in step with the legacy blob ledger.
+ *
+ * These helpers deliberately no-op until bootstrap has created the local backend. That preserves
+ * phase compatibility for repository-level callers while runtime bootstrap remains the hard gate
+ * before any location-ledger consumer is enabled.
+ */
+export async function recordLocalStorageReady(
+  transaction: StorageLedgerTransaction,
+  blob: LocalStorageLedgerBlob,
+  verifiedAt: Date,
+): Promise<void> {
+  const backend = await lockLocalBackend(transaction);
+  if (!backend) return;
+
+  const existing = await lockLocalLocation(transaction, blob.sha256);
+  const wasPhysical = existing?.state === 'deleting' || existing?.state === 'ready';
+  await transaction
+    .insert(mediaBlobLocations)
+    .values({
+      backendId: LOCAL_STORAGE_BACKEND_ID,
+      blobSha256: blob.sha256,
+      lastAccessedAt: blob.lastAccessedAt,
+      state: 'ready',
+      storageKey: blob.relativeKey,
+      verifiedAt,
+      verifiedByteLength: blob.byteLength,
+      verifiedSha256: blob.sha256,
+    })
+    .onConflictDoUpdate({
+      target: [mediaBlobLocations.backendId, mediaBlobLocations.blobSha256],
+      set: {
+        lastAccessedAt: sql`greatest(
+          ${mediaBlobLocations.lastAccessedAt},
+          excluded.last_accessed_at
+        )`,
+        mutationExpiresAt: null,
+        mutationOwner: null,
+        mutationToken: null,
+        providerChecksumSha256: null,
+        providerEtag: null,
+        providerVersionId: null,
+        state: 'ready',
+        storageKey: blob.relativeKey,
+        updatedAt: verifiedAt,
+        verifiedAt,
+        verifiedByteLength: blob.byteLength,
+        verifiedSha256: blob.sha256,
+      },
+    });
+  if (!wasPhysical) {
+    await setLocalBackendReadyBytes(transaction, backend.readyBytes + blob.byteLength, verifiedAt);
+  }
+}
+
+export async function recordLocalStorageAccess(
+  transaction: StorageLedgerTransaction,
+  sha256: string,
+  observedAt: Date,
+): Promise<void> {
+  await transaction
+    .update(mediaBlobLocations)
+    .set({
+      lastAccessedAt: sql`greatest(
+        ${mediaBlobLocations.lastAccessedAt},
+        ${observedAt.toISOString()}::timestamptz
+      )`,
+      updatedAt: sql`clock_timestamp()`,
+    })
+    .where(
+      and(
+        eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+        eq(mediaBlobLocations.blobSha256, sha256),
+        eq(mediaBlobLocations.state, 'ready'),
+      ),
+    );
+}
+
+export async function claimLocalStorageDeletion(
+  transaction: StorageLedgerTransaction,
+  input: LocalStorageLedgerBlob & {
+    mutationExpiresAt: Date;
+    mutationOwner: string;
+    mutationToken: string;
+    now: Date;
+  },
+): Promise<void> {
+  const backend = await lockLocalBackend(transaction);
+  if (!backend) return;
+
+  const existing = await lockLocalLocation(transaction, input.sha256);
+  const wasPhysical = existing?.state === 'deleting' || existing?.state === 'ready';
+  await transaction
+    .insert(mediaBlobLocations)
+    .values({
+      backendId: LOCAL_STORAGE_BACKEND_ID,
+      blobSha256: input.sha256,
+      lastAccessedAt: input.lastAccessedAt,
+      mutationExpiresAt: input.mutationExpiresAt,
+      mutationOwner: input.mutationOwner,
+      mutationToken: input.mutationToken,
+      state: 'deleting',
+      storageKey: input.relativeKey,
+      updatedAt: input.now,
+      verifiedAt: input.now,
+      verifiedByteLength: input.byteLength,
+      verifiedSha256: input.sha256,
+    })
+    .onConflictDoUpdate({
+      target: [mediaBlobLocations.backendId, mediaBlobLocations.blobSha256],
+      set: {
+        lastAccessedAt: sql`greatest(
+          ${mediaBlobLocations.lastAccessedAt},
+          excluded.last_accessed_at
+        )`,
+        mutationExpiresAt: input.mutationExpiresAt,
+        mutationOwner: input.mutationOwner,
+        mutationToken: input.mutationToken,
+        providerChecksumSha256: null,
+        providerEtag: null,
+        providerVersionId: null,
+        state: 'deleting',
+        storageKey: input.relativeKey,
+        updatedAt: input.now,
+        verifiedAt: input.now,
+        verifiedByteLength: input.byteLength,
+        verifiedSha256: input.sha256,
+      },
+    });
+  if (!wasPhysical) {
+    await setLocalBackendReadyBytes(transaction, backend.readyBytes + input.byteLength, input.now);
+  }
+}
+
+export async function finalizeLocalStorageDeletion(
+  transaction: StorageLedgerTransaction,
+  input: {
+    byteLength: bigint;
+    mutationToken: string;
+    now: Date;
+    sha256: string;
+  },
+): Promise<void> {
+  const backend = await lockLocalBackend(transaction);
+  if (!backend) return;
+
+  const [location] = await transaction
+    .update(mediaBlobLocations)
+    .set({
+      mutationExpiresAt: null,
+      mutationOwner: null,
+      mutationToken: null,
+      providerChecksumSha256: null,
+      providerEtag: null,
+      providerVersionId: null,
+      state: 'evicted',
+      updatedAt: input.now,
+      verifiedAt: null,
+      verifiedByteLength: null,
+      verifiedSha256: null,
+    })
+    .where(
+      and(
+        eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+        eq(mediaBlobLocations.blobSha256, input.sha256),
+        eq(mediaBlobLocations.state, 'deleting'),
+        eq(mediaBlobLocations.mutationToken, input.mutationToken),
+      ),
+    )
+    .returning({ blobSha256: mediaBlobLocations.blobSha256 });
+  if (!location) {
+    throw new Error(`Local storage deletion lease for ${input.sha256} is stale`);
+  }
+  if (backend.readyBytes < input.byteLength) {
+    throw new Error('Local storage backend bytes are smaller than the evicted blob');
+  }
+  await setLocalBackendReadyBytes(transaction, backend.readyBytes - input.byteLength, input.now);
+}
+
+export async function restoreLocalStorageDeletion(
+  transaction: StorageLedgerTransaction,
+  input: {
+    mutationToken: string;
+    now: Date;
+    sha256: string;
+  },
+): Promise<void> {
+  const backend = await lockLocalBackend(transaction);
+  if (!backend) return;
+
+  const [location] = await transaction
+    .update(mediaBlobLocations)
+    .set({
+      mutationExpiresAt: null,
+      mutationOwner: null,
+      mutationToken: null,
+      state: 'ready',
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+        eq(mediaBlobLocations.blobSha256, input.sha256),
+        eq(mediaBlobLocations.state, 'deleting'),
+        eq(mediaBlobLocations.mutationToken, input.mutationToken),
+      ),
+    )
+    .returning({ blobSha256: mediaBlobLocations.blobSha256 });
+  if (!location) {
+    throw new Error(`Local storage deletion lease for ${input.sha256} is stale`);
+  }
+}
+
+export async function reconcileLocalStorageLedger(
+  transaction: StorageLedgerTransaction,
+): Promise<{ readyBytes: bigint; reconciled: boolean }> {
+  const backend = await lockLocalBackend(transaction);
+  if (!backend) return { readyBytes: 0n, reconciled: false };
+  const now = await readDatabaseClock(transaction);
+
+  let cursor: string | undefined;
+  while (true) {
+    const blobs = await transaction
+      .select({
+        byteLength: mediaCacheBlobs.byteLength,
+        createdAt: mediaCacheBlobs.createdAt,
+        evictionExpiresAt: mediaCacheBlobs.evictionExpiresAt,
+        evictionOwner: mediaCacheBlobs.evictionOwner,
+        evictionToken: mediaCacheBlobs.evictionToken,
+        lastAccessedAt: mediaCacheBlobs.lastAccessedAt,
+        relativeKey: mediaCacheBlobs.relativeKey,
+        sha256: mediaCacheBlobs.sha256,
+        state: mediaCacheBlobs.state,
+        updatedAt: mediaCacheBlobs.updatedAt,
+      })
+      .from(mediaCacheBlobs)
+      .where(cursor ? gt(mediaCacheBlobs.sha256, cursor) : undefined)
+      .orderBy(asc(mediaCacheBlobs.sha256))
+      .limit(BACKFILL_BATCH_SIZE);
+    if (blobs.length === 0) break;
+
+    const activeMutations = await transaction
+      .select({ blobSha256: mediaBlobLocations.blobSha256 })
+      .from(mediaBlobLocations)
+      .where(
+        and(
+          eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+          inArray(
+            mediaBlobLocations.blobSha256,
+            blobs.map((blob) => blob.sha256),
+          ),
+          inArray(mediaBlobLocations.state, ['copying', 'deleting']),
+          gt(mediaBlobLocations.mutationExpiresAt, now),
+        ),
+      );
+    const activelyMutatingHashes = new Set(activeMutations.map((location) => location.blobSha256));
+    for (const blob of blobs) {
+      if (activelyMutatingHashes.has(blob.sha256)) continue;
+      const physicallyPresent = blob.state === 'ready' || blob.state === 'deleting';
+      await transaction
+        .insert(mediaBlobLocations)
+        .values({
+          backendId: LOCAL_STORAGE_BACKEND_ID,
+          blobSha256: blob.sha256,
+          createdAt: blob.createdAt,
+          lastAccessedAt: blob.lastAccessedAt,
+          mutationExpiresAt: blob.state === 'deleting' ? blob.evictionExpiresAt : null,
+          mutationOwner: blob.state === 'deleting' ? blob.evictionOwner : null,
+          mutationToken: blob.state === 'deleting' ? blob.evictionToken : null,
+          state: blob.state,
+          storageKey: blob.relativeKey,
+          updatedAt: blob.updatedAt,
+          verifiedAt: physicallyPresent ? blob.updatedAt : null,
+          verifiedByteLength: physicallyPresent ? blob.byteLength : null,
+          verifiedSha256: physicallyPresent ? blob.sha256 : null,
+        })
+        .onConflictDoUpdate({
+          target: [mediaBlobLocations.backendId, mediaBlobLocations.blobSha256],
+          set: {
+            lastAccessedAt: blob.lastAccessedAt,
+            mutationExpiresAt: blob.state === 'deleting' ? blob.evictionExpiresAt : null,
+            mutationOwner: blob.state === 'deleting' ? blob.evictionOwner : null,
+            mutationToken: blob.state === 'deleting' ? blob.evictionToken : null,
+            providerChecksumSha256: null,
+            providerEtag: null,
+            providerVersionId: null,
+            state: blob.state,
+            storageKey: blob.relativeKey,
+            updatedAt: blob.updatedAt,
+            verifiedAt: physicallyPresent ? blob.updatedAt : null,
+            verifiedByteLength: physicallyPresent ? blob.byteLength : null,
+            verifiedSha256: physicallyPresent ? blob.sha256 : null,
+          },
+        });
+    }
+
+    cursor = blobs.at(-1)?.sha256;
+    if (blobs.length < BACKFILL_BATCH_SIZE || !cursor) break;
+  }
+
+  const readyBytes = await sumLocationReadyBytes(transaction, LOCAL_STORAGE_BACKEND_ID);
+  await setLocalBackendReadyBytes(transaction, readyBytes, now, true);
+  return { readyBytes, reconciled: true };
+}
 
 interface UpsertBackendInput {
   configFingerprint: string;
@@ -326,6 +638,51 @@ async function sumLocationReadyBytes(
       ),
     );
   return BigInt(result?.readyBytes ?? '0');
+}
+
+async function lockLocalBackend(
+  transaction: StorageLedgerTransaction,
+): Promise<{ readyBytes: bigint } | null> {
+  const [backend] = await transaction
+    .select({ readyBytes: mediaStorageBackends.readyBytes })
+    .from(mediaStorageBackends)
+    .where(eq(mediaStorageBackends.id, LOCAL_STORAGE_BACKEND_ID))
+    .for('update');
+  return backend ?? null;
+}
+
+async function lockLocalLocation(transaction: StorageLedgerTransaction, sha256: string) {
+  const [location] = await transaction
+    .select({ state: mediaBlobLocations.state })
+    .from(mediaBlobLocations)
+    .where(
+      and(
+        eq(mediaBlobLocations.backendId, LOCAL_STORAGE_BACKEND_ID),
+        eq(mediaBlobLocations.blobSha256, sha256),
+      ),
+    )
+    .for('update');
+  return location ?? null;
+}
+
+async function setLocalBackendReadyBytes(
+  transaction: StorageLedgerTransaction,
+  readyBytes: bigint,
+  now: Date,
+  reconciled = false,
+): Promise<void> {
+  const [backend] = await transaction
+    .update(mediaStorageBackends)
+    .set({
+      ...(reconciled ? { lastReconciledAt: now } : {}),
+      readyBytes,
+      updatedAt: now,
+    })
+    .where(eq(mediaStorageBackends.id, LOCAL_STORAGE_BACKEND_ID))
+    .returning({ id: mediaStorageBackends.id });
+  if (!backend) {
+    throw new Error('Local storage backend disappeared while updating its byte ledger');
+  }
 }
 
 async function updateBackendReadyBytes(

@@ -10,6 +10,12 @@ import {
 import type { MediaCacheAccessWriter, MediaCacheBlobAccess } from './access-coalescer.js';
 import type { MediaBlobEvictionResult, MediaBlobIdentity } from './blob-store.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import {
+  claimLocalStorageDeletion,
+  finalizeLocalStorageDeletion,
+  recordLocalStorageAccess,
+  restoreLocalStorageDeletion,
+} from './storage-ledger-repository.js';
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -92,16 +98,21 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
     }
 
     await this.database.transaction(async (transaction) => {
+      await lockLedger(transaction);
       for (const [sha256, observedAt] of [...latestByHash].sort(([left], [right]) =>
         left.localeCompare(right),
       )) {
-        await transaction
+        const [accessed] = await transaction
           .update(mediaCacheBlobs)
           .set({
             lastAccessedAt: sql`greatest(${mediaCacheBlobs.lastAccessedAt}, ${observedAt.toISOString()}::timestamptz)`,
             updatedAt: sql`clock_timestamp()`,
           })
-          .where(and(eq(mediaCacheBlobs.sha256, sha256), eq(mediaCacheBlobs.state, 'ready')));
+          .where(and(eq(mediaCacheBlobs.sha256, sha256), eq(mediaCacheBlobs.state, 'ready')))
+          .returning({ sha256: mediaCacheBlobs.sha256 });
+        if (accessed) {
+          await recordLocalStorageAccess(transaction, sha256, observedAt);
+        }
       }
     });
   }
@@ -177,6 +188,13 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
           'Media cache eviction candidate changed while it was locked',
         );
       }
+      await claimLocalStorageDeletion(transaction, {
+        ...blob,
+        mutationExpiresAt: input.evictionExpiresAt,
+        mutationOwner: input.evictionOwner.trim(),
+        mutationToken: input.evictionToken,
+        now,
+      });
       return {
         ...blob,
         evictionExpiresAt: new Date(input.evictionExpiresAt),
@@ -306,6 +324,12 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
           updatedAt: now,
         })
         .where(eq(mediaCacheBlobs.sha256, blob.sha256));
+      await finalizeLocalStorageDeletion(transaction, {
+        byteLength: blob.byteLength,
+        mutationToken: input.evictionToken,
+        now,
+        sha256: blob.sha256,
+      });
       const [updatedRuntime] = await transaction
         .update(mediaCacheRuntime)
         .set({
@@ -354,6 +378,7 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
 
     await this.database.transaction(async (transaction) => {
       await lockLedger(transaction);
+      const now = await readDatabaseClock(transaction);
       const [blob] = await transaction
         .select({
           evictionToken: mediaCacheBlobs.evictionToken,
@@ -375,9 +400,14 @@ class PostgresMediaCacheEvictionProtocol implements MediaCacheAccessWriter {
           evictionOwner: null,
           evictionToken: null,
           state: 'ready',
-          updatedAt: sql`clock_timestamp()`,
+          updatedAt: now,
         })
         .where(eq(mediaCacheBlobs.sha256, input.sha256));
+      await restoreLocalStorageDeletion(transaction, {
+        mutationToken: input.evictionToken,
+        now,
+        sha256: input.sha256,
+      });
     });
   }
 }

@@ -21,6 +21,7 @@ import {
 } from './blob-store.js';
 import { MediaCacheEvictionService } from './eviction-repository.js';
 import { MEDIA_CACHE_ADVISORY_LOCK } from './ledger-repository.js';
+import { reconcileLocalStorageLedger } from './storage-ledger-repository.js';
 
 const MAX_MAINTENANCE_BATCH = 100;
 const EVICTION_LEASE_MS = 2 * 60_000;
@@ -292,6 +293,7 @@ export class MediaCacheMaintenanceService {
             reason: input.initiator.reason.trim(),
           });
         }
+        await reconcileLocalStorageLedger(transaction);
       }
       return {
         drift,

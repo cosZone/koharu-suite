@@ -8,12 +8,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import {
+  mediaBlobLocations,
   mediaCacheActions,
   mediaCacheBlobs,
   mediaCacheObjectSources,
   mediaCacheObjects,
   mediaCachePostPlans,
   mediaCacheRuntime,
+  mediaStorageBackends,
   messageMedia,
   messageRevisions,
   messages,
@@ -26,6 +28,7 @@ import {
   type MediaCacheEvictionError,
   MediaCacheEvictionService,
 } from '../../src/media-cache/eviction-repository.js';
+import { StorageLedgerRepository } from '../../src/media-cache/storage-ledger-repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const SHA_A = 'a'.repeat(64);
@@ -86,6 +89,9 @@ async function createBackedReadyBlob(
     BigInt(local.published.byteLength),
     new Date('2026-07-24T01:00:00.000Z'),
   );
+  await new StorageLedgerRepository(connection.db).bootstrap({
+    local: { maxBytes: 5n * 1024n * 1024n * 1024n, root: local.root },
+  });
   await createReadyPlan(connection, {
     blobSha256: local.published.sha256,
     byteLength: BigInt(local.published.byteLength),
@@ -316,6 +322,8 @@ describe('PostgreSQL media cache eviction repository', () => {
     }
     await connection.db.execute(sql`
       truncate table
+        ${mediaBlobLocations},
+        ${mediaStorageBackends},
         ${mediaCacheActions},
         ${mediaCacheObjectSources},
         ${mediaCacheObjects},
@@ -334,6 +342,9 @@ describe('PostgreSQL media cache eviction repository', () => {
     const initial = new Date('2026-07-24T01:00:00.000Z');
     const newest = new Date('2026-07-24T03:00:00.000Z');
     await insertBlob(connection, SHA_A, 100n, initial);
+    await new StorageLedgerRepository(connection.db).bootstrap({
+      local: { maxBytes: 5n * 1024n * 1024n * 1024n, root: '/var/lib/koharu/test-media' },
+    });
     const writer = createPostgresMediaCacheAccessWriter(connection.db);
 
     await writer.writeAccesses([
@@ -343,12 +354,26 @@ describe('PostgreSQL media cache eviction repository', () => {
     await writer.writeAccesses([
       { observedAt: new Date('2026-07-24T00:00:00.000Z'), sha256: SHA_A },
     ]);
+    await writer.writeAccesses([{ observedAt: newest, sha256: SHA_B }]);
 
     const [blob] = await connection.db
-      .select({ lastAccessedAt: mediaCacheBlobs.lastAccessedAt })
+      .select({
+        blobLastAccessedAt: mediaCacheBlobs.lastAccessedAt,
+        locationLastAccessedAt: mediaBlobLocations.lastAccessedAt,
+      })
       .from(mediaCacheBlobs)
+      .innerJoin(mediaBlobLocations, eq(mediaBlobLocations.blobSha256, mediaCacheBlobs.sha256))
       .where(eq(mediaCacheBlobs.sha256, SHA_A));
-    expect(blob?.lastAccessedAt).toEqual(newest);
+    expect(blob).toEqual({
+      blobLastAccessedAt: newest,
+      locationLastAccessedAt: newest,
+    });
+    await expect(
+      connection.db
+        .select({ sha256: mediaBlobLocations.blobSha256 })
+        .from(mediaBlobLocations)
+        .where(eq(mediaBlobLocations.blobSha256, SHA_B)),
+    ).resolves.toEqual([]);
     await expect(
       writer.writeAccesses(
         Array.from({ length: 101 }, (_, index) => ({
@@ -541,6 +566,22 @@ describe('PostgreSQL media cache eviction repository', () => {
     await expect(readFile(join(root, published.relativeKey))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    const [ledger] = await connection.db
+      .select({
+        mutationToken: mediaBlobLocations.mutationToken,
+        readyBytes: mediaStorageBackends.readyBytes,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .innerJoin(mediaStorageBackends, eq(mediaStorageBackends.id, mediaBlobLocations.backendId))
+      .where(eq(mediaBlobLocations.blobSha256, published.sha256));
+    expect(ledger).toEqual({
+      mutationToken: null,
+      readyBytes: 0n,
+      state: 'evicted',
+      verifiedByteLength: null,
+    });
   });
 
   it('restores the ready database state when the supported service cannot unlink', async () => {
@@ -573,6 +614,19 @@ describe('PostgreSQL media cache eviction repository', () => {
       .from(mediaCacheBlobs)
       .where(eq(mediaCacheBlobs.sha256, published.sha256));
     expect(blob).toEqual({ evictionToken: null, state: 'ready' });
+    const [location] = await connection.db
+      .select({
+        mutationToken: mediaBlobLocations.mutationToken,
+        state: mediaBlobLocations.state,
+        verifiedByteLength: mediaBlobLocations.verifiedByteLength,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, published.sha256));
+    expect(location).toEqual({
+      mutationToken: null,
+      state: 'ready',
+      verifiedByteLength: BigInt(published.byteLength),
+    });
     await expect(readFile(replacementTarget, 'utf8')).resolves.toBe('must survive');
   });
 
@@ -669,6 +723,21 @@ describe('PostgreSQL media cache eviction repository', () => {
       initiator: { kind: 'worker' },
     });
     await firstWorkerOpened;
+    const [deletingLocation] = await connection.db
+      .select({
+        mutationExpiresAt: mediaBlobLocations.mutationExpiresAt,
+        mutationOwner: mediaBlobLocations.mutationOwner,
+        mutationToken: mediaBlobLocations.mutationToken,
+        state: mediaBlobLocations.state,
+      })
+      .from(mediaBlobLocations)
+      .where(eq(mediaBlobLocations.blobSha256, published.sha256));
+    expect(deletingLocation).toEqual({
+      mutationExpiresAt: firstClaim.evictionExpiresAt,
+      mutationOwner: firstClaim.evictionOwner,
+      mutationToken: firstClaim.evictionToken,
+      state: 'deleting',
+    });
     await connection.db
       .update(mediaCacheBlobs)
       .set({ evictionExpiresAt: new Date('2000-01-01T00:00:00.000Z') })
