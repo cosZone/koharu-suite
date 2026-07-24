@@ -12,13 +12,13 @@ Telegram 多频道归档、动态内容、统一管理与静态发布能力。
 - 内容与媒体可导出、可恢复，移除后端不影响既有静态站点；
 - 以 PostgreSQL 18、Astro 6 Live Content Collections 和开放 JSON API 为基础。
 
-当前 [G2.4 #24](https://github.com/cosZone/koharu-suite/issues/24) 在多频道归档与可审计恢复之上增加了
-可选的 local hot tier 与 S3-compatible durable cached tier：
+当前 [G2.5 #26](https://github.com/cosZone/koharu-suite/issues/26) 在多频道归档、可审计恢复和
+local/S3-compatible 媒体层之上增加了公开搜索与 RSS：
 
-- `apps/server`：Hono API、PostgreSQL 账本、crash-safe content-addressed storage、Bot/显式
-  Desktop 缓存、bounded thumbnail、server-proxied media route 与 `kodama media` 运维命令；
-- `apps/admin`：React + Vite Owner Desk，支持脱敏状态、copy/restore、protection、policy、
-  prune preview/apply、retry、evict 与 reconcile；
+- `apps/server`：Hono API、PostgreSQL 18 `pg_trgm` current-revision 搜索、全局/频道 RSS 2.0、
+  PostgreSQL 账本、crash-safe content-addressed storage 与 `kodama` 运维命令；
+- `apps/admin`：React + Vite Owner Desk，支持搜索/feed 入口、脱敏状态、copy/restore、protection、
+  policy、prune、retry、evict 与 reconcile；
 - PostgreSQL 18、Testcontainers、Docker Compose 与 CI。
 
 完整路线图见 [Roadmap #1](https://github.com/cosZone/koharu-suite/issues/1)。
@@ -27,6 +27,8 @@ Telegram gap、Desktop 辅助恢复、显式修复与 tombstone 规则见
 [对账与恢复手册](./docs/reconciliation/README.md)。
 媒体存储的容量、S3 配置、隐私、备份、回滚与崩溃恢复见
 [媒体缓存运维手册](./docs/media-cache/README.md)。
+搜索参数、短词边界、RSS cache、`pg_trgm` 权限与故障排查见
+[搜索与 RSS 运维手册](./docs/search-rss/README.md)。
 
 ## 本地开发
 
@@ -136,12 +138,19 @@ curl http://localhost:3000/api/v1/channels
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50"
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50&cursor=<nextCursor>"
 curl http://localhost:3000/api/v1/messages/<suiteMessageId>
+curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro 6"
+curl http://localhost:3000/api/v1/rss.xml
+curl http://localhost:3000/api/v1/channels/<suiteChannelId>/rss.xml
 ```
 
 消息列表返回 `{ items, nextCursor }`；`limit` 默认为 50，范围 1–100，`cursor` 是与频道绑定的
 opaque 值，不应由客户端解析或修改。归档 revision 会保存 escaped text/entities 生成的安全 HTML；
 renderer 升级后可在 Owner Desk 运行 “Rerender outdated”，只更新派生 HTML/version，不改 revision
 历史。
+
+搜索只读取未 tombstone 的 current revision。3 字符以上默认按相关性排序；1–2 字符必须限制到一个
+频道、明确不超过 31 天的 UTC 时间窗口，并按最新排序。全局/频道 RSS 2.0 各固定最多 50 条且不分页，
+支持 GET、HEAD、ETag 与 304。完整合同见[搜索与 RSS 运维手册](./docs/search-rss/README.md)。
 
 公开 API 使用稳定的 suite ID。M1 只归档 Telegram 媒体元数据，不下载文件。公开响应不会包含原始
 update、Telegram 数字 ID、内部 file ID 或 Bot token。原始 update 只由 owner/session 或具有

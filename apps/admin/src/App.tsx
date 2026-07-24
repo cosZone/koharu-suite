@@ -16,8 +16,10 @@ import {
   Fragment,
   type ReactNode,
   useEffect,
+  useRef,
   useState,
 } from 'react';
+import { SearchAndFeedsPanel, type SearchPublicMessage } from './SearchAndFeedsPanel';
 import { startStatusPoller } from './status-poller';
 
 const authClient = createAuthClient({
@@ -1771,6 +1773,7 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [mediaCachePrunePreview, setMediaCachePrunePreview] =
     useState<MediaCachePrunePreview | null>(null);
   const [mediaCacheReasons, setMediaCacheReasons] = useState<Record<string, string>>({});
+  const messageSelectionVersion = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1863,14 +1866,17 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     }
 
     const controller = new AbortController();
+    const selectionVersion = messageSelectionVersion.current;
     fetchJson<{ items: Message[] }>(
       `/api/v1/messages?channel=${encodeURIComponent(selectedChannel)}`,
       { signal: controller.signal },
     )
       .then((result) => {
         setMessages(result.items);
-        setSelectedMessage(result.items[0] ?? null);
-        setRaw(null);
+        if (messageSelectionVersion.current === selectionVersion) {
+          setSelectedMessage(result.items[0] ?? null);
+          setRaw(null);
+        }
       })
       .catch((reason: unknown) => {
         if (reason instanceof DOMException && reason.name === 'AbortError') {
@@ -1900,6 +1906,17 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     } finally {
       setRawLoading(false);
     }
+  }
+
+  function selectArchiveChannel(channelId: string) {
+    messageSelectionVersion.current += 1;
+    setSelectedChannel(channelId);
+  }
+
+  function selectSearchMessage(message: SearchPublicMessage) {
+    messageSelectionVersion.current += 1;
+    setSelectedMessage(message);
+    setRaw(null);
   }
 
   async function actOnTask(task: BlockedTask, action: 'retry' | 'skip', reason: string) {
@@ -2423,7 +2440,7 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               <button
                 className={selectedChannel === channel.id ? 'is-active' : ''}
                 key={channel.id}
-                onClick={() => setSelectedChannel(channel.id)}
+                onClick={() => selectArchiveChannel(channel.id)}
                 type="button"
               >
                 <span>{channel.title}</span>
@@ -2541,6 +2558,8 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
               )}
             </Panel>
           </div>
+
+          <SearchAndFeedsPanel channels={channels} onSelectMessage={selectSearchMessage} />
 
           <OperationsPanel
             blockedTasks={blockedTasks}

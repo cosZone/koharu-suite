@@ -1,0 +1,2 @@
+CREATE INDEX "message_revisions_text_trgm_idx" ON "message_revisions" USING gin ("text" gin_trgm_ops) WHERE "message_revisions"."text" is not null;--> statement-breakpoint
+CREATE INDEX "messages_public_published_idx" ON "messages" USING btree ("published_at","id") WHERE "messages"."tombstoned_at" is null;

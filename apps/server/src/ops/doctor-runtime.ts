@@ -7,6 +7,7 @@ import type {
   DoctorDatabaseDiagnostics,
   DoctorMediaCacheLedgerSnapshot,
   DoctorOwner,
+  DoctorSearchCapabilitySnapshot,
   DoctorTelegramBot,
   DoctorTelegramChannel,
   DoctorTelegramChat,
@@ -16,6 +17,11 @@ import type {
 
 interface PostgresVersionRow extends Record<string, unknown> {
   serverVersionNum: string;
+}
+
+interface SearchCapabilityRow extends Record<string, unknown> {
+  indexDefinition: string | null;
+  pgTrgmVersion: string | null;
 }
 
 interface SchemaColumnRow extends Record<string, unknown> {
@@ -91,6 +97,34 @@ export class PostgresDoctorDiagnostics implements DoctorDatabaseDiagnostics {
       throw new Error('PostgreSQL did not return a valid server_version_num');
     }
     return Math.floor(Number(serverVersionNum) / 10_000);
+  }
+
+  async getSearchCapabilitySnapshot(): Promise<DoctorSearchCapabilitySnapshot> {
+    const result = await this.database.execute<SearchCapabilityRow>(sql`
+      select
+        (
+          select extversion
+          from pg_extension
+          where extname = 'pg_trgm'
+        ) as "pgTrgmVersion",
+        pg_get_indexdef(
+          to_regclass('public.message_revisions_text_trgm_idx')
+        ) as "indexDefinition"
+    `);
+    const row = result[0];
+    if (!row) {
+      throw new Error('PostgreSQL did not return a search capability snapshot');
+    }
+    if (
+      (row.indexDefinition !== null && typeof row.indexDefinition !== 'string') ||
+      (row.pgTrgmVersion !== null && typeof row.pgTrgmVersion !== 'string')
+    ) {
+      throw new Error('PostgreSQL returned an invalid search capability snapshot');
+    }
+    return {
+      indexDefinition: row.indexDefinition,
+      pgTrgmVersion: row.pgTrgmVersion,
+    };
   }
 
   async getMediaCacheLedgerSnapshot(): Promise<DoctorMediaCacheLedgerSnapshot> {

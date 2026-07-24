@@ -1,4 +1,18 @@
-import { and, asc, desc, eq, inArray, isNull, lt, or, type SQL, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  or,
+  type SQL,
+  sql,
+} from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   mediaCacheObjects,
@@ -13,8 +27,20 @@ import {
 import type { NormalizedChannelPost } from '../telegram/types.js';
 import { CURRENT_MESSAGE_FINGERPRINT_VERSION, fingerprintMessageSnapshot } from './fingerprint.js';
 import { CURRENT_RENDERER_VERSION, renderTelegramMessage } from './renderer.js';
+import type { MessageFeed } from './rss.js';
+import {
+  escapeLikePattern,
+  type MessageSearchCursor,
+  type MessageSearchItem,
+  type MessageSearchOptions,
+  type MessageSearchPage,
+  messageSearchQueryHash,
+  messageSearchSnippet,
+  unicodeLength,
+} from './search.js';
 import { lockSourceEvidenceDiscovery } from './source-evidence-coordination.js';
 import type {
+  MessageDiscoveryReader,
   MessageListOptions,
   MessagePage,
   MessageReader,
@@ -227,7 +253,9 @@ function publicMessage(row: MessageRow, media: PublicMedia[]): PublicMessage {
   };
 }
 
-export class PostgresMessageRepository implements MessageReader, MessageWriter {
+export class PostgresMessageRepository
+  implements MessageDiscoveryReader, MessageReader, MessageWriter
+{
   private readonly mediaCacheEnabled: boolean;
 
   constructor(
@@ -682,6 +710,153 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
     return message ?? null;
   }
 
+  async getFeed(channelId?: string): Promise<MessageFeed | null> {
+    let channel: MessageFeed['channel'] = null;
+    if (channelId !== undefined) {
+      const [row] = await this.database
+        .select({
+          id: telegramChannels.id,
+          title: telegramChannels.title,
+          updatedAt: telegramChannels.updatedAt,
+          username: telegramChannels.username,
+        })
+        .from(telegramChannels)
+        .where(eq(telegramChannels.id, channelId))
+        .limit(1);
+      if (!row) {
+        return null;
+      }
+      channel = {
+        id: row.id,
+        title: row.title,
+        updatedAt: row.updatedAt.toISOString(),
+        username: row.username,
+      };
+    }
+
+    const rows = await this.selectMessages(
+      channelId === undefined ? undefined : eq(messages.channelId, channelId),
+      50,
+    );
+    const items = rows.map((row) => publicMessage(row, []));
+    const latestMessageUpdate = rows.reduce<Date | null>((latest, row) => {
+      const rowUpdate = row.channelUpdatedAt > row.updatedAt ? row.channelUpdatedAt : row.updatedAt;
+      return !latest || rowUpdate > latest ? rowUpdate : latest;
+    }, null);
+    const channelUpdate = channel ? new Date(channel.updatedAt) : null;
+    const updatedAt =
+      latestMessageUpdate && channelUpdate
+        ? latestMessageUpdate > channelUpdate
+          ? latestMessageUpdate
+          : channelUpdate
+        : (latestMessageUpdate ?? channelUpdate);
+
+    return {
+      channel,
+      items,
+      updatedAt: updatedAt?.toISOString() ?? null,
+    };
+  }
+
+  async searchMessages(options: MessageSearchOptions): Promise<MessageSearchPage | null> {
+    if (options.channelId !== null) {
+      const [channel] = await this.database
+        .select({ id: telegramChannels.id })
+        .from(telegramChannels)
+        .where(eq(telegramChannels.id, options.channelId))
+        .limit(1);
+      if (!channel) {
+        return null;
+      }
+    }
+
+    const snapshotAt = options.cursor?.snapshotAt ?? (await this.databaseSnapshotAt());
+    const score =
+      options.sort === 'relevance'
+        ? sql<number>`word_similarity(${options.query}, ${messageRevisions.text})`
+        : sql<number>`0`;
+    const literalPattern = `%${escapeLikePattern(options.query)}%`;
+    const cursorWhere = this.searchCursorWhere(options.sort, score, options.cursor);
+    const rows = await this.database
+      .select({
+        authorSignature: messageRevisions.authorSignature,
+        channelId: telegramChannels.id,
+        channelTitle: telegramChannels.title,
+        channelUpdatedAt: telegramChannels.updatedAt,
+        channelUsername: telegramChannels.username,
+        contentKind: messageRevisions.contentKind,
+        entities: messageRevisions.entities,
+        html: messageRevisions.html,
+        mediaGroupId: messageRevisions.mediaGroupId,
+        messageId: messages.id,
+        publishedAt: messages.publishedAt,
+        revisionId: messageRevisions.id,
+        revisionNumber: messageRevisions.revisionNumber,
+        score,
+        telegramMessageId: messages.telegramMessageId,
+        text: messageRevisions.text,
+        updatedAt: messages.updatedAt,
+      })
+      .from(messages)
+      .innerJoin(telegramChannels, eq(telegramChannels.id, messages.channelId))
+      .innerJoin(
+        messageRevisions,
+        and(
+          eq(messageRevisions.messageId, messages.id),
+          eq(messageRevisions.revisionNumber, messages.currentRevisionNumber),
+        ),
+      )
+      .where(
+        and(
+          isNull(messages.tombstonedAt),
+          isNotNull(messageRevisions.text),
+          lte(messages.createdAt, new Date(snapshotAt)),
+          lte(messages.updatedAt, new Date(snapshotAt)),
+          options.channelId === null ? undefined : eq(messages.channelId, options.channelId),
+          options.from === null ? undefined : gte(messages.publishedAt, new Date(options.from)),
+          options.to === null ? undefined : lt(messages.publishedAt, new Date(options.to)),
+          sql`${messageRevisions.text} ILIKE ${literalPattern} ESCAPE '\\'`,
+          cursorWhere,
+        ),
+      )
+      .orderBy(
+        ...(options.sort === 'relevance' ? [desc(score)] : []),
+        desc(messages.publishedAt),
+        desc(messages.id),
+      )
+      .limit(options.limit + 1);
+    const hasMore = rows.length > options.limit;
+    const pageRows = rows.slice(0, options.limit);
+    const publicMessages = await this.attachMedia(pageRows);
+    const scoreByMessage = new Map(
+      pageRows.map((row) => [row.messageId, Number(row.score)] as const),
+    );
+    const textByMessage = new Map(pageRows.map((row) => [row.messageId, row.text ?? ''] as const));
+    const items: MessageSearchItem[] = publicMessages.map((message) => ({
+      match: {
+        score: options.sort === 'relevance' ? (scoreByMessage.get(message.id) ?? 0) : null,
+        snippet: messageSearchSnippet(textByMessage.get(message.id) ?? '', options.query),
+      },
+      message,
+    }));
+    const last = pageRows.at(-1);
+    const queryHash = messageSearchQueryHash(options);
+    return {
+      items,
+      mode: unicodeLength(options.query) < 3 ? 'short_substring' : 'trigram',
+      nextCursor:
+        hasMore && last
+          ? {
+              messageId: last.messageId,
+              publishedAt: last.publishedAt.toISOString(),
+              queryHash,
+              score: options.sort === 'relevance' ? Number(last.score) : null,
+              snapshotAt,
+            }
+          : null,
+    };
+  }
+
   private async selectIdentity(
     transaction: DatabaseTransaction,
     channelId: string,
@@ -884,6 +1059,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
         authorSignature: messageRevisions.authorSignature,
         channelId: telegramChannels.id,
         channelTitle: telegramChannels.title,
+        channelUpdatedAt: telegramChannels.updatedAt,
         channelUsername: telegramChannels.username,
         contentKind: messageRevisions.contentKind,
         entities: messageRevisions.entities,
@@ -895,6 +1071,7 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
         revisionNumber: messageRevisions.revisionNumber,
         telegramMessageId: messages.telegramMessageId,
         text: messageRevisions.text,
+        updatedAt: messages.updatedAt,
       })
       .from(messages)
       .innerJoin(telegramChannels, eq(telegramChannels.id, messages.channelId))
@@ -908,6 +1085,50 @@ export class PostgresMessageRepository implements MessageReader, MessageWriter {
       .where(and(where, isNull(messages.tombstonedAt)))
       .orderBy(desc(messages.publishedAt), desc(messages.id))
       .limit(limit);
+  }
+
+  private searchCursorWhere(
+    sort: MessageSearchOptions['sort'],
+    score: SQL<number>,
+    cursor: MessageSearchCursor | undefined,
+  ): SQL | undefined {
+    if (!cursor) {
+      return undefined;
+    }
+    const publishedAt = new Date(cursor.publishedAt);
+    const newestTail = or(
+      lt(messages.publishedAt, publishedAt),
+      and(eq(messages.publishedAt, publishedAt), lt(messages.id, cursor.messageId)),
+    );
+    if (sort === 'newest') {
+      return newestTail;
+    }
+    const cursorScore = cursor.score;
+    if (cursorScore === null) {
+      throw new Error('Relevance cursor is missing its score');
+    }
+    return or(
+      lt(score, cursorScore),
+      and(
+        eq(score, cursorScore),
+        or(
+          lt(messages.publishedAt, publishedAt),
+          and(eq(messages.publishedAt, publishedAt), lt(messages.id, cursor.messageId)),
+        ),
+      ),
+    );
+  }
+
+  private async databaseSnapshotAt(): Promise<string> {
+    const result = await this.database.execute<{ snapshotAt: Date | string }>(
+      sql`select clock_timestamp() as "snapshotAt"`,
+    );
+    const value = result[0]?.snapshotAt;
+    const timestamp = value instanceof Date ? value : new Date(value ?? Number.NaN);
+    if (!Number.isFinite(timestamp.getTime())) {
+      throw new Error('PostgreSQL did not return a valid discovery snapshot timestamp');
+    }
+    return timestamp.toISOString();
   }
 
   private async attachMedia(rows: MessageRow[]): Promise<PublicMessage[]> {

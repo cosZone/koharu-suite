@@ -29,6 +29,11 @@ function createDatabase(
       runtimeRowCount: 0n,
     })),
     getPostgresMajorVersion: vi.fn(async () => 18),
+    getSearchCapabilitySnapshot: vi.fn(async () => ({
+      indexDefinition:
+        'CREATE INDEX message_revisions_text_trgm_idx ON public.message_revisions USING gin (text gin_trgm_ops) WHERE (text IS NOT NULL)',
+      pgTrgmVersion: '1.6',
+    })),
     listEnabledChannels: vi.fn(async () => [
       {
         telegramChatId: -1_002_234_260_754n,
@@ -87,6 +92,7 @@ describe('kodama doctor diagnostics', () => {
       'config',
       'postgres-version',
       'database-schema',
+      'search',
       'media-cache-ledger',
       'owner',
       'telegram-bot',
@@ -141,6 +147,7 @@ describe('kodama doctor diagnostics', () => {
     );
 
     expect(warningReport.checks.map((check) => check.status)).toEqual([
+      'ok',
       'ok',
       'ok',
       'ok',
@@ -224,6 +231,67 @@ describe('kodama doctor diagnostics', () => {
     expect(report.checks.find((check) => check.id === 'owner')?.status).toBe('fail');
     expect(report.checks.find((check) => check.id === 'telegram-bot')?.status).toBe('fail');
     expect(doctorHasFailures(report)).toBe(true);
+  });
+
+  it('fails search capability checks without exposing index definitions or database errors', async () => {
+    const malformedDefinition =
+      'CREATE INDEX message_revisions_text_trgm_idx ON public.message_revisions USING btree (text)';
+    const incompleteReport = await runDoctor(
+      createDependencies({
+        database: createDatabase({
+          getSearchCapabilitySnapshot: vi.fn(async () => ({
+            indexDefinition: malformedDefinition,
+            pgTrgmVersion: null,
+          })),
+        }),
+      }),
+    );
+    const incompleteOutput = renderDoctorReport(incompleteReport);
+
+    expect(incompleteReport.checks.find((check) => check.id === 'search')).toEqual({
+      details: [
+        'Missing PostgreSQL extension: pg_trgm',
+        'Index public.message_revisions_text_trgm_idx does not provide the required GIN gin_trgm_ops partial definition',
+        'Fix: run kodama migrate',
+      ],
+      id: 'search',
+      label: 'Search',
+      message: 'Search database capability is incomplete',
+      status: 'fail',
+    });
+    expect(incompleteOutput).not.toContain(malformedDefinition);
+
+    const missingIndexReport = await runDoctor(
+      createDependencies({
+        database: createDatabase({
+          getSearchCapabilitySnapshot: vi.fn(async () => ({
+            indexDefinition: null,
+            pgTrgmVersion: '1.6',
+          })),
+        }),
+      }),
+    );
+    expect(missingIndexReport.checks.find((check) => check.id === 'search')?.details).toEqual([
+      'Missing index: public.message_revisions_text_trgm_idx',
+      'Fix: run kodama migrate',
+    ]);
+
+    const queryText = "select secret article body from message_revisions where text = 'private'";
+    const failedReport = await runDoctor(
+      createDependencies({
+        database: createDatabase({
+          getSearchCapabilitySnapshot: vi.fn(async () => {
+            throw new Error(queryText);
+          }),
+        }),
+      }),
+    );
+    const failedOutput = renderDoctorReport(failedReport);
+
+    expect(failedOutput).toContain('Search capability check failed');
+    expect(failedOutput).toContain('Fix: run kodama migrate');
+    expect(failedOutput).not.toContain(queryText);
+    expect(doctorHasFailures(failedReport)).toBe(true);
   });
 
   it('fails on media-cache ledger drift and reports only aggregate counts', async () => {

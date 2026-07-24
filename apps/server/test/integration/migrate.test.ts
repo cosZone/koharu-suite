@@ -93,6 +93,169 @@ describe('database migrations', () => {
     }
   }, 30_000);
 
+  it('installs pg_trgm and the public discovery indexes', async () => {
+    if (!container) {
+      throw new Error('PostgreSQL test container did not start');
+    }
+    const client = postgres(container.getConnectionUri(), { max: 1 });
+    try {
+      const [capability] = await client<
+        Array<{
+          globalIndex: string | null;
+          pgTrgmVersion: string | null;
+          trigramIndex: string | null;
+        }>
+      >`
+        select
+          (select extversion from pg_extension where extname = 'pg_trgm') as "pgTrgmVersion",
+          pg_get_indexdef(to_regclass('public.message_revisions_text_trgm_idx')) as "trigramIndex",
+          pg_get_indexdef(to_regclass('public.messages_public_published_idx')) as "globalIndex"
+      `;
+
+      expect(capability?.pgTrgmVersion).toEqual(expect.any(String));
+      expect(capability?.trigramIndex).toMatch(
+        /USING gin \(text gin_trgm_ops\) WHERE \(text IS NOT NULL\)/u,
+      );
+      expect(capability?.globalIndex).toMatch(
+        /USING btree \(published_at, id\) WHERE \(tombstoned_at IS NULL\)/u,
+      );
+    } finally {
+      await client.end();
+    }
+  });
+
+  it('searches only visible current revisions and serves global/channel RSS', async () => {
+    if (!connection) {
+      throw new Error('Database connection was not created');
+    }
+    const repository = new PostgresMessageRepository(connection.db);
+    const initial = normalizeChannelPost(
+      channelPostFixture({
+        date: 1_751_300_000,
+        messageId: 201,
+        text: 'obsolete 100%_match',
+        updateId: 4_001,
+      }),
+      ALLOWED_CHANNEL_ID,
+    );
+    const edited = normalizeChannelUpdate(
+      editedChannelPostFixture({
+        date: 1_751_300_000,
+        editDate: 1_751_300_200,
+        messageId: 201,
+        text: 'current needle',
+        updateId: 4_002,
+      }),
+      ALLOWED_CHANNEL_ID,
+    );
+    const second = normalizeChannelPost(
+      channelPostFixture({
+        date: 1_751_300_100,
+        messageId: 202,
+        text: String.raw`current needle 爱 100%_match\path`,
+        updateId: 4_003,
+      }),
+      ALLOWED_CHANNEL_ID,
+    );
+    if (!initial || !edited || !second) {
+      throw new Error('Discovery fixtures did not normalize');
+    }
+    const initialResult = await repository.ingest(initial);
+    await repository.ingest(edited);
+    const secondResult = await repository.ingest(second);
+    const app = createApp({
+      canonicalOrigin: 'https://suite.example',
+      discovery: repository,
+      messages: repository,
+    });
+
+    const obsolete = await app.request('/api/v1/search/messages?q=obsolete');
+    expect(obsolete.status).toBe(200);
+    await expect(obsolete.json()).resolves.toMatchObject({ items: [] });
+
+    const literal = await app.request('/api/v1/search/messages?q=100%25_match&sort=newest');
+    expect(literal.status).toBe(200);
+    await expect(literal.json()).resolves.toMatchObject({
+      items: [{ message: { id: secondResult.messageId } }],
+      mode: 'trigram',
+    });
+    const backslashLiteral = await app.request(
+      `/api/v1/search/messages?q=${encodeURIComponent(String.raw`\path`)}&sort=newest`,
+    );
+    await expect(backslashLiteral.json()).resolves.toMatchObject({
+      items: [{ message: { id: secondResult.messageId } }],
+    });
+
+    const firstPage = await app.request('/api/v1/search/messages?q=needle&limit=1');
+    expect(firstPage.status).toBe(200);
+    const firstPageBody = await firstPage.json();
+    expect(firstPageBody.items).toHaveLength(1);
+    expect(firstPageBody.nextCursor).toEqual(expect.any(String));
+    const lateSnapshotMessage = normalizeChannelPost(
+      channelPostFixture({
+        date: 1_751_300_050,
+        messageId: 203,
+        text: 'current needle inserted after page one',
+        updateId: 4_004,
+      }),
+      ALLOWED_CHANNEL_ID,
+    );
+    if (!lateSnapshotMessage) {
+      throw new Error('Late snapshot fixture did not normalize');
+    }
+    const lateSnapshotResult = await repository.ingest(lateSnapshotMessage);
+    const secondPage = await app.request(
+      `/api/v1/search/messages?q=needle&limit=1&cursor=${encodeURIComponent(firstPageBody.nextCursor)}`,
+    );
+    expect(secondPage.status).toBe(200);
+    const secondPageBody = await secondPage.json();
+    expect(secondPageBody.items).toHaveLength(1);
+    expect(secondPageBody.items[0]?.message.id).not.toBe(firstPageBody.items[0]?.message.id);
+    expect(secondPageBody.items[0]?.message.id).not.toBe(lateSnapshotResult.messageId);
+    const mismatchedCursor = await app.request(
+      `/api/v1/search/messages?q=different&limit=1&cursor=${encodeURIComponent(firstPageBody.nextCursor)}`,
+    );
+    expect(mismatchedCursor.status).toBe(400);
+
+    const boundedShort = await app.request(
+      `/api/v1/search/messages?q=${encodeURIComponent('爱')}&channel=${initialResult.channelId}&from=2025-06-15T00%3A00%3A00.000Z&to=2025-07-15T00%3A00%3A00.000Z`,
+    );
+    expect(boundedShort.status).toBe(200);
+    await expect(boundedShort.json()).resolves.toMatchObject({
+      items: [{ message: { id: secondResult.messageId } }],
+      mode: 'short_substring',
+    });
+
+    const globalFeed = await app.request('/api/v1/rss.xml');
+    expect(globalFeed.status).toBe(200);
+    const globalXml = await globalFeed.text();
+    expect(globalXml).toContain('current needle');
+    expect(globalXml).not.toContain('obsolete');
+    expect(globalXml).toContain('https://suite.example/api/v1/rss.xml');
+    const channelFeed = await app.request(`/api/v1/channels/${initialResult.channelId}/rss.xml`);
+    expect(channelFeed.status).toBe(200);
+    expect(await channelFeed.text()).toContain(`urn:uuid:${secondResult.messageId}`);
+
+    await connection.db
+      .update(messages)
+      .set({ tombstonedAt: new Date(), updatedAt: new Date() })
+      .where(eq(messages.id, secondResult.messageId));
+    const hiddenSearch = await app.request('/api/v1/search/messages?q=100%25_match');
+    await expect(hiddenSearch.json()).resolves.toMatchObject({ items: [] });
+    expect(await (await app.request('/api/v1/rss.xml')).text()).not.toContain(
+      `urn:uuid:${secondResult.messageId}`,
+    );
+
+    await connection.db
+      .update(messages)
+      .set({ tombstonedAt: null, updatedAt: new Date() })
+      .where(eq(messages.id, secondResult.messageId));
+    const restoredSearch = await app.request('/api/v1/search/messages?q=100%25_match');
+    await expect(restoredSearch.json()).resolves.toMatchObject({
+      items: [{ message: { id: secondResult.messageId } }],
+    });
+  }, 30_000);
+
   it('ingests replayed posts idempotently and serves only the public projection', async () => {
     if (!connection) {
       throw new Error('Database connection was not created');
