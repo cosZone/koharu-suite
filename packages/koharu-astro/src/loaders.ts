@@ -44,7 +44,7 @@ export function koharuChannelsLoader(
 ): LiveLoader<PublicChannel, KoharuChannelEntryFilter, never, KoharuError> {
   const client = loaderClient(options);
   return {
-    name: '@koharu/astro-loader/channels',
+    name: '@coszone/koharu-astro/channels',
     loadCollection: async () => {
       try {
         const response = await client.channels.list();
@@ -75,7 +75,7 @@ export function koharuMessagesLoader(
 ): LiveLoader<PublicMessage, KoharuMessageEntryFilter, KoharuMessageCollectionFilter, KoharuError> {
   const client = loaderClient(options);
   return {
-    name: '@koharu/astro-loader/messages',
+    name: '@coszone/koharu-astro/messages',
     loadCollection: async ({ filter }) => {
       if (!filter) return loaderError(KoharuError.invalidResponse());
       try {

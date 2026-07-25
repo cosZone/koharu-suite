@@ -53,25 +53,25 @@ jobs:
       - name: Build workspace
         run: pnpm build
 
-      - name: Pack and audit @koharu/astro-loader
-        id: koharu-astro-loader-artifact
-        run: pnpm pack:astro-loader
+      - name: Pack and audit koharu-astro
+        id: koharu-astro-artifact
+        run: pnpm pack:koharu-astro
 
       - name: Test audited package in minimal Astro fixtures
         env:
-          KOHARU_ASTRO_LOADER_TARBALL: ${{ steps.koharu-astro-loader-artifact.outputs.tarball }}
+          KOHARU_ASTRO_TARBALL: ${{ steps.koharu-astro-artifact.outputs.tarball }}
         run: pnpm test:astro-fixture
 
       - name: Test audited package in pinned astro-koharu template
         env:
-          KOHARU_ASTRO_LOADER_TARBALL: ${{ steps.koharu-astro-loader-artifact.outputs.tarball }}
+          KOHARU_ASTRO_TARBALL: ${{ steps.koharu-astro-artifact.outputs.tarball }}
         run: pnpm test:astro-template
 
-      - name: Preserve audited @koharu/astro-loader tarball
+      - name: Preserve audited koharu-astro tarball
         uses: actions/upload-artifact@v4
         with:
-          name: koharu-astro-loader-npm-package
-          path: ${{ steps.koharu-astro-loader-artifact.outputs.tarball }}
+          name: koharu-astro-npm-package
+          path: ${{ steps.koharu-astro-artifact.outputs.tarball }}
           if-no-files-found: error
           retention-days: 14
 

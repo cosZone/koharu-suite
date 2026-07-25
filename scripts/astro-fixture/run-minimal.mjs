@@ -5,7 +5,7 @@ import { FIXTURE_MESSAGE_ID, startSuiteApiFixture } from './suite-api.mjs';
 import {
   createTemporaryDirectory,
   getFreePort,
-  packAstroLoader,
+  packKoharuAstro,
   prepareConsumerFixture,
   removeTemporaryDirectory,
   repositoryRoot,
@@ -16,7 +16,7 @@ import {
 } from './support.mjs';
 
 const fixtureRoot = join(repositoryRoot, 'tests/fixtures/astro-consumer');
-const temporaryRoot = await createTemporaryDirectory('koharu-astro-loader-fixture-');
+const temporaryRoot = await createTemporaryDirectory('koharu-astro-fixture-');
 const artifacts = join(temporaryRoot, 'artifacts');
 const staticDirectory = join(temporaryRoot, 'static-off');
 const dynamicDirectory = join(temporaryRoot, 'dynamic-on');
@@ -27,7 +27,7 @@ let trapApi;
 
 try {
   await mkdir(artifacts);
-  const tarball = await packAstroLoader(artifacts);
+  const tarball = await packKoharuAstro(artifacts);
 
   trapApi = await startSuiteApiFixture({ failOnApiRequest: true });
   await prepareConsumerFixture(join(fixtureRoot, 'static-off'), staticDirectory, tarball);

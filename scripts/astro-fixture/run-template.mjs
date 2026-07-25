@@ -5,7 +5,7 @@ import { FIXTURE_MESSAGE_ID, startSuiteApiFixture } from './suite-api.mjs';
 import {
   createTemporaryDirectory,
   getFreePort,
-  packAstroLoader,
+  packKoharuAstro,
   removeTemporaryDirectory,
   repositoryRoot,
   runCommand,
@@ -19,7 +19,7 @@ const metadata = JSON.parse(
 );
 const sourceFixture = join(repositoryRoot, 'tests/fixtures/astro-consumer/dynamic-on');
 const overlayRoot = join(repositoryRoot, 'scripts/astro-fixture/template-overlay');
-const temporaryRoot = await createTemporaryDirectory('koharu-astro-loader-template-');
+const temporaryRoot = await createTemporaryDirectory('koharu-astro-template-');
 const artifacts = join(temporaryRoot, 'artifacts');
 const staticDirectory = join(temporaryRoot, 'static-off');
 const dynamicDirectory = join(temporaryRoot, 'dynamic-on');
@@ -59,7 +59,7 @@ async function installTemplateDependencies(directory, tarball, includeNodeAdapte
 
 try {
   await mkdir(artifacts);
-  const tarball = await packAstroLoader(artifacts);
+  const tarball = await packKoharuAstro(artifacts);
 
   await clonePinnedTemplate(staticDirectory);
   await installTemplateDependencies(staticDirectory, tarball, false);

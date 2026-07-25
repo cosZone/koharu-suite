@@ -1,5 +1,5 @@
 {
-  "name": "@koharu/astro-loader",
+  "name": "@coszone/koharu-astro",
   "version": "0.1.0",
   "description": "Typed Koharu Suite client and Astro 6 Live Content Collection loaders.",
   "keywords": [
@@ -16,7 +16,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cosZone/koharu-suite.git",
-    "directory": "packages/astro-loader"
+    "directory": "packages/koharu-astro"
   },
   "exports": {
     ".": {

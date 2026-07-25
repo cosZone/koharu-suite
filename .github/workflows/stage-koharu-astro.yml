@@ -1,4 +1,4 @@
-name: Stage @koharu/astro-loader on npm
+name: Stage koharu-astro on npm
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: stage-koharu-astro-loader
+  group: stage-koharu-astro
   cancel-in-progress: false
 
 jobs:
@@ -82,28 +82,28 @@ jobs:
 
       - name: Pack and audit publish artifact
         id: artifact
-        run: pnpm pack:astro-loader
+        run: pnpm pack:koharu-astro
 
       - name: Test audited package in minimal Astro fixtures
         env:
-          KOHARU_ASTRO_LOADER_TARBALL: ${{ steps.artifact.outputs.tarball }}
+          KOHARU_ASTRO_TARBALL: ${{ steps.artifact.outputs.tarball }}
         run: pnpm test:astro-fixture
 
       - name: Test audited package in pinned astro-koharu template
         env:
-          KOHARU_ASTRO_LOADER_TARBALL: ${{ steps.artifact.outputs.tarball }}
+          KOHARU_ASTRO_TARBALL: ${{ steps.artifact.outputs.tarball }}
         run: pnpm test:astro-template
 
       - name: Refuse bootstrap or an unversioned source
         shell: bash
         run: |
-          version="$(node -p "require('./packages/astro-loader/package.json').version")"
+          version="$(node -p "require('./packages/koharu-astro/package.json').version")"
           if [[ "$version" == "0.0.0" ]]; then
             echo "Merge the Version Packages PR and complete the owner bootstrap before using trusted publishing." >&2
             exit 1
           fi
-          if npm view "@koharu/astro-loader@$version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "@koharu/astro-loader@$version already exists and cannot be overwritten." >&2
+          if npm view "@coszone/koharu-astro@$version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "@coszone/koharu-astro@$version already exists and cannot be overwritten." >&2
             exit 1
           fi
 
@@ -116,7 +116,7 @@ jobs:
       - name: Preserve audited tarball
         uses: actions/upload-artifact@v4
         with:
-          name: koharu-astro-loader-npm-package
+          name: koharu-astro-npm-package
           path: ${{ steps.artifact.outputs.tarball }}
           if-no-files-found: error
           retention-days: 14
