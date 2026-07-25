@@ -21,7 +21,14 @@ import {
   resolvePublicApiConfig,
   resolveTelegramConfig,
   resolveWorkerInstanceId,
+  validateServerEnvironment,
 } from './config.js';
+import { captureExplicitEnvironment, resolveBootEnvironment } from './config-boot.js';
+import {
+  loadConfigOverrides,
+  mergeEnvironmentWithOverrides,
+  readConfigOverrides,
+} from './config-overrides.js';
 import { createDatabaseConnection } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { loadEnvironmentFile } from './env.js';
@@ -261,20 +268,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  const explicitEnv = captureExplicitEnvironment();
   loadEnvironmentFile();
 
   if (command === 'serve') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
-    const auth = resolveAuthConfig();
-    const mediaCache = resolveMediaCacheConfig();
-    const mediaS3 = resolveMediaS3Config();
+    const { configCenter, environment } = await resolveBootEnvironment(databaseUrl, explicitEnv);
+    const auth = resolveAuthConfig(environment);
+    const mediaCache = resolveMediaCacheConfig(environment);
+    const mediaS3 = resolveMediaS3Config(environment);
     const runtime = await startServerRuntime({
       auth,
+      configCenter,
       databaseUrl,
       mediaCache,
       mediaS3,
       port: resolvePort(options.port),
-      publicApi: resolvePublicApiConfig(),
+      publicApi: resolvePublicApiConfig(environment),
     });
     registerProcessLifecycle(runtime, {
       secrets: [
@@ -289,13 +299,15 @@ async function main(): Promise<void> {
 
   if (command === 'worker') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
-    const telegram = resolveTelegramConfig();
-    const mediaCache = resolveMediaCacheConfig();
-    const mediaS3 = resolveMediaS3Config();
+    const overrides = await loadConfigOverrides(databaseUrl);
+    const env = mergeEnvironmentWithOverrides(process.env, overrides, explicitEnv);
+    const telegram = resolveTelegramConfig(env);
+    const mediaCache = resolveMediaCacheConfig(env);
+    const mediaS3 = resolveMediaS3Config(env);
     const runtime = createWorkerRuntime({
       ...telegram,
       databaseUrl,
-      instanceId: resolveWorkerInstanceId(),
+      instanceId: resolveWorkerInstanceId(env),
       mediaCache,
       mediaS3,
     });
@@ -321,7 +333,9 @@ async function main(): Promise<void> {
 
   if (command === 'media') {
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
-    const mediaCache = resolveMediaCacheConfig();
+    const overrides = await loadConfigOverrides(databaseUrl);
+    const env = mergeEnvironmentWithOverrides(process.env, overrides, explicitEnv);
+    const mediaCache = resolveMediaCacheConfig(env);
     try {
       await runMediaCacheCli({
         apply: options.apply === true,
@@ -655,21 +669,32 @@ async function main(): Promise<void> {
       throw new Error('doctor does not accept a subcommand');
     }
     const databaseUrl = resolveDatabaseUrl(options['database-url']);
-    const telegram = resolveTelegramConfig();
+    const configOverrideResult = await readConfigOverrides(databaseUrl);
+    const env = mergeEnvironmentWithOverrides(
+      process.env,
+      configOverrideResult.overrides,
+      explicitEnv,
+    );
+    const telegram = resolveTelegramConfig(env);
     const connection = createDatabaseConnection(databaseUrl, { max: 2 });
     try {
       const telegramApi = new GrammyTelegramApi(telegram.botToken, {
         ...(telegram.apiRoot ? { apiRoot: telegram.apiRoot } : {}),
       });
       const report = await runDoctor({
+        configOverrides: {
+          activeCount: Object.keys(configOverrideResult.overrides).length,
+          lockedKeys: Object.keys(configOverrideResult.overrides)
+            .filter((key) => key in explicitEnv)
+            .sort(),
+          readError: configOverrideResult.readError,
+        },
         database: new PostgresDoctorDiagnostics(connection.db),
         sensitiveValues: [...sensitiveEnvironmentValues(), databaseUrl, telegram.botToken],
         telegram: new TelegramDoctorDiagnostics(telegramApi),
         validateConfig: () => {
           resolveDatabaseUrl(options['database-url']);
-          resolveAuthConfig();
-          resolveTelegramConfig();
-          resolvePublicApiConfig();
+          validateServerEnvironment(env);
         },
       });
       process.stdout.write(`${renderDoctorReport(report)}\n`);

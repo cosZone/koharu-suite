@@ -9,6 +9,7 @@ import {
   resolvePublicApiConfig,
   resolveTelegramConfig,
   resolveWorkerInstanceId,
+  validateServerEnvironment,
 } from '../src/config.js';
 
 describe('configuration', () => {
@@ -388,5 +389,41 @@ describe('configuration', () => {
     { TRUST_PROXY: '1' },
   ])('rejects unsafe public API configuration: %j', (environment) => {
     expect(() => resolvePublicApiConfig(environment)).toThrow();
+  });
+
+  describe('validateServerEnvironment', () => {
+    const validEnvironment = {
+      BETTER_AUTH_SECRET: 'a'.repeat(32),
+      BETTER_AUTH_URL: 'https://blog.example.com',
+      TELEGRAM_BOT_TOKEN: '123456:test-token',
+    };
+
+    it('accepts a complete environment without optional media configuration', () => {
+      expect(() => validateServerEnvironment(validEnvironment)).not.toThrow();
+    });
+
+    it('rejects a partial S3 override group that would brick the next boot', () => {
+      expect(() =>
+        validateServerEnvironment({ ...validEnvironment, S3_ENDPOINT: 'https://s3.example.com' }),
+      ).toThrow(/incomplete/u);
+    });
+
+    it('rejects a non-absolute media cache root from an override', () => {
+      expect(() =>
+        validateServerEnvironment({ ...validEnvironment, MEDIA_CACHE_ROOT: 'relative/path' }),
+      ).toThrow(/absolute/u);
+    });
+
+    it('rejects an HTTP S3 endpoint without the insecure opt-in', () => {
+      expect(() =>
+        validateServerEnvironment({
+          ...validEnvironment,
+          S3_BUCKET: 'media',
+          S3_ENDPOINT: 'http://s3.example.com',
+          S3_KEY: 'key-id',
+          S3_SECRET: 'key-secret',
+        }),
+      ).toThrow(/S3_ALLOW_INSECURE/u);
+    });
   });
 });

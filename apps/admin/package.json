@@ -17,15 +17,23 @@
   },
   "dependencies": {
     "better-auth": "catalog:",
-    "@koharu-suite/ui": "workspace:*",
+    "class-variance-authority": "catalog:",
+    "clsx": "catalog:",
+    "radix-ui": "catalog:",
     "react": "catalog:",
-    "react-dom": "catalog:"
+    "react-dom": "catalog:",
+    "react-router-dom": "catalog:",
+    "sonner": "catalog:",
+    "tailwind-merge": "catalog:"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "catalog:",
     "@types/node": "catalog:",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
     "@vitejs/plugin-react": "catalog:",
+    "tailwindcss": "catalog:",
+    "tw-animate-css": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

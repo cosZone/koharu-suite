@@ -3,6 +3,11 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { type Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
+  AdminConfigLockedError,
+  AdminConfigValidationError,
+  type PostgresConfigService,
+} from './admin/config-service.js';
+import {
   AdminOperationConflictError,
   AdminOperationNotFoundError,
   type PostgresAdminOperations,
@@ -55,6 +60,7 @@ export interface AppDependencies {
   adminAssetsRoot?: string;
   auth: RuntimeAuth;
   canonicalOrigin: string;
+  configService: Pick<PostgresConfigService, 'apply' | 'describe'>;
   discovery: MessageDiscoveryReader;
   media: PublicMediaReader;
   mediaCacheAdmin: MediaCacheAdminReader;
@@ -146,6 +152,14 @@ const unavailableAuth: RuntimeAuth = {
     Response.json(apiError('auth_unavailable', 'Authentication is not configured'), {
       status: 503,
     }),
+};
+const unavailableConfigService: AppDependencies['configService'] = {
+  apply: async () => {
+    throw new Error('Admin config service is not configured');
+  },
+  describe: async () => {
+    throw new Error('Admin config service is not configured');
+  },
 };
 const unavailableMediaReader: PublicMediaReader = {
   open: async () => null,
@@ -368,6 +382,12 @@ const reconciliationScanSchema = z
 const reconciliationTombstoneSchema = reconciliationActionSchema
   .extend({ messageId: z.uuid() })
   .strict();
+const configUpdateSchema = z
+  .object({
+    changes: z.record(z.string(), z.string().max(16_384).nullable()),
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
 
 function isPublicApiPath(path: string, mediaEnabled: boolean): boolean {
   return (
@@ -408,6 +428,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     adminAssetsRoot: dependencies.adminAssetsRoot,
     auth: dependencies.auth ?? unavailableAuth,
     canonicalOrigin: dependencies.canonicalOrigin ?? 'http://localhost',
+    configService: dependencies.configService ?? unavailableConfigService,
     discovery: dependencies.discovery ?? unavailableDiscoveryReader,
     media: dependencies.media ?? unavailableMediaReader,
     mediaCacheAdmin: dependencies.mediaCacheAdmin ?? unavailableMediaCacheAdmin,
@@ -792,6 +813,38 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       },
       version: VERSION,
     });
+  });
+  app.get('/api/v1/admin/config', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) {
+      return authorization.response;
+    }
+    return context.json(await resolved.configService.describe());
+  });
+  app.put('/api/v1/admin/config', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const body = configUpdateSchema.safeParse(await context.req.json().catch(() => null));
+    if (!body.success) {
+      return context.json(
+        apiError('invalid_config_change', 'Valid config changes and a reason are required'),
+        400,
+      );
+    }
+    try {
+      return context.json(await resolved.configService.apply(body.data, authorization.principal));
+    } catch (error) {
+      if (error instanceof AdminConfigValidationError) {
+        return context.json(apiError('invalid_config_change', error.message), 400);
+      }
+      if (error instanceof AdminConfigLockedError) {
+        return context.json(apiError('config_locked', error.message), 409);
+      }
+      throw error;
+    }
   });
   app.get('/api/v1/admin/media-cache/status', async (context) => {
     const authorization = await authorizeAdmin(context, 'admin:read');

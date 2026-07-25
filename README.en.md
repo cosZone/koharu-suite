@@ -92,7 +92,9 @@ TOTP can be enabled after signing in. Recovery codes are shown once during setup
 manager, because each code is single-use. A TOTP challenge can explicitly trust the current device for 30 days;
 the checkbox is off by default. Trust skips only the second factor and never bypasses the password. Password or
 TOTP state changes revoke every database session. Sign-in always uses a seven-day sliding session and does not
-offer a “remember me” switch.
+offer a “remember me” switch. The settings page also hosts a config center: non-essential media cache, S3,
+public API, and ingestion settings can be edited in the panel and take effect after restarting the server and
+worker; an explicitly set environment variable locks the corresponding panel field.
 
 ### Service tokens
 

@@ -1,6 +1,7 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sql } from 'drizzle-orm';
+import { PostgresConfigService } from './admin/config-service.js';
 import { PostgresAdminOperations } from './admin/operations.js';
 import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
@@ -12,6 +13,7 @@ import type {
   PublicApiConfig,
   TelegramConfig,
 } from './config.js';
+import type { ConfigCenterBootState } from './config-registry.js';
 import { createDatabaseConnection, type Database } from './db/client.js';
 import { MediaCacheAccessCoalescer } from './media-cache/access-coalescer.js';
 import { PostgresMediaCacheAdminRepository } from './media-cache/admin-repository.js';
@@ -61,6 +63,7 @@ export interface StoppableRuntime {
 
 export interface ServerRuntimeConfig {
   auth: AuthConfig;
+  configCenter?: ConfigCenterBootState;
   databaseUrl: string;
   mediaCache: MediaCacheConfig;
   mediaS3: MediaS3Config;
@@ -444,6 +447,9 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
       adminAssetsRoot: process.env.ADMIN_ASSETS_ROOT ?? defaultAdminAssetsRoot,
       auth: new BetterAuthRuntime(mainConnection.db, config.auth),
       canonicalOrigin: config.auth.baseUrl,
+      ...(config.configCenter
+        ? { configService: new PostgresConfigService(mainConnection.db, config.configCenter) }
+        : {}),
       discovery: repository,
       ...(committedBlobReader && accessCoalescer
         ? {

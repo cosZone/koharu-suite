@@ -332,3 +332,38 @@ describe('kodama doctor diagnostics', () => {
     expect(doctorHasFailures(report)).toBe(true);
   });
 });
+
+describe('kodama doctor config overrides', () => {
+  it('reports active overrides and keys locked by explicit env', async () => {
+    const report = await runDoctor(
+      createDependencies({
+        configOverrides: { activeCount: 2, lockedKeys: ['S3_REGION'], readError: null },
+      }),
+    );
+    const check = report.checks.find((entry) => entry.id === 'config-overrides');
+
+    expect(check).toMatchObject({ status: 'ok' });
+    expect(check?.message).toContain('2 config override(s)');
+    expect(check?.details?.[0]).toContain('S3_REGION');
+    expect(doctorHasFailures(report)).toBe(false);
+  });
+
+  it('warns instead of failing when the override table cannot be read', async () => {
+    const report = await runDoctor(
+      createDependencies({
+        configOverrides: { activeCount: 0, lockedKeys: [], readError: 'connect ECONNREFUSED' },
+      }),
+    );
+    const check = report.checks.find((entry) => entry.id === 'config-overrides');
+
+    expect(check).toMatchObject({ status: 'warn' });
+    expect(check?.details?.[0]).toContain('ECONNREFUSED');
+    expect(doctorHasFailures(report)).toBe(false);
+  });
+
+  it('omits the check when no override report is provided', async () => {
+    const report = await runDoctor(createDependencies());
+
+    expect(report.checks.some((entry) => entry.id === 'config-overrides')).toBe(false);
+  });
+});

@@ -42,6 +42,10 @@ MEDIA_CACHE_DOWNLOAD_CONCURRENCY=2
 预置 `.tmp/` 与 `blobs/`。server 只校验目录类型、`realpath` 和 containment，不会在只读挂载中
 创建目录。非 Compose 部署必须预先创建完整布局，并让 worker UID 可读写、server UID 只读。
 
+以上 `MEDIA_CACHE_*` 变量也可以在管理面板设置页的「媒体缓存」分区修改：面板写入数据库
+override，重启 server 与 worker 后才生效。优先级为显式 shell 环境变量 > 面板 override >
+`.env`；显式设置的环境变量会锁定对应面板字段（「由环境变量锁定」），override 不生效。
+
 启用或修改 root 后，同时重启 server 与唯一 worker：
 
 ```bash
@@ -80,6 +84,8 @@ S3_REQUEST_TIMEOUT_MS=30000
 - connect timeout 范围为 250–30,000 ms，request/body deadline 范围为 1,000–120,000 ms；
 - `S3_MAX_BYTES` 是应用容量账本，不是 provider quota，也不会阻止 bucket 中的其他对象增长。
 
+`S3_*` 变量同样可在设置页的「S3 存储」分区配置，优先级与锁定规则同上。
+
 server 与 worker 必须获得同一套配置；Compose 已将这些变量传给两者。bucket、endpoint、region、
 prefix 与 path-style 共同确定存储 namespace。已有 location 时不要原地改成另一 namespace；应配置
 新的部署、复制并验证所需数据后再切换。access key 和 secret 不属于 namespace，可以在 provider
@@ -106,6 +112,9 @@ Owner Desk 与命令结果都不会输出：
 - Telegram `file_id` / `file_path`；
 - endpoint、bucket、object key、prefix 或 backend fingerprint；
 - Desktop export root、绝对路径、blob SHA-256、临时文件名或 lease token。
+
+通过设置页写入的 `S3_KEY`/`S3_SECRET` 只写不读：保存后永不回显，面板与 API 只显示
+「已配置」和末四位。
 
 `recache_on_access` 是默认对象策略：当公开请求成功从 S3 读取且本地没有健康副本时，系统会
 best-effort 入队一个有界 local restore；公开请求不会等待回填。`stay_evicted` 会禁止这次自动

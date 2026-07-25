@@ -13,7 +13,7 @@ const telegramChannelIdSchema = z
   .transform((value) => BigInt(value))
   .refine((value) => value < 0n, 'must be a negative Telegram channel ID')
   .refine((value) => value >= telegramIdLowerBound, 'is outside Telegram safe integer range');
-const telegramEnvironmentSchema = z.object({
+export const telegramEnvironmentSchema = z.object({
   KOHARU_ENABLE_TEST_TELEGRAM_API_ROOT: z.enum(['false', 'true']).default('false'),
   KOHARU_TEST_TELEGRAM_API_ROOT: z.url().optional(),
   TELEGRAM_BOT_TOKEN: z.string().trim().min(1),
@@ -27,7 +27,7 @@ const authEnvironmentSchema = z.object({
   BETTER_AUTH_SECRET: z.string().trim().min(32),
   BETTER_AUTH_URL: z.string().trim().min(1),
 });
-const publicApiEnvironmentSchema = z.object({
+export const publicApiEnvironmentSchema = z.object({
   PUBLIC_CORS_ORIGINS: z.string().optional(),
   PUBLIC_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(120),
   PUBLIC_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(1).max(3_600).default(60),
@@ -43,10 +43,10 @@ const postgresEnvironmentSchema = z.object({
   POSTGRES_PORT: portSchema,
   POSTGRES_USER: z.string().min(1),
 });
-const MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
-const MEDIA_S3_DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+export const MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+export const MEDIA_S3_DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
 const MEDIA_S3_MAX_BYTES = 5 * 1024 * 1024 * 1024 * 1024;
-const mediaCacheEnvironmentSchema = z.object({
+export const mediaCacheEnvironmentSchema = z.object({
   MEDIA_CACHE_DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(2),
   MEDIA_CACHE_ENABLED: z
     .enum(['false', 'true'])
@@ -64,7 +64,7 @@ const optionalTrimmedString = z.preprocess(
   (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
   z.string().trim().min(1).optional(),
 );
-const mediaS3EnvironmentSchema = z.object({
+export const mediaS3EnvironmentSchema = z.object({
   S3_ALLOW_INSECURE: z
     .enum(['false', 'true'])
     .default('false')
@@ -336,4 +336,17 @@ export function resolveTelegramConfig(
 
 export function parseTelegramChannelId(value: string): bigint {
   return telegramChannelIdSchema.parse(value);
+}
+
+/**
+ * Re-runs every server environment resolver, including the media cache and S3
+ * group rules, so diagnostics surface config-center override states that would
+ * prevent serve/worker from booting.
+ */
+export function validateServerEnvironment(environment: NodeJS.ProcessEnv): void {
+  resolveAuthConfig(environment);
+  resolveTelegramConfig(environment);
+  resolvePublicApiConfig(environment);
+  resolveMediaCacheConfig(environment);
+  resolveMediaS3Config(environment);
 }

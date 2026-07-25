@@ -87,7 +87,8 @@ Vite 只在开发时代理 `/api`，并把 Origin 改写为 canonical server ori
 登录后可以启用 TOTP。设置页只显示一次 recovery codes，请保存到密码管理器；每枚只能使用一次。
 TOTP challenge 可显式信任当前设备 30 天，默认不勾选。它只跳过第二因子，不能绕过密码。密码或
 TOTP 状态变化后，全部数据库 session 都会撤销。登录固定使用 7 天滑动 session，不提供
-“记住我”开关。
+“记住我”开关。设置页同时提供配置中心：媒体缓存、S3、公开 API 与采集并发等非核心配置可在
+面板修改，重启 server 与 worker 后生效；显式设置的环境变量会锁定对应面板字段。
 
 ### Service token
 

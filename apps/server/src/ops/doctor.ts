@@ -2,6 +2,7 @@ export type DoctorCheckStatus = 'fail' | 'ok' | 'warn';
 
 export type DoctorCheckId =
   | 'config'
+  | 'config-overrides'
   | 'postgres-version'
   | 'database-schema'
   | 'search'
@@ -91,7 +92,17 @@ export interface DoctorTelegramDiagnostics {
   getMe(signal?: AbortSignal): Promise<DoctorTelegramBot>;
 }
 
+export interface DoctorConfigOverridesReport {
+  /** Number of rows currently stored in config_overrides (0 when unreadable). */
+  activeCount: number;
+  /** Override keys shadowed by explicit shell environment variables. */
+  lockedKeys: string[];
+  /** Sanitized read failure, when the override table could not be read. */
+  readError: string | null;
+}
+
 export interface DoctorDependencies {
+  configOverrides?: DoctorConfigOverridesReport;
   database: DoctorDatabaseDiagnostics;
   sensitiveValues?: readonly string[];
   telegram: DoctorTelegramDiagnostics;
@@ -148,6 +159,9 @@ export const EXPECTED_DATABASE_OBJECTS = [
   'message_source_media_observations.telegram_file_unique_id',
   'messages',
   'messages.tombstoned_at',
+  'config_overrides',
+  'config_overrides.value',
+  'config_overrides.updated_by',
   'operation_audit_events',
   'operation_audit_events.reason',
   'owners',
@@ -454,6 +468,33 @@ async function checkConfig(
   } catch (error) {
     return failure('config', 'Configuration', error, sensitiveValues);
   }
+}
+
+async function checkConfigOverrides(
+  report: DoctorConfigOverridesReport,
+  sensitiveValues: readonly string[],
+): Promise<DoctorCheckResult> {
+  if (report.readError !== null) {
+    return result(
+      'config-overrides',
+      'Config overrides',
+      'warn',
+      'Config overrides could not be read; environment configuration is in effect',
+      sensitiveValues,
+      [`Read failure: ${report.readError}`],
+    );
+  }
+  const details = report.lockedKeys.map(
+    (key) => `${key}: override ignored, locked by an explicit environment variable`,
+  );
+  return result(
+    'config-overrides',
+    'Config overrides',
+    'ok',
+    `${report.activeCount} config override(s) active; changes apply after restart`,
+    sensitiveValues,
+    details.length > 0 ? details : undefined,
+  );
 }
 
 async function checkPostgresVersion(
@@ -835,6 +876,9 @@ export async function runDoctor(dependencies: DoctorDependencies): Promise<Docto
   const checks: DoctorCheckResult[] = [];
 
   checks.push(await checkConfig(dependencies, sensitiveValues));
+  if (dependencies.configOverrides) {
+    checks.push(await checkConfigOverrides(dependencies.configOverrides, sensitiveValues));
+  }
   checks.push(await checkPostgresVersion(dependencies.database, sensitiveValues));
   checks.push(await checkDatabaseSchema(dependencies.database, sensitiveValues));
   checks.push(await checkSearchCapability(dependencies.database, sensitiveValues));

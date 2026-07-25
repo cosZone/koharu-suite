@@ -45,6 +45,11 @@ seeds `.tmp/` and `blobs/` into a new volume. The server only validates director
 containment; it does not create directories through its read-only mount. A non-Compose deployment must create
 the complete layout first and grant the worker UID read-write access and the server UID read-only access.
 
+The `MEDIA_CACHE_*` variables above can also be edited from the admin settings page (Media cache section):
+the panel stores a database override that takes effect only after the server and worker restart. Precedence
+is explicit shell environment variable > panel override > `.env`; an explicitly set environment variable
+locks the corresponding panel field and its override is ignored.
+
 Restart the server and singleton worker after enabling the cache or changing its root:
 
 ```bash
@@ -86,6 +91,9 @@ S3_REQUEST_TIMEOUT_MS=30000
 - `S3_MAX_BYTES` is an application ledger, not a provider quota, and does not constrain unrelated bucket
   objects.
 
+The `S3_*` variables can likewise be configured from the settings page (S3 storage section), with the same
+precedence and locking rules.
+
 The server and worker must receive the same configuration; Compose already passes these variables to both.
 Bucket, endpoint, region, prefix, and path-style settings jointly identify the storage namespace. Do not
 change an existing location ledger in place to point at another namespace. Prepare the new deployment, copy
@@ -116,6 +124,9 @@ server to recheck current revision, tombstone, and object state. Invalid ranges 
 - Telegram `file_id` or `file_path`;
 - endpoints, buckets, object keys, prefixes, or backend fingerprints;
 - Desktop export roots, absolute paths, blob SHA-256 values, temporary filenames, or lease tokens.
+
+`S3_KEY` and `S3_SECRET` written through the settings page are write-only: they are never echoed back, and
+the panel and API report only whether each is set plus its last four characters.
 
 `recache_on_access` is the default object policy. When a public request succeeds from S3 and no healthy local
 copy exists, the system best-effort enqueues a bounded local restore; the public request does not wait.

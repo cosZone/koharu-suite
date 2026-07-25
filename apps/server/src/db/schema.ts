@@ -278,6 +278,13 @@ export const telegramIngestTasks = pgTable(
   ],
 );
 
+export const configOverrides = pgTable('config_overrides', {
+  key: varchar('key', { length: 128 }).primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: text('updated_by').notNull(),
+});
+
 export const operationAuditEvents = pgTable(
   'operation_audit_events',
   {
@@ -288,11 +295,16 @@ export const operationAuditEvents = pgTable(
     actorId: text('actor_id').notNull(),
     action: varchar('action', { length: 64 })
       .$type<
-        'channel.disable' | 'channel.enable' | 'content.rerender' | 'task.retry' | 'task.skip'
+        | 'channel.disable'
+        | 'channel.enable'
+        | 'config.update'
+        | 'content.rerender'
+        | 'task.retry'
+        | 'task.skip'
       >()
       .notNull(),
     targetType: varchar('target_type', { length: 32 })
-      .$type<'channel' | 'renderer' | 'task'>()
+      .$type<'channel' | 'config' | 'renderer' | 'task'>()
       .notNull(),
     targetId: text('target_id').notNull(),
     reason: text('reason'),
