@@ -93,6 +93,10 @@ try {
     'repository.directory is incorrect',
   );
   assert(packageJson.sideEffects === false, 'sideEffects must be false');
+  assert(
+    packageJson.peerDependencies?.astro === '^6.0.0 || ^7.0.0',
+    'Astro 6/7 peer range is incorrect',
+  );
 
   const forbiddenPaths = ['src/', 'test/', 'node_modules/', '.env', '.npmrc', 'tsconfig'];
   for (const path of manifest) {

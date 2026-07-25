@@ -2,7 +2,10 @@ import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 
 export const FIXTURE_CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
+export const FIXTURE_SECOND_CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af2';
 export const FIXTURE_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b33';
+export const FIXTURE_NEWER_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b37';
+export const FIXTURE_OLDER_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b38';
 
 const channel = {
   id: FIXTURE_CHANNEL_ID,
@@ -90,6 +93,39 @@ export async function startSuiteApiFixture(options = {}) {
         return;
       }
       sendJson(response, 200, { items: [fixtureMessage(revision)], nextCursor: null });
+      return;
+    }
+
+    if (url.pathname === '/api/v1/messages/latest') {
+      if (
+        JSON.stringify(url.searchParams.getAll('channel')) !==
+        JSON.stringify([FIXTURE_CHANNEL_ID, FIXTURE_SECOND_CHANNEL_ID])
+      ) {
+        sendJson(response, 400, {
+          error: { code: 'invalid_channel', message: 'Expected repeated channel filters' },
+        });
+        return;
+      }
+      sendJson(response, 200, { items: [fixtureMessage(revision)], nextCursor: null });
+      return;
+    }
+
+    if (url.pathname === `/api/v1/messages/${FIXTURE_MESSAGE_ID}/context`) {
+      sendJson(response, 200, {
+        message: fixtureMessage(revision),
+        newer: {
+          channelId: FIXTURE_CHANNEL_ID,
+          id: FIXTURE_NEWER_MESSAGE_ID,
+          preview: 'Synthetic newer preview',
+          publishedAt: '2026-07-25T00:00:00.000Z',
+        },
+        older: {
+          channelId: FIXTURE_CHANNEL_ID,
+          id: FIXTURE_OLDER_MESSAGE_ID,
+          preview: null,
+          publishedAt: '2026-07-23T00:00:00.000Z',
+        },
+      });
       return;
     }
 

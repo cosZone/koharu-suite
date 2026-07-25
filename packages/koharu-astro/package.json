@@ -1,7 +1,7 @@
 {
   "name": "@coszone/koharu-astro",
   "version": "0.1.0",
-  "description": "Typed Koharu Suite client and Astro 6 Live Content Collection loaders.",
+  "description": "Typed Koharu Suite client and Astro 6/7 Live Content Collection loaders.",
   "keywords": [
     "astro",
     "astro-loader",
@@ -53,7 +53,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "astro": "^6.0.0"
+    "astro": "^6.0.0 || ^7.0.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",

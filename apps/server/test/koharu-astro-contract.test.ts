@@ -1,6 +1,7 @@
 import {
   apiErrorResponseSchema,
   channelListResponseSchema,
+  messageContextSchema,
   messagePageSchema,
   publicMessageSchema,
   searchMessagePageSchema,
@@ -59,8 +60,11 @@ const message: PublicMessage = {
 
 function createMessages(): MessageReader {
   return {
+    getMessageContext: async (id) =>
+      id === MESSAGE_ID ? { message, newer: null, older: null } : null,
     getMessage: async (id) => (id === MESSAGE_ID ? message : null),
     listChannels: async () => [message.channel],
+    listLatestMessages: async () => ({ items: [message], nextCursor: null }),
     listMessages: async (channelId) =>
       channelId === CHANNEL_ID
         ? {
@@ -110,9 +114,24 @@ describe('@coszone/koharu-astro server contracts', () => {
       nextCursor: null,
     });
 
+    const latest = await app.request('/api/v1/messages/latest');
+    expect(latest.status).toBe(200);
+    expect(messagePageSchema.parse(await latest.json())).toEqual({
+      items: [message],
+      nextCursor: null,
+    });
+
     const detail = await app.request(`/api/v1/messages/${MESSAGE_ID}`);
     expect(detail.status).toBe(200);
     expect(publicMessageSchema.parse(await detail.json())).toEqual(message);
+
+    const context = await app.request(`/api/v1/messages/${MESSAGE_ID}/context`);
+    expect(context.status).toBe(200);
+    expect(messageContextSchema.parse(await context.json())).toEqual({
+      message,
+      newer: null,
+      older: null,
+    });
 
     const search = await app.request('/api/v1/search/messages?q=koharu');
     expect(search.status).toBe(200);

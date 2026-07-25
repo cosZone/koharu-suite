@@ -39,6 +39,27 @@ interface Channel {
   username: string | null;
 }
 
+type ClipboardWriter = Pick<Clipboard, 'writeText'>;
+
+export function formatChannelId(channelId: string): string {
+  if (channelId.length <= 13) {
+    return channelId;
+  }
+
+  return `${channelId.slice(0, 8)}…${channelId.slice(-4)}`;
+}
+
+export async function writeChannelIdToClipboard(
+  channelId: string,
+  clipboard: ClipboardWriter | undefined = globalThis.navigator?.clipboard,
+): Promise<void> {
+  if (!clipboard) {
+    throw new Error('Clipboard API is unavailable.');
+  }
+
+  await clipboard.writeText(channelId);
+}
+
 interface ConfiguredChannel {
   disabledAt: string | null;
   enabled: boolean;
@@ -1746,6 +1767,72 @@ export function ReconciliationPanel({
   );
 }
 
+export function ChannelRailItem({
+  channel,
+  selected,
+  onSelect,
+}: {
+  channel: Channel;
+  selected: boolean;
+  onSelect(): void;
+}) {
+  const [copyState, setCopyState] = useState<'copied' | 'copying' | 'failed' | 'idle'>('idle');
+
+  async function copyChannelId() {
+    setCopyState('copying');
+    try {
+      await writeChannelIdToClipboard(channel.id);
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+  }
+
+  return (
+    <div className="rail-channel">
+      <button
+        aria-pressed={selected}
+        className={`rail-channel__select ${selected ? 'is-active' : ''}`}
+        onClick={onSelect}
+        type="button"
+      >
+        <span>{channel.title}</span>
+        <small>{channel.username ? `@${channel.username}` : '私有链接不可用'}</small>
+      </button>
+      <div className="rail-channel__identity">
+        <code title={channel.id}>Suite ID {formatChannelId(channel.id)}</code>
+        <button
+          aria-label={`复制 ${channel.title} 的完整 Suite 频道 ID`}
+          disabled={copyState === 'copying'}
+          onClick={copyChannelId}
+          title="复制完整 Suite 频道 ID"
+          type="button"
+        >
+          {copyState === 'copying'
+            ? '复制中…'
+            : copyState === 'copied'
+              ? '已复制'
+              : copyState === 'failed'
+                ? '重试'
+                : '复制 ID'}
+        </button>
+      </div>
+      <span
+        aria-atomic="true"
+        aria-live="polite"
+        className={`rail-channel__copy-status ${copyState === 'failed' ? 'is-failed' : ''}`}
+      >
+        {copyState === 'copied' ? '已复制完整 Suite 频道 ID。' : null}
+        {copyState === 'failed' ? (
+          <>
+            复制失败，请手动复制：<code>{channel.id}</code>
+          </>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
 function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Promise<void> }) {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -2437,15 +2524,12 @@ function Dashboard({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
           <h2>频道</h2>
           <nav aria-label="归档频道">
             {channels.map((channel) => (
-              <button
-                className={selectedChannel === channel.id ? 'is-active' : ''}
+              <ChannelRailItem
+                channel={channel}
                 key={channel.id}
-                onClick={() => selectArchiveChannel(channel.id)}
-                type="button"
-              >
-                <span>{channel.title}</span>
-                <small>{channel.username ? `@${channel.username}` : '私有链接不可用'}</small>
-              </button>
+                onSelect={() => selectArchiveChannel(channel.id)}
+                selected={selectedChannel === channel.id}
+              />
             ))}
           </nav>
           <div className="rail__footer">

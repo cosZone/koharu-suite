@@ -5,9 +5,9 @@
   "type": "module",
   "dependencies": {
     "@astrojs/check": "0.9.9",
-    "@astrojs/node": "10.1.4",
+    "@astrojs/node": "__ASTRO_NODE_VERSION__",
     "@coszone/koharu-astro": "file:__KOHARU_ASTRO_TARBALL__",
-    "astro": "6.4.8",
+    "astro": "__ASTRO_VERSION__",
     "typescript": "5.9.3"
   }
 }

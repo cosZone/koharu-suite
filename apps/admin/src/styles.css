@@ -343,25 +343,77 @@ button {
   gap: 8px;
 }
 
-.rail nav button {
+.rail-channel {
   display: grid;
-  gap: 4px;
-  padding: 12px 13px;
+  gap: 6px;
+  padding: 8px;
   border: 1px solid transparent;
   border-radius: 4px 14px 4px 14px;
+  background: rgba(255, 249, 237, 0.3);
+}
+
+.rail-channel__select {
+  display: grid;
+  gap: 4px;
+  padding: 4px 5px;
+  border: 0;
   background: transparent;
   cursor: pointer;
   text-align: left;
 }
 
-.rail nav button:hover,
-.rail nav button.is-active {
+.rail-channel:has(.rail-channel__select:hover),
+.rail-channel:has(.rail-channel__select.is-active) {
   border-color: var(--line);
   background: rgba(255, 249, 237, 0.76);
 }
 
-.rail nav small {
+.rail-channel__select small {
   color: var(--ink-soft);
+}
+
+.rail-channel__identity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 5px;
+}
+
+.rail-channel__identity code,
+.rail-channel__copy-status code {
+  color: var(--ink-soft);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.62rem;
+  overflow-wrap: anywhere;
+}
+
+.rail-channel__identity button {
+  flex: 0 0 auto;
+  padding: 2px 0;
+  border: 0;
+  border-bottom: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 0.62rem;
+}
+
+.rail-channel__identity button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.rail-channel__copy-status {
+  min-height: 0.8rem;
+  padding: 0 5px;
+  color: var(--moss);
+  font-size: 0.62rem;
+  line-height: 1.35;
+}
+
+.rail-channel__copy-status.is-failed {
+  color: #992f25;
 }
 
 .rail__footer {
@@ -1653,7 +1705,7 @@ details .uri {
     overflow-x: auto;
   }
 
-  .rail nav button {
+  .rail-channel {
     min-width: 190px;
   }
 

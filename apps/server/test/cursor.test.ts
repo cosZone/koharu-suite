@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  decodeLatestMessageCursor,
   decodeMessageCursor,
+  encodeLatestMessageCursor,
   encodeMessageCursor,
   InvalidCursorError,
   type MessageCursor,
@@ -19,6 +21,18 @@ function encodedJson(json: string): string {
 }
 
 describe('message cursor', () => {
+  it('binds a latest cursor to its snapshot and normalized visible-channel set', () => {
+    const latest = { ...CURSOR, snapshotAt: '2026-07-24T01:00:00.000Z' };
+    const otherChannel = 'c78e9147-480f-4e63-941c-eefac29534d0';
+    const encoded = encodeLatestMessageCursor(latest, [CHANNEL_ID, otherChannel]);
+
+    expect(decodeLatestMessageCursor(encoded, [otherChannel, CHANNEL_ID])).toEqual(latest);
+    expect(() => decodeLatestMessageCursor(encoded, [CHANNEL_ID])).toThrow(InvalidCursorError);
+    expect(() =>
+      encodeLatestMessageCursor({ ...latest, snapshotAt: '2026-07-24' }, [CHANNEL_ID]),
+    ).toThrow(InvalidCursorError);
+  });
+
   it('round-trips a canonical v1 base64url payload', () => {
     const encoded = encodeMessageCursor(CURSOR);
 

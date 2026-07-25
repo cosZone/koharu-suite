@@ -1,0 +1,33 @@
+---
+import { createKoharuClient } from '@coszone/koharu-astro';
+
+export const prerender = false;
+
+const channelIds = ['019bf894-2b6c-7b18-bd70-0ad6349a4af1', '019bf894-2b6c-7b18-bd70-0ad6349a4af2'];
+const messageId = '019bf895-0e70-7881-83b3-471b8dbb1b33';
+const baseUrl = import.meta.env.KOHARU_SUITE_URL;
+
+if (!baseUrl) {
+  throw new Error('KOHARU_SUITE_URL is required by the dynamic fixture');
+}
+
+const client = createKoharuClient({ baseUrl });
+const [_latest, _context] = await Promise.all([
+  client.messages.latest({ channelIds, limit: 10 }),
+  client.messages.context({ messageId }),
+]);
+---
+
+<html lang="en">
+  <body>
+    <main
+      data-context-message={_context.message.id}
+      data-latest-message={_latest.items[0]?.id}
+      data-newer={_context.newer?.id}
+      data-older={_context.older?.id}
+    >
+      <p>{_context.newer?.preview}</p>
+      <p>{_context.older?.preview ?? 'No older preview'}</p>
+    </main>
+  </body>
+</html>

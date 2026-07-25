@@ -11,7 +11,14 @@ import type { AdminReader } from './admin/repository.js';
 import type { RuntimeAuth } from './auth/runtime-auth.js';
 import type { ServiceTokenScope } from './auth/service-token.js';
 import { type PublicApiConfig, parseTelegramChannelId } from './config.js';
-import { decodeMessageCursor, encodeMessageCursor, type MessageCursor } from './http/cursor.js';
+import {
+  decodeLatestMessageCursor,
+  decodeMessageCursor,
+  encodeLatestMessageCursor,
+  encodeMessageCursor,
+  type LatestMessageCursor,
+  type MessageCursor,
+} from './http/cursor.js';
 import { FixedWindowRateLimiter, matchCorsOrigin } from './http/public-policy.js';
 import type { MediaCacheAdminReader } from './media-cache/admin-repository.js';
 import {
@@ -91,8 +98,10 @@ const healthResponse = (): HealthResponse => ({
 });
 
 const unavailableMessageReader: MessageReader = {
+  getMessageContext: async () => null,
   getMessage: async () => null,
   listChannels: async () => [],
+  listLatestMessages: async () => ({ items: [], nextCursor: null }),
   listMessages: async () => null,
 };
 const unavailableDiscoveryReader: MessageDiscoveryReader = {
@@ -289,6 +298,7 @@ function reconciliationMutationStatus(error: unknown): 404 | 409 | null {
 
 const uuidSchema = z.uuid();
 const listLimitSchema = z.coerce.number().int().min(1).max(100).default(50);
+const MAX_VISIBLE_CHANNEL_IDS = 32;
 const reasonSchema = z.object({ reason: z.string().trim().min(1).max(500) }).strict();
 const storageBackendIdSchema = z
   .string()
@@ -399,6 +409,30 @@ function parseSearchTimestamp(value: string | undefined): Date | null | false {
     return false;
   }
   return timestamp;
+}
+
+function parseVisibleChannelIds(
+  context: Context,
+):
+  | { channelIds: string[]; success: true }
+  | { error: 'invalid_channel' | 'too_many_channels'; success: false } {
+  const values = new URL(context.req.url).searchParams.getAll('channel');
+  const channelIds: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = value.trim().toLowerCase();
+    if (!uuidSchema.safeParse(normalized).success) {
+      return { error: 'invalid_channel', success: false };
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      channelIds.push(normalized);
+    }
+  }
+  if (channelIds.length > MAX_VISIBLE_CHANNEL_IDS) {
+    return { error: 'too_many_channels', success: false };
+  }
+  return { channelIds, success: true };
 }
 
 export function createApp(dependencies: Partial<AppDependencies> = {}) {
@@ -549,13 +583,25 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       );
     }
 
-    const rawChannelId = context.req.query('channel');
-    const parsedChannelId =
-      rawChannelId === undefined ? null : uuidSchema.safeParse(rawChannelId.trim());
-    if (parsedChannelId !== null && !parsedChannelId.success) {
-      return context.json(apiError('invalid_channel', 'channel must be a suite channel UUID'), 400);
+    const parsedChannels = parseVisibleChannelIds(context);
+    if (!parsedChannels.success) {
+      if (parsedChannels.error === 'invalid_channel') {
+        return context.json(
+          apiError('invalid_channel', 'channel must be a suite channel UUID'),
+          400,
+        );
+      }
+      return context.json(
+        apiError(
+          'too_many_channels',
+          `channel accepts at most ${MAX_VISIBLE_CHANNEL_IDS} unique IDs`,
+        ),
+        400,
+      );
     }
-    const channelId = parsedChannelId?.data ?? null;
+    const channelId =
+      parsedChannels.channelIds.length === 1 ? (parsedChannels.channelIds[0] ?? null) : null;
+    const channelIds = parsedChannels.channelIds.length > 1 ? parsedChannels.channelIds : undefined;
     const from = parseSearchTimestamp(context.req.query('from'));
     const to = parseSearchTimestamp(context.req.query('to'));
     if (from === false || to === false || (from !== null && to !== null && from >= to)) {
@@ -610,6 +656,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
 
     const key: MessageSearchKey = {
       channelId,
+      ...(channelIds ? { channelIds } : {}),
       from: from?.toISOString() ?? null,
       query,
       sort,
@@ -764,6 +811,59 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       items: page.items,
       nextCursor: page.nextCursor ? encodeMessageCursor(page.nextCursor) : null,
     });
+  });
+  app.get('/api/v1/messages/latest', async (context) => {
+    const parsedChannels = parseVisibleChannelIds(context);
+    if (!parsedChannels.success) {
+      if (parsedChannels.error === 'invalid_channel') {
+        return context.json(
+          apiError('invalid_channel', 'channel must be a suite channel UUID'),
+          400,
+        );
+      }
+      return context.json(
+        apiError(
+          'too_many_channels',
+          `channel accepts at most ${MAX_VISIBLE_CHANNEL_IDS} unique IDs`,
+        ),
+        400,
+      );
+    }
+    const parsedLimit = listLimitSchema.safeParse(context.req.query('limit'));
+    if (!parsedLimit.success) {
+      return context.json(apiError('invalid_limit', 'limit must be between 1 and 100'), 400);
+    }
+    let cursor: LatestMessageCursor | undefined;
+    const encodedCursor = context.req.query('cursor');
+    if (encodedCursor !== undefined) {
+      try {
+        cursor = decodeLatestMessageCursor(encodedCursor, parsedChannels.channelIds);
+      } catch {
+        return context.json(apiError('invalid_cursor', 'cursor is invalid'), 400);
+      }
+    }
+    const page = await resolved.messages.listLatestMessages({
+      channelIds: parsedChannels.channelIds,
+      ...(cursor ? { cursor } : {}),
+      limit: parsedLimit.data,
+    });
+    return context.json({
+      items: page.items,
+      nextCursor: page.nextCursor
+        ? encodeLatestMessageCursor(page.nextCursor, parsedChannels.channelIds)
+        : null,
+    });
+  });
+  app.get('/api/v1/messages/:id/context', async (context) => {
+    const parsedMessageId = uuidSchema.safeParse(context.req.param('id'));
+    if (!parsedMessageId.success) {
+      return context.json(apiError('invalid_message_id', 'id must be a suite message UUID'), 400);
+    }
+    const result = await resolved.messages.getMessageContext(parsedMessageId.data);
+    if (!result) {
+      return context.json(apiError('message_not_found', 'Message was not found'), 404);
+    }
+    return context.json(result);
   });
   app.get('/api/v1/messages/:id', async (context) => {
     const parsedMessageId = uuidSchema.safeParse(context.req.param('id'));

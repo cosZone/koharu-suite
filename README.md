@@ -10,7 +10,7 @@ Telegram 多频道归档、动态内容、统一管理与静态发布能力。
 - 默认保持 astro-koharu 的纯静态构建与部署体验；
 - 需要时再连接独立的 suite 后端；
 - 内容与媒体可导出、可恢复，移除后端不影响既有静态站点；
-- 以 PostgreSQL 18、Astro 6 Live Content Collections 和开放 JSON API 为基础。
+- 以 PostgreSQL 18、Astro 6/7 Live Content Collections 和开放 JSON API 为基础。
 
 当前 [G2.5 #26](https://github.com/cosZone/koharu-suite/issues/26) 在多频道归档、可审计恢复和
 local/S3-compatible 媒体层之上增加了公开搜索与 RSS：
@@ -131,20 +131,25 @@ update 在重新启用后不会补回。
 Telegram 只保留尚未取得的 update 最多约 24 小时；服务离线超过上游 retention 时，Bot API 无法
 补回已经删除的 update。
 
-发布消息后，先发现 suite channel ID，再读取消息：
+频道归档首条消息后才会取得稳定的 suite channel ID。Owner Desk 会显示并复制完整 UUID；无 GUI
+环境仍可用 `/api/v1/channels` 查询。消费方若展示全部公开频道（例如省略 astro-koharu 的
+`moments.channels`），无需手工填写 UUID。读取消息：
 
 ```bash
 curl http://localhost:3000/api/v1/channels
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50"
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50&cursor=<nextCursor>"
+curl "http://localhost:3000/api/v1/messages/latest?limit=50"
 curl http://localhost:3000/api/v1/messages/<suiteMessageId>
-curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro 6"
+curl http://localhost:3000/api/v1/messages/<suiteMessageId>/context
+curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro"
 curl http://localhost:3000/api/v1/rss.xml
 curl http://localhost:3000/api/v1/channels/<suiteChannelId>/rss.xml
 ```
 
-消息列表返回 `{ items, nextCursor }`；`limit` 默认为 50，范围 1–100，`cursor` 是与频道绑定的
-opaque 值，不应由客户端解析或修改。归档 revision 会保存 escaped text/entities 生成的安全 HTML；
+消息列表返回 `{ items, nextCursor }`；`limit` 默认为 50，范围 1–100，`cursor` 是绑定请求范围的
+opaque 值，不应由客户端解析或修改。全局最新和搜索可重复传入最多 32 个 `channel` UUID，只在这些
+可见频道中分页；省略时保持原有全局行为。归档 revision 会保存 escaped text/entities 生成的安全 HTML；
 renderer 升级后可在 Owner Desk 运行 “Rerender outdated”，只更新派生 HTML/version，不改 revision
 历史。
 

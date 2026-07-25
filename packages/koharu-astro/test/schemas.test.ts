@@ -2,11 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   apiErrorResponseSchema,
   channelListResponseSchema,
+  messageContextSchema,
   messagePageSchema,
   publicMessageSchema,
   searchMessagePageSchema,
 } from '../src/schemas.js';
-import { channel, message } from './fixtures.js';
+import { CHANNEL_ID, channel, message, NEWER_MESSAGE_ID } from './fixtures.js';
 
 describe('public response schemas', () => {
   it('parses the complete public message contract without narrowing open entity types', () => {
@@ -61,6 +62,22 @@ describe('public response schemas', () => {
         nextCursor: null,
       }),
     ).toMatchObject({ mode: 'trigram', nextCursor: null });
+  });
+
+  it('parses message context without requiring neighbor media', () => {
+    const context = messageContextSchema.parse({
+      message,
+      newer: {
+        channelId: CHANNEL_ID,
+        id: NEWER_MESSAGE_ID,
+        preview: 'A plain text preview',
+        publishedAt: '2026-07-25T00:00:00.000Z',
+      },
+      older: null,
+    });
+
+    expect(context.newer).toMatchObject({ id: NEWER_MESSAGE_ID, preview: 'A plain text preview' });
+    expect(context.older).toBeNull();
   });
 
   it('keeps API error codes open for forward-compatible server additions', () => {

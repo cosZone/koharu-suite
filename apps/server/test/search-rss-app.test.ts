@@ -4,6 +4,7 @@ import { messageSearchQueryHash } from '../src/messages/search.js';
 import type { MessageDiscoveryReader, PublicMessage } from '../src/messages/types.js';
 
 const CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
+const OTHER_CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af2';
 const MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b33';
 const message: PublicMessage = {
   authorSignature: null,
@@ -74,6 +75,24 @@ describe('search and RSS HTTP routes', () => {
       query: 'koharu',
       sort: 'relevance',
       to: '2026-08-01T00:00:00.000Z',
+    });
+  });
+
+  it('passes deduped multi-channel visibility filters without changing singular behavior', async () => {
+    const discovery = createDiscovery();
+    const response = await createApp({ discovery }).request(
+      `/api/v1/search/messages?q=koharu&channel=${CHANNEL_ID}&channel=${OTHER_CHANNEL_ID}&channel=${CHANNEL_ID}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(discovery.searchMessages).toHaveBeenCalledWith({
+      channelId: null,
+      channelIds: [CHANNEL_ID, OTHER_CHANNEL_ID],
+      from: null,
+      limit: 20,
+      query: 'koharu',
+      sort: 'relevance',
+      to: null,
     });
   });
 

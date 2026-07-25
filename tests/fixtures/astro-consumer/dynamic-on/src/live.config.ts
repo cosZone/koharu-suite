@@ -6,7 +6,7 @@ import {
   publicMessageSchema,
 } from '@coszone/koharu-astro';
 
-const baseUrl = process.env.KOHARU_SUITE_URL;
+const baseUrl = import.meta.env.KOHARU_SUITE_URL;
 
 if (!baseUrl) {
   throw new Error('KOHARU_SUITE_URL is required by the dynamic fixture');

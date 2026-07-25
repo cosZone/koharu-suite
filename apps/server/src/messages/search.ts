@@ -9,6 +9,7 @@ export type MessageSearchSort = 'newest' | 'relevance';
 
 export interface MessageSearchKey {
   channelId: string | null;
+  channelIds?: readonly string[];
   from: string | null;
   query: string;
   sort: MessageSearchSort;
@@ -78,14 +79,18 @@ function isCanonicalIsoTimestamp(value: unknown): value is string {
 }
 
 function canonicalKey(key: MessageSearchKey): string {
-  return JSON.stringify({
+  const value = {
     v: 1,
     query: key.query,
     channelId: key.channelId,
     from: key.from,
     to: key.to,
     sort: key.sort,
-  });
+    ...(key.channelIds && key.channelIds.length > 0
+      ? { channelIds: [...key.channelIds].sort() }
+      : {}),
+  };
+  return JSON.stringify(value);
 }
 
 export function messageSearchQueryHash(key: MessageSearchKey): string {

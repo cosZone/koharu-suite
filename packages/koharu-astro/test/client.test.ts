@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createKoharuClient, isKoharuError, type KoharuError } from '../src/client.js';
-import { CHANNEL_ID, channel, MESSAGE_ID, message } from './fixtures.js';
+import {
+  CHANNEL_ID,
+  channel,
+  MESSAGE_ID,
+  message,
+  NEWER_MESSAGE_ID,
+  OLDER_MESSAGE_ID,
+} from './fixtures.js';
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -87,6 +94,94 @@ describe('typed client', () => {
     });
     expect(url.searchParams.has('channel')).toBe(false);
     expect(url.searchParams.has('limit')).toBe(false);
+  });
+
+  it('fetches global latest messages with bounded, stable visible channel filters', async () => {
+    const secondChannelId = '019bf894-2b6c-7b18-bd70-0ad6349a4af2';
+    const fetchMock = vi.fn(async (_input: string | URL | Request) =>
+      jsonResponse({ items: [message], nextCursor: null }),
+    );
+    const client = createKoharuClient({
+      baseUrl: 'https://suite.example',
+      fetch: fetchMock as typeof fetch,
+    });
+
+    await client.messages.latest({
+      channelIds: [CHANNEL_ID, secondChannelId, CHANNEL_ID],
+      cursor: 'opaque+cursor',
+      limit: 20,
+    });
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.pathname).toBe('/api/v1/messages/latest');
+    expect(url.searchParams.getAll('channel')).toEqual([CHANNEL_ID, secondChannelId]);
+    expect(url.searchParams.get('cursor')).toBe('opaque+cursor');
+    expect(url.searchParams.get('limit')).toBe('20');
+  });
+
+  it('fetches message context with lightweight neighbor references', async () => {
+    const context = {
+      message,
+      newer: {
+        channelId: CHANNEL_ID,
+        id: NEWER_MESSAGE_ID,
+        preview: 'Newer message',
+        publishedAt: '2026-07-25T00:00:00.000Z',
+      },
+      older: {
+        channelId: CHANNEL_ID,
+        id: OLDER_MESSAGE_ID,
+        preview: null,
+        publishedAt: '2026-07-23T00:00:00.000Z',
+      },
+    };
+    const fetchMock = vi.fn(async (_input: string | URL | Request) => jsonResponse(context));
+    const client = createKoharuClient({
+      baseUrl: 'https://suite.example',
+      fetch: fetchMock as typeof fetch,
+    });
+
+    await expect(client.messages.context({ messageId: MESSAGE_ID })).resolves.toEqual(context);
+    expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe(
+      `/api/v1/messages/${MESSAGE_ID}/context`,
+    );
+  });
+
+  it('adds repeated visible channel filters to search and rejects ambiguous scopes', async () => {
+    const secondChannelId = '019bf894-2b6c-7b18-bd70-0ad6349a4af2';
+    const fetchMock = vi.fn(async (_input: string | URL | Request) =>
+      jsonResponse({ items: [], mode: 'trigram', nextCursor: null }),
+    );
+    const client = createKoharuClient({
+      baseUrl: 'https://suite.example',
+      fetch: fetchMock as typeof fetch,
+    });
+
+    await client.search.messages({
+      channelIds: [CHANNEL_ID, secondChannelId, CHANNEL_ID],
+      query: 'Astro',
+    });
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.searchParams.getAll('channel')).toEqual([CHANNEL_ID, secondChannelId]);
+
+    expect(() =>
+      client.search.messages({ channelId: CHANNEL_ID, channelIds: [], query: 'Astro' }),
+    ).toThrow('channelId and channelIds cannot be used together');
+  });
+
+  it('rejects more than 32 unique visible channel IDs before fetch', () => {
+    const fetchMock = vi.fn();
+    const client = createKoharuClient({
+      baseUrl: 'https://suite.example',
+      fetch: fetchMock as typeof fetch,
+    });
+    const channelIds = Array.from(
+      { length: 33 },
+      (_, index) => `019bf894-2b6c-7b18-bd70-${index.toString(16).padStart(12, '0')}`,
+    );
+
+    expect(() => client.messages.latest({ channelIds })).toThrow('at most 32 unique IDs');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('validates short search boundaries before issuing a request', async () => {

@@ -2,6 +2,8 @@ import type { PublicChannel, PublicMessage } from '../src/schemas.js';
 
 export const CHANNEL_ID = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
 export const MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b33';
+export const NEWER_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b37';
+export const OLDER_MESSAGE_ID = '019bf895-0e70-7881-83b3-471b8dbb1b38';
 export const MEDIA_ID = '019bf895-0e70-7881-83b3-471b8dbb1b35';
 export const MEDIA_OBJECT_ID = '019bf895-0e70-7881-83b3-471b8dbb1b36';
 

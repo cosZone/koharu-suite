@@ -45,6 +45,25 @@ describe('message search helpers', () => {
     );
   });
 
+  it('binds cursors to a normalized visible-channel set without changing unfiltered hashes', () => {
+    const first = '70fb9e5c-b6e4-4c53-964b-dfb322b5a3b7';
+    const second = 'c78e9147-480f-4e63-941c-eefac29534d0';
+    const filtered = { ...KEY, channelIds: [first, second] };
+    const filteredCursor = {
+      ...CURSOR,
+      queryHash: messageSearchQueryHash(filtered),
+    };
+    const encoded = encodeMessageSearchCursor(filteredCursor);
+
+    expect(decodeMessageSearchCursor(encoded, { ...KEY, channelIds: [second, first] })).toEqual(
+      filteredCursor,
+    );
+    expect(() => decodeMessageSearchCursor(encoded, { ...KEY, channelIds: [first] })).toThrow(
+      InvalidSearchCursorError,
+    );
+    expect(messageSearchQueryHash(KEY)).toBe(CURSOR.queryHash);
+  });
+
   it('rejects malformed, non-canonical, and mode-mismatched cursors', () => {
     expect(() => decodeMessageSearchCursor('not+base64', KEY)).toThrow(InvalidSearchCursorError);
     const malformed = Buffer.from(JSON.stringify({ ...CURSOR, v: 1, extra: true })).toString(

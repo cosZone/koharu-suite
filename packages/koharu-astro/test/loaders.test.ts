@@ -10,7 +10,9 @@ function mockClient(): KoharuClient {
       list: vi.fn(async () => ({ items: [channel] })),
     },
     messages: {
+      context: vi.fn(async () => ({ message, newer: null, older: null })),
       get: vi.fn(async () => message),
+      latest: vi.fn(async () => ({ items: [message], nextCursor: null })),
       list: vi.fn(async () => ({ items: [message], nextCursor: 'not-exposed-by-loader' })),
     },
     resolveUrl: vi.fn((path) => path),
