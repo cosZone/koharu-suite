@@ -1,0 +1,14 @@
+---
+import { getCollection } from 'astro:content';
+
+const _posts = await getCollection('blog');
+---
+
+<html lang="en">
+  <body>
+    <main data-fixture="static-off">
+      <h1>Static fixture</h1>
+      <p>{_posts[0]?.data.title}</p>
+    </main>
+  </body>
+</html>

@@ -21,11 +21,14 @@
     "kodama": "kodama",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
+    "pack:koharu-astro": "node scripts/pack-koharu-astro.mjs",
     "storybook": "pnpm --filter @koharu-suite/ui storybook",
-    "test": "pnpm -r --if-present test",
+    "test": "pnpm --filter @coszone/koharu-astro build && pnpm -r --if-present test",
+    "test:astro-fixture": "node scripts/astro-fixture/run-minimal.mjs",
+    "test:astro-template": "node scripts/astro-fixture/run-template.mjs",
     "test:integration": "pnpm --filter @koharu-suite/server test:integration",
     "test:storybook": "pnpm --filter @koharu-suite/ui test:storybook",
-    "typecheck": "pnpm --filter @koharu-suite/ui build && pnpm -r --if-present typecheck",
+    "typecheck": "pnpm --filter @koharu-suite/ui build && pnpm --filter @coszone/koharu-astro build && pnpm -r --if-present typecheck",
     "version:packages": "pnpm exec changeset version"
   },
   "devDependencies": {

@@ -1,0 +1,33 @@
+---
+import { getLiveEntry } from 'astro:content';
+
+export const prerender = false;
+
+const result = await getLiveEntry('koharuMessages', Astro.params.id ?? '');
+const entry = result.entry;
+const error = result.error;
+const isNotFound = error && 'code' in error && error.code === 'message_not_found';
+
+if (error || !entry) {
+  Astro.response.status = isNotFound ? 404 : 503;
+}
+---
+
+<html lang="en">
+  <body>
+    <main data-fixture="dynamic-detail">
+      {
+        entry ? (
+          <>
+            <h1>Message revision {entry.data.revision}</h1>
+            <Fragment set:html={entry.rendered?.html ?? ''} />
+          </>
+        ) : (
+          <p data-state={isNotFound ? 'not-found' : 'unavailable'}>
+            {isNotFound ? 'Message not found' : 'Archive unavailable'}
+          </p>
+        )
+      }
+    </main>
+  </body>
+</html>
