@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
-const artifactDirectory = join(repositoryRoot, '.artifacts', 'koharu-astro');
+const artifactDirectory = join(repositoryRoot, '.artifacts', 'koharu-astro-loader');
 const artifactPath = join(artifactDirectory, 'package.tgz');
-const temporaryDirectory = await mkdtemp(join(tmpdir(), 'koharu-astro-pack-'));
+const temporaryDirectory = await mkdtemp(join(tmpdir(), 'koharu-astro-loader-pack-'));
 const packDirectory = join(temporaryDirectory, 'pack');
 const extractDirectory = join(temporaryDirectory, 'extract');
 
@@ -42,8 +42,8 @@ try {
   await mkdir(packDirectory, { recursive: true });
   await mkdir(extractDirectory, { recursive: true });
 
-  run('pnpm', ['--filter', '@coszone/koharu-astro', 'build']);
-  run('pnpm', ['--filter', '@coszone/koharu-astro', 'pack', '--pack-destination', packDirectory]);
+  run('pnpm', ['--filter', '@koharu/astro-loader', 'build']);
+  run('pnpm', ['--filter', '@koharu/astro-loader', 'pack', '--pack-destination', packDirectory]);
 
   const tarballs = (await readdir(packDirectory)).filter((name) => name.endsWith('.tgz'));
   assert(tarballs.length === 1, `Expected one tarball, found ${tarballs.length}`);
@@ -80,7 +80,7 @@ try {
   run('tar', ['-xzf', packedTarball, '-C', extractDirectory]);
   const packedRoot = join(extractDirectory, 'package');
   const packageJson = JSON.parse(await readFile(join(packedRoot, 'package.json'), 'utf8'));
-  assert(packageJson.name === '@coszone/koharu-astro', 'Unexpected package name');
+  assert(packageJson.name === '@koharu/astro-loader', 'Unexpected package name');
   assert(packageJson.private !== true, 'Publishable package cannot be private');
   assert(packageJson.publishConfig?.access === 'public', 'publishConfig.access must be public');
   assert(packageJson.publishConfig?.provenance === true, 'publishConfig.provenance must be true');
@@ -89,7 +89,7 @@ try {
     'publishConfig.registry must be the public npm registry',
   );
   assert(
-    packageJson.repository?.directory === 'packages/koharu-astro',
+    packageJson.repository?.directory === 'packages/astro-loader',
     'repository.directory is incorrect',
   );
   assert(packageJson.sideEffects === false, 'sideEffects must be false');

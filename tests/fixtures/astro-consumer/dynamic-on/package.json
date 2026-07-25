@@ -1,12 +1,12 @@
 {
-  "name": "koharu-astro-dynamic-on-fixture",
+  "name": "koharu-astro-loader-dynamic-on-fixture",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "dependencies": {
     "@astrojs/check": "0.9.9",
     "@astrojs/node": "10.1.4",
-    "@coszone/koharu-astro": "file:__KOHARU_ASTRO_TARBALL__",
+    "@koharu/astro-loader": "file:__KOHARU_ASTRO_LOADER_TARBALL__",
     "astro": "6.4.8",
     "typescript": "5.9.3"
   }

@@ -39,17 +39,17 @@ export async function removeTemporaryDirectory(path) {
   await rm(path, { force: true, recursive: true });
 }
 
-export async function packKoharuAstro(destination) {
-  const providedTarball = process.env.KOHARU_ASTRO_TARBALL;
+export async function packAstroLoader(destination) {
+  const providedTarball = process.env.KOHARU_ASTRO_LOADER_TARBALL;
   if (providedTarball) {
     const tarball = resolve(repositoryRoot, providedTarball);
     await access(tarball);
     return tarball;
   }
-  await runCommand('pnpm', ['--filter', '@coszone/koharu-astro', 'build']);
+  await runCommand('pnpm', ['--filter', '@koharu/astro-loader', 'build']);
   await runCommand('pnpm', [
     '--filter',
-    '@coszone/koharu-astro',
+    '@koharu/astro-loader',
     'pack',
     '--pack-destination',
     destination,
@@ -57,7 +57,7 @@ export async function packKoharuAstro(destination) {
   const tarballs = (await readdir(destination))
     .filter((entry) => entry.endsWith('.tgz'))
     .map((entry) => join(destination, entry));
-  assert.equal(tarballs.length, 1, 'Expected exactly one @coszone/koharu-astro tarball');
+  assert.equal(tarballs.length, 1, 'Expected exactly one @koharu/astro-loader tarball');
   return tarballs[0];
 }
 
@@ -65,8 +65,12 @@ export async function prepareConsumerFixture(source, destination, tarball) {
   await cp(source, destination, { recursive: true });
   const packageJsonPath = join(destination, 'package.json');
   const manifest = await readFile(packageJsonPath, 'utf8');
-  assert.match(manifest, /__KOHARU_ASTRO_TARBALL__/u);
-  await writeFile(packageJsonPath, manifest.replace('__KOHARU_ASTRO_TARBALL__', tarball), 'utf8');
+  assert.match(manifest, /__KOHARU_ASTRO_LOADER_TARBALL__/u);
+  await writeFile(
+    packageJsonPath,
+    manifest.replace('__KOHARU_ASTRO_LOADER_TARBALL__', tarball),
+    'utf8',
+  );
   await runCommand('pnpm', ['install', '--no-frozen-lockfile'], { cwd: destination });
 }
 
