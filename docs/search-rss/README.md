@@ -21,12 +21,30 @@ G2.5 为公开的 current message 投影增加 PostgreSQL 18 `pg_trgm` 搜索，
 `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` 调整单进程 fixed-window 限流；不要使用 `*` 或
 credentialed CORS。
 
+## 全局最新消息与上下文
+
+全局最新接口按 `publishedAt DESC, message UUID DESC` 返回稳定 cursor page：
+
+```http
+GET /api/v1/messages/latest?channel=<suiteChannelId>&limit=50&cursor=<opaque>
+GET /api/v1/messages/:suiteMessageId/context
+```
+
+`latest` 的 `channel` 可以省略，也可以重复传入最多 32 个不同的 suite UUID。重复 ID 会被去重；
+省略时读取全部公开频道。过滤在数据库分页前执行，不会产生先取后滤的漏项。cursor 与首次请求的
+频道集合和读取快照绑定，后续页面必须原样重复 `channel` 参数。
+
+`context` 返回完整当前消息，以及同频道中不含媒体的轻量 `newer` / `older` 引用；边界为 `null`。
+顺序与 feed 相同，tombstone 消息不会作为当前消息或邻接项出现。频道 UUID 只有在首条消息归档后
+才存在；Owner Desk 可复制完整 ID，`GET /api/v1/channels` 是无 GUI 环境的 fallback。消费全部公开
+频道时不需要手工配置 UUID。
+
 ## 搜索 API
 
 ```http
 GET /api/v1/search/messages
   ?q=<text>
-  &channel=<suiteChannelId>
+  &channel=<suiteChannelId>  # 可重复，最多 32 个不同 UUID
   &from=<canonical-UTC>
   &to=<canonical-UTC>
   &sort=relevance|newest
@@ -35,6 +53,8 @@ GET /api/v1/search/messages
 ```
 
 `q` trim 后必须为 1–200 个 Unicode code point。`channel`、`from` 和 `to` 对 3 字符以上查询均可选；
+多个 `channel` 在数据库查询前组成可见频道集合，避免客户端分页后再过滤。cursor 与规范化后的频道
+集合绑定。
 `from` inclusive、`to` exclusive，时间必须是 canonical ISO 8601 UTC，例如
 `2026-07-01T00:00:00.000Z`。
 
@@ -112,6 +132,7 @@ curl --get "$ORIGIN/api/v1/search/messages" \
 |---|---|
 | `invalid_query` | `q` 缺失、为空或超过 200 个 Unicode 字符 |
 | `invalid_channel` | `channel` 不是 suite UUID |
+| `too_many_channels` | 重复 `channel` 中包含超过 32 个不同 UUID |
 | `channel_not_found` | suite channel 不存在 |
 | `invalid_time_range` | 时间非 canonical UTC，或 `from >= to` |
 | `invalid_sort` / `invalid_limit` | 排序或页大小不在允许范围 |

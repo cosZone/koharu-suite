@@ -3,6 +3,7 @@ import {
   asc,
   desc,
   eq,
+  gt,
   gte,
   inArray,
   isNotNull,
@@ -40,6 +41,10 @@ import {
 } from './search.js';
 import { lockSourceEvidenceDiscovery } from './source-evidence-coordination.js';
 import type {
+  LatestMessageListOptions,
+  LatestMessagePage,
+  MessageContext,
+  MessageContextReference,
   MessageDiscoveryReader,
   MessageListOptions,
   MessagePage,
@@ -251,6 +256,15 @@ function publicMessage(row: MessageRow, media: PublicMedia[]): PublicMessage {
     revision: row.revisionNumber,
     sourceUrl: sourceUrl(row.channelUsername, row.telegramMessageId),
   };
+}
+
+function messagePreview(text: string | null): string | null {
+  const normalized = text?.replaceAll(/\s+/gu, ' ').trim();
+  if (!normalized) {
+    return null;
+  }
+  const characters = Array.from(normalized);
+  return characters.length <= 40 ? normalized : `${characters.slice(0, 39).join('')}…`;
 }
 
 export class PostgresMessageRepository
@@ -710,6 +724,78 @@ export class PostgresMessageRepository
     return message ?? null;
   }
 
+  async listLatestMessages(options: LatestMessageListOptions): Promise<LatestMessagePage> {
+    const snapshotAt = options.cursor?.snapshotAt ?? (await this.databaseSnapshotAt());
+    const cursor = options.cursor;
+    const cursorWhere = cursor
+      ? or(
+          lt(messages.publishedAt, new Date(cursor.publishedAt)),
+          and(
+            eq(messages.publishedAt, new Date(cursor.publishedAt)),
+            lt(messages.id, cursor.messageId),
+          ),
+        )
+      : undefined;
+    const rows = await this.selectMessages(
+      and(
+        options.channelIds.length > 0
+          ? inArray(messages.channelId, [...options.channelIds])
+          : undefined,
+        lte(messages.createdAt, new Date(snapshotAt)),
+        lte(messages.updatedAt, new Date(snapshotAt)),
+        cursorWhere,
+      ),
+      options.limit + 1,
+    );
+    const hasMore = rows.length > options.limit;
+    const pageRows = rows.slice(0, options.limit);
+    const items = await this.attachMedia(pageRows);
+    const last = pageRows.at(-1);
+    return {
+      items,
+      nextCursor:
+        hasMore && last
+          ? {
+              channelId: last.channelId,
+              messageId: last.messageId,
+              publishedAt: last.publishedAt.toISOString(),
+              snapshotAt,
+            }
+          : null,
+    };
+  }
+
+  async getMessageContext(id: string): Promise<MessageContext | null> {
+    const rows = await this.selectMessages(eq(messages.id, id), 1);
+    const [anchor] = rows;
+    if (!anchor) {
+      return null;
+    }
+    const [message] = await this.attachMedia([anchor]);
+    if (!message) {
+      return null;
+    }
+    const newerWhere = and(
+      eq(messages.channelId, anchor.channelId),
+      or(
+        gt(messages.publishedAt, anchor.publishedAt),
+        and(eq(messages.publishedAt, anchor.publishedAt), gt(messages.id, anchor.messageId)),
+      ),
+    );
+    const olderWhere = and(
+      eq(messages.channelId, anchor.channelId),
+      or(
+        lt(messages.publishedAt, anchor.publishedAt),
+        and(eq(messages.publishedAt, anchor.publishedAt), lt(messages.id, anchor.messageId)),
+      ),
+    );
+    const [newer, older] = await Promise.all([
+      this.selectMessageContextReference(newerWhere, 'asc'),
+      this.selectMessageContextReference(olderWhere, 'desc'),
+    ]);
+    return { message, newer, older };
+  }
+
   async getFeed(channelId?: string): Promise<MessageFeed | null> {
     let channel: MessageFeed['channel'] = null;
     if (channelId !== undefined) {
@@ -813,6 +899,9 @@ export class PostgresMessageRepository
           lte(messages.createdAt, new Date(snapshotAt)),
           lte(messages.updatedAt, new Date(snapshotAt)),
           options.channelId === null ? undefined : eq(messages.channelId, options.channelId),
+          options.channelIds && options.channelIds.length > 0
+            ? inArray(messages.channelId, [...options.channelIds])
+            : undefined,
           options.from === null ? undefined : gte(messages.publishedAt, new Date(options.from)),
           options.to === null ? undefined : lt(messages.publishedAt, new Date(options.to)),
           sql`${messageRevisions.text} ILIKE ${literalPattern} ESCAPE '\\'`,
@@ -1129,6 +1218,41 @@ export class PostgresMessageRepository
       throw new Error('PostgreSQL did not return a valid discovery snapshot timestamp');
     }
     return timestamp.toISOString();
+  }
+
+  private async selectMessageContextReference(
+    where: SQL | undefined,
+    direction: 'asc' | 'desc',
+  ): Promise<MessageContextReference | null> {
+    const [row] = await this.database
+      .select({
+        channelId: messages.channelId,
+        id: messages.id,
+        publishedAt: messages.publishedAt,
+        text: messageRevisions.text,
+      })
+      .from(messages)
+      .innerJoin(
+        messageRevisions,
+        and(
+          eq(messageRevisions.messageId, messages.id),
+          eq(messageRevisions.revisionNumber, messages.currentRevisionNumber),
+        ),
+      )
+      .where(and(where, isNull(messages.tombstonedAt)))
+      .orderBy(
+        direction === 'asc' ? asc(messages.publishedAt) : desc(messages.publishedAt),
+        direction === 'asc' ? asc(messages.id) : desc(messages.id),
+      )
+      .limit(1);
+    return row
+      ? {
+          channelId: row.channelId,
+          id: row.id,
+          preview: messagePreview(row.text),
+          publishedAt: row.publishedAt.toISOString(),
+        }
+      : null;
   }
 
   private async attachMedia(rows: MessageRow[]): Promise<PublicMessage[]> {

@@ -1,10 +1,10 @@
 # `@coszone/koharu-astro`
 
-`@coszone/koharu-astro` 是 [koharu-suite](https://github.com/cosZone/koharu-suite) 的 Astro 6
+`@coszone/koharu-astro` 是 [koharu-suite](https://github.com/cosZone/koharu-suite) 的 Astro 6/7
 适配器，提供：
 
 - 经过 Zod 校验的公开只读 client；
-- 频道与消息的 Astro 6 Live Loaders；
+- 频道与消息的 Astro 6/7 Live Loaders；
 - 统一、可判别且不会泄露响应正文的错误；
 - RSS 与媒体 URL 构造工具。
 
@@ -17,7 +17,7 @@ Live Collection，现有纯静态博客仍然照常构建。
 pnpm add @coszone/koharu-astro
 ```
 
-需要 Astro `^6.0.0`、Node.js `>=22.20.0`。Live Collection 在请求时运行，因此消费站点还需要自行配置
+需要 Astro `^6.0.0 || ^7.0.0`、Node.js `>=22.20.0`。Live Collection 在请求时运行，因此消费站点还需要自行配置
 支持 on-demand rendering 的 Astro adapter。
 
 ## Typed client
@@ -35,9 +35,19 @@ const page = await client.messages.list({
   limit: 20,
 });
 
+const latest = await client.messages.latest({
+  // 可省略；重复 ID 会被去重，最多 32 个可见频道。
+  channelIds: channels.items.map((channel) => channel.id),
+  limit: 20,
+});
+
+const context = await client.messages.context({
+  messageId: latest.items[0].id,
+});
+
 const result = await client.search.messages({
-  query: 'Astro 6',
-  channelId: channels.items[0].id,
+  query: 'Astro',
+  channelIds: channels.items.map((channel) => channel.id),
 });
 ```
 
@@ -52,7 +62,11 @@ client.urls.globalRss();
 client.urls.channelRss(channels.items[0].id);
 ```
 
-## Astro 6 Live Collections
+`messages.context()` 返回完整当前消息，以及不含媒体的轻量 `newer` / `older` 引用，适合详情页导航。
+`messages.latest()` 和 `search.messages()` 的 `channelIds` 会以服务端过滤执行，避免先取一页再在客户端过滤而漏项。
+搜索原有的单个 `channelId` 参数保持兼容，但不能与 `channelIds` 同时传入。空 `channelIds` 与省略参数都表示不限制频道。
+
+## Astro 6/7 Live Collections
 
 ```ts
 // src/live.config.ts
@@ -80,7 +94,7 @@ export const collections = {
 ```
 
 页面通过 `getLiveCollection()` 和 `getLiveEntry()` 在运行时读取数据。消息 loader 只加载一页；
-Astro 6 的 Live Collection result 无法携带 suite 的 `nextCursor`，需要分页或搜索时请直接调用 typed
+Astro 的 Live Collection result 无法携带 suite 的 `nextCursor`，需要分页或搜索时请直接调用 typed
 client。
 
 安全 HTML 会映射到 entry 的 `rendered.html`，页面可以用 Astro 的 `set:html` 输出。loader 不把

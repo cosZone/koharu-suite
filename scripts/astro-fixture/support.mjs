@@ -61,12 +61,17 @@ export async function packKoharuAstro(destination) {
   return tarballs[0];
 }
 
-export async function prepareConsumerFixture(source, destination, tarball) {
+export async function prepareConsumerFixture(source, destination, tarball, replacements = {}) {
   await cp(source, destination, { recursive: true });
   const packageJsonPath = join(destination, 'package.json');
-  const manifest = await readFile(packageJsonPath, 'utf8');
+  let manifest = await readFile(packageJsonPath, 'utf8');
   assert.match(manifest, /__KOHARU_ASTRO_TARBALL__/u);
-  await writeFile(packageJsonPath, manifest.replace('__KOHARU_ASTRO_TARBALL__', tarball), 'utf8');
+  manifest = manifest.replace('__KOHARU_ASTRO_TARBALL__', tarball);
+  for (const [placeholder, value] of Object.entries(replacements)) {
+    assert.match(manifest, new RegExp(placeholder, 'u'));
+    manifest = manifest.replaceAll(placeholder, value);
+  }
+  await writeFile(packageJsonPath, manifest, 'utf8');
   await runCommand('pnpm', ['install', '--no-frozen-lockfile'], { cwd: destination });
 }
 

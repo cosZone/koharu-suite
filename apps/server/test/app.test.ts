@@ -68,8 +68,11 @@ const message: PublicMessage = {
 
 function createReader(): MessageReader {
   return {
+    getMessageContext: async (id) =>
+      id === MESSAGE_ID ? { message, newer: null, older: null } : null,
     getMessage: async (id) => (id === MESSAGE_ID ? message : null),
     listChannels: async () => [message.channel],
+    listLatestMessages: async () => ({ items: [message], nextCursor: null }),
     listMessages: async (channelId) =>
       channelId === CHANNEL_ID ? { items: [message], nextCursor: null } : null,
   };
@@ -199,12 +202,74 @@ describe('public message endpoints', () => {
     const detailResponse = await app.request(`/api/v1/messages/${MESSAGE_ID}`);
     expect(detailResponse.status).toBe(200);
     await expect(detailResponse.json()).resolves.toEqual(message);
+
+    const contextResponse = await app.request(`/api/v1/messages/${MESSAGE_ID}/context`);
+    expect(contextResponse.status).toBe(200);
+    await expect(contextResponse.json()).resolves.toEqual({ message, newer: null, older: null });
+  });
+
+  it('returns global latest pages with deduped filters and a snapshot-bound cursor', async () => {
+    const nextCursor = {
+      channelId: OTHER_CHANNEL_ID,
+      messageId: NEXT_MESSAGE_ID,
+      publishedAt: '2025-06-30T16:13:19.000Z',
+      snapshotAt: '2026-07-26T00:00:00.000Z',
+    };
+    const listLatestMessages = vi.fn(async () => ({ items: [message], nextCursor }));
+    const reader: MessageReader = { ...createReader(), listLatestMessages };
+    const first = await createApp({ messages: reader }).request(
+      `/api/v1/messages/latest?channel=${CHANNEL_ID}&channel=${CHANNEL_ID}&channel=${OTHER_CHANNEL_ID}&limit=20`,
+    );
+
+    expect(first.status).toBe(200);
+    expect(listLatestMessages).toHaveBeenCalledWith({
+      channelIds: [CHANNEL_ID, OTHER_CHANNEL_ID],
+      limit: 20,
+    });
+    const firstBody = await first.json();
+    const cursor = firstBody.nextCursor as string;
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/u);
+
+    const next = await createApp({ messages: reader }).request(
+      `/api/v1/messages/latest?channel=${OTHER_CHANNEL_ID}&channel=${CHANNEL_ID}&cursor=${cursor}`,
+    );
+    expect(next.status).toBe(200);
+    expect(listLatestMessages).toHaveBeenLastCalledWith({
+      channelIds: [OTHER_CHANNEL_ID, CHANNEL_ID],
+      cursor: nextCursor,
+      limit: 50,
+    });
+
+    const rebound = await createApp({ messages: reader }).request(
+      `/api/v1/messages/latest?channel=${CHANNEL_ID}&cursor=${cursor}`,
+    );
+    expect(rebound.status).toBe(400);
+    await expect(rebound.json()).resolves.toMatchObject({ error: { code: 'invalid_cursor' } });
+  });
+
+  it('rejects invalid and beyond-bound visible channel filters', async () => {
+    const invalid = await createApp({ messages: createReader() }).request(
+      `/api/v1/messages/latest?channel=${CHANNEL_ID}&channel=not-a-uuid`,
+    );
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: { code: 'invalid_channel' } });
+
+    const params = new URLSearchParams();
+    for (let index = 1; index <= 33; index += 1) {
+      params.append('channel', `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`);
+    }
+    const beyond = await createApp({ messages: createReader() }).request(
+      `/api/v1/messages/latest?${params.toString()}`,
+    );
+    expect(beyond.status).toBe(400);
+    await expect(beyond.json()).resolves.toMatchObject({ error: { code: 'too_many_channels' } });
   });
 
   it.each([
     ['/api/v1/messages', 'invalid_channel'],
     ['/api/v1/messages?channel=not-a-uuid', 'invalid_channel'],
     ['/api/v1/messages/not-a-uuid', 'invalid_message_id'],
+    ['/api/v1/messages/not-a-uuid/context', 'invalid_message_id'],
   ])('rejects an invalid request at %s', async (path, code) => {
     const response = await createApp({ messages: createReader() }).request(path);
 
@@ -217,6 +282,7 @@ describe('public message endpoints', () => {
   it.each([
     [`/api/v1/messages?channel=019bf894-2b6c-7b18-bd70-0ad6349a4af2`, 'channel_not_found'],
     [`/api/v1/messages/019bf895-0e70-7881-83b3-471b8dbb1b34`, 'message_not_found'],
+    [`/api/v1/messages/019bf895-0e70-7881-83b3-471b8dbb1b34/context`, 'message_not_found'],
   ])('returns not found at %s without leaking storage details', async (path, code) => {
     const response = await createApp({ messages: createReader() }).request(path);
 

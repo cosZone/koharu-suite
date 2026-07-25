@@ -1,5 +1,5 @@
 import type { Update } from 'grammy/types';
-import type { MessageCursor } from '../http/cursor.js';
+import type { LatestMessageCursor, MessageCursor } from '../http/cursor.js';
 import type { NormalizedMediaKind, NormalizedMessageEntity } from '../telegram/types.js';
 import type { MessageFeed } from './rss.js';
 import type { MessageSearchOptions, MessageSearchPage } from './search.js';
@@ -125,13 +125,39 @@ export interface MessagePage {
   nextCursor: MessageCursor | null;
 }
 
+export interface LatestMessagePage {
+  items: PublicMessage[];
+  nextCursor: LatestMessageCursor | null;
+}
+
+export interface LatestMessageListOptions {
+  channelIds: readonly string[];
+  cursor?: LatestMessageCursor;
+  limit: number;
+}
+
+export interface MessageContextReference {
+  channelId: string;
+  id: string;
+  preview: string | null;
+  publishedAt: string;
+}
+
+export interface MessageContext {
+  message: PublicMessage;
+  newer: MessageContextReference | null;
+  older: MessageContextReference | null;
+}
+
 export interface MessageListOptions {
   cursor?: MessageCursor;
   limit: number;
 }
 
 export interface MessageReader {
+  getMessageContext(id: string): Promise<MessageContext | null>;
   getMessage(id: string): Promise<PublicMessage | null>;
+  listLatestMessages(options: LatestMessageListOptions): Promise<LatestMessagePage>;
   listChannels(): Promise<PublicChannel[]>;
   listMessages(channelId: string, options: MessageListOptions): Promise<MessagePage | null>;
 }

@@ -5,7 +5,9 @@ import {
   type ChannelListResponse,
   canonicalUtcTimestampSchema,
   channelListResponseSchema,
+  type MessageContext,
   type MessagePage,
+  messageContextSchema,
   messagePageSchema,
   type PublicMessage,
   publicMessageSchema,
@@ -18,6 +20,7 @@ import { canonicalSuiteOrigin, channelRssUrl, globalRssUrl, resolveSuiteUrl } fr
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 30_000;
+const MAX_VISIBLE_CHANNEL_IDS = 32;
 
 export interface KoharuRequestOptions {
   signal?: AbortSignal;
@@ -25,6 +28,12 @@ export interface KoharuRequestOptions {
 
 export interface ListMessagesOptions extends KoharuRequestOptions {
   channelId: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface LatestMessagesOptions extends KoharuRequestOptions {
+  channelIds?: string[];
   cursor?: string;
   limit?: number;
 }
@@ -38,6 +47,7 @@ export type SearchMessageSort = 'newest' | 'relevance';
 
 export interface SearchMessagesOptions extends KoharuRequestOptions {
   channelId?: string;
+  channelIds?: string[];
   cursor?: string;
   from?: SearchTimestamp;
   limit?: number;
@@ -57,7 +67,9 @@ export interface KoharuClient {
     list(options?: KoharuRequestOptions): Promise<ChannelListResponse>;
   };
   readonly messages: {
+    context(options: GetMessageOptions): Promise<MessageContext>;
     get(options: GetMessageOptions): Promise<PublicMessage>;
+    latest(options?: LatestMessagesOptions): Promise<MessagePage>;
     list(options: ListMessagesOptions): Promise<MessagePage>;
   };
   readonly search: {
@@ -106,6 +118,22 @@ function assertCursor(value: string | undefined): string | undefined {
     throw new TypeError('cursor must not be empty');
   }
   return value;
+}
+
+function visibleChannelIds(values: string[] | undefined): string[] {
+  if (values === undefined || values.length === 0) return [];
+  const unique = [...new Set(values.map((value) => assertSuiteId(value, 'channelIds')))].slice(
+    0,
+    MAX_VISIBLE_CHANNEL_IDS + 1,
+  );
+  if (unique.length > MAX_VISIBLE_CHANNEL_IDS) {
+    throw new RangeError(`channelIds must contain at most ${MAX_VISIBLE_CHANNEL_IDS} unique IDs`);
+  }
+  return unique;
+}
+
+function appendChannelIds(search: URLSearchParams, channelIds: string[]): void {
+  for (const channelId of channelIds) search.append('channel', channelId);
 }
 
 function canonicalSearchTimestamp(
@@ -207,6 +235,17 @@ function messageListPath(options: ListMessagesOptions): string {
   return `/api/v1/messages?${search.toString()}`;
 }
 
+function latestMessagesPath(options: LatestMessagesOptions): string {
+  const search = new URLSearchParams();
+  appendChannelIds(search, visibleChannelIds(options.channelIds));
+  const limit = assertLimit(options.limit, 100);
+  const cursor = assertCursor(options.cursor);
+  if (limit !== undefined) search.set('limit', String(limit));
+  if (cursor !== undefined) search.set('cursor', cursor);
+  const query = search.toString();
+  return `/api/v1/messages/latest${query ? `?${query}` : ''}`;
+}
+
 function searchMessagesPath(options: SearchMessagesOptions): string {
   const query = options.query.trim();
   const queryLength = Array.from(query).length;
@@ -215,6 +254,10 @@ function searchMessagesPath(options: SearchMessagesOptions): string {
   }
   const channelId =
     options.channelId === undefined ? undefined : assertSuiteId(options.channelId, 'channelId');
+  if (channelId !== undefined && options.channelIds !== undefined) {
+    throw new TypeError('channelId and channelIds cannot be used together');
+  }
+  const channelIds = visibleChannelIds(options.channelIds);
   const from = canonicalSearchTimestamp(options.from, 'from');
   const to = canonicalSearchTimestamp(options.to, 'to');
   if (from !== undefined && to !== undefined && from >= to) {
@@ -225,7 +268,7 @@ function searchMessagesPath(options: SearchMessagesOptions): string {
   const sort = options.sort;
   if (
     shortQuery &&
-    (channelId === undefined ||
+    ((channelId === undefined && channelIds.length !== 1) ||
       from === undefined ||
       to === undefined ||
       new Date(to).getTime() - new Date(from).getTime() > 31 * 24 * 60 * 60 * 1_000 ||
@@ -240,6 +283,7 @@ function searchMessagesPath(options: SearchMessagesOptions): string {
   const limit = assertLimit(options.limit, shortQuery ? 20 : 50);
   const cursor = assertCursor(options.cursor);
   if (channelId !== undefined) search.set('channel', channelId);
+  appendChannelIds(search, channelIds);
   if (from !== undefined) search.set('from', from);
   if (to !== undefined) search.set('to', to);
   if (sort !== undefined) search.set('sort', sort);
@@ -266,6 +310,15 @@ export function createKoharuClient(options: CreateKoharuClientOptions): KoharuCl
         requestJson(runtime, '/api/v1/channels', channelListResponseSchema, requestOptions.signal),
     },
     messages: {
+      context: (requestOptions) =>
+        requestJson(
+          runtime,
+          `/api/v1/messages/${encodeURIComponent(
+            assertSuiteId(requestOptions.messageId, 'messageId'),
+          )}/context`,
+          messageContextSchema,
+          requestOptions.signal,
+        ),
       get: (requestOptions) =>
         requestJson(
           runtime,
@@ -273,6 +326,13 @@ export function createKoharuClient(options: CreateKoharuClientOptions): KoharuCl
             assertSuiteId(requestOptions.messageId, 'messageId'),
           )}`,
           publicMessageSchema,
+          requestOptions.signal,
+        ),
+      latest: (requestOptions = {}) =>
+        requestJson(
+          runtime,
+          latestMessagesPath(requestOptions),
+          messagePageSchema,
           requestOptions.signal,
         ),
       list: (requestOptions) =>

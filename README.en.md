@@ -12,7 +12,7 @@ Core principles:
 - connect the standalone suite backend only when its dynamic capabilities are needed;
 - keep content and media exportable and recoverable so removing the backend does not affect existing static
   posts;
-- build on PostgreSQL 18, Astro 6 Live Content Collections, and an open JSON API.
+- build on PostgreSQL 18, Astro 6/7 Live Content Collections, and an open JSON API.
 
 [G2.5 #26](https://github.com/cosZone/koharu-suite/issues/26) adds public search and RSS on top of
 multi-channel archiving, auditable recovery, and local/S3-compatible media tiers:
@@ -140,20 +140,25 @@ after re-enabling.
 Telegram retains unfetched updates for at most roughly 24 hours. If the service remains offline beyond that
 upstream window, the Bot API cannot restore updates Telegram has already removed.
 
-After publishing a message, discover the suite channel ID before reading its messages:
+A stable suite channel ID exists only after the channel archives its first message. Owner Desk displays and copies
+the full UUID; `/api/v1/channels` remains the headless fallback. Consumers that show every public channel, such as
+astro-koharu with `moments.channels` omitted, do not need a manually configured UUID. Read messages with:
 
 ```bash
 curl http://localhost:3000/api/v1/channels
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50"
 curl "http://localhost:3000/api/v1/messages?channel=<suiteChannelId>&limit=50&cursor=<nextCursor>"
+curl "http://localhost:3000/api/v1/messages/latest?limit=50"
 curl http://localhost:3000/api/v1/messages/<suiteMessageId>
-curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro 6"
+curl http://localhost:3000/api/v1/messages/<suiteMessageId>/context
+curl --get "http://localhost:3000/api/v1/search/messages" --data-urlencode "q=Astro"
 curl http://localhost:3000/api/v1/rss.xml
 curl http://localhost:3000/api/v1/channels/<suiteChannelId>/rss.xml
 ```
 
 Message lists return `{ items, nextCursor }`. `limit` defaults to 50 and accepts 1–100; `cursor` is an opaque
-value bound to the selected channel and clients should neither decode nor modify it. Archived revisions store
+value bound to the request scope and clients should neither decode nor modify it. Global latest and search accept
+up to 32 repeated `channel` UUIDs to page within the visible set; omitting them preserves unfiltered behavior. Archived revisions store
 safe HTML rendered from escaped text/entities. After a renderer upgrade, “Rerender outdated” in Owner Desk
 updates only derived HTML/version fields and leaves revision history unchanged.
 

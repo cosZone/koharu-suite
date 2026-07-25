@@ -113,6 +113,23 @@ export const messagePageSchema = z
   })
   .passthrough();
 
+export const messageContextReferenceSchema = z
+  .object({
+    channelId: suiteIdSchema,
+    id: suiteIdSchema,
+    preview: z.string().nullable(),
+    publishedAt: canonicalUtcTimestampSchema,
+  })
+  .passthrough();
+
+export const messageContextSchema = z
+  .object({
+    message: publicMessageSchema,
+    newer: messageContextReferenceSchema.nullable(),
+    older: messageContextReferenceSchema.nullable(),
+  })
+  .passthrough();
+
 export const searchMessageResultSchema = z
   .object({
     match: z
@@ -145,6 +162,7 @@ export const knownKoharuErrorCodes = [
   'message_not_found',
   'rate_limited',
   'short_query_requires_bounded_scope',
+  'too_many_channels',
 ] as const;
 
 export type ApiErrorResponse = z.infer<typeof apiErrorResponseSchema>;
@@ -155,6 +173,8 @@ export type PublicMedia = z.infer<typeof publicMediaSchema>;
 export type PublicMessage = z.infer<typeof publicMessageSchema>;
 export type ChannelListResponse = z.infer<typeof channelListResponseSchema>;
 export type MessagePage = z.infer<typeof messagePageSchema>;
+export type MessageContextReference = z.infer<typeof messageContextReferenceSchema>;
+export type MessageContext = z.infer<typeof messageContextSchema>;
 export type SearchMessageResult = z.infer<typeof searchMessageResultSchema>;
 export type SearchMessagePage = z.infer<typeof searchMessagePageSchema>;
 export type KnownKoharuErrorCode = (typeof knownKoharuErrorCodes)[number];

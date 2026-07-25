@@ -1,10 +1,10 @@
 # `@coszone/koharu-astro`
 
-`@coszone/koharu-astro` is the Astro 6 adapter for
+`@coszone/koharu-astro` is the Astro 6/7 adapter for
 [koharu-suite](https://github.com/cosZone/koharu-suite). It provides:
 
 - a Zod-validated, public read-only client;
-- Astro 6 live loaders for channels and messages;
+- Astro 6/7 live loaders for channels and messages;
 - normalized, discriminated errors that never expose response bodies;
 - RSS and media URL helpers.
 
@@ -17,7 +17,7 @@ adapter at import time. A site that does not configure a live collection keeps i
 pnpm add @coszone/koharu-astro
 ```
 
-Astro `^6.0.0` and Node.js `>=22.20.0` are required. Live collections run at request time, so the consuming site
+Astro `^6.0.0 || ^7.0.0` and Node.js `>=22.20.0` are required. Live collections run at request time, so the consuming site
 must configure an Astro adapter that supports on-demand rendering.
 
 ## Typed client
@@ -35,9 +35,19 @@ const page = await client.messages.list({
   limit: 20,
 });
 
+const latest = await client.messages.latest({
+  // Optional. Duplicate IDs are removed; at most 32 visible channels are accepted.
+  channelIds: channels.items.map((channel) => channel.id),
+  limit: 20,
+});
+
+const context = await client.messages.context({
+  messageId: latest.items[0].id,
+});
+
 const result = await client.search.messages({
-  query: 'Astro 6',
-  channelId: channels.items[0].id,
+  query: 'Astro',
+  channelIds: channels.items.map((channel) => channel.id),
 });
 ```
 
@@ -52,7 +62,13 @@ client.urls.globalRss();
 client.urls.channelRss(channels.items[0].id);
 ```
 
-## Astro 6 live collections
+`messages.context()` returns the full current message plus lightweight, media-free `newer` and `older` references
+for detail navigation. The `channelIds` accepted by `messages.latest()` and `search.messages()` are applied by the
+server, avoiding gaps caused by fetching a page and filtering it afterward. The existing singular search `channelId`
+remains supported but cannot be combined with `channelIds`. An empty `channelIds` array and an omitted filter are both
+unfiltered.
+
+## Astro 6/7 live collections
 
 ```ts
 // src/live.config.ts
@@ -80,7 +96,7 @@ export const collections = {
 ```
 
 Pages use `getLiveCollection()` and `getLiveEntry()` to fetch data at request time. The message loader fetches one
-page only. Astro 6 live collection results cannot carry koharu-suite's `nextCursor`; use the typed client directly
+page only. Astro live collection results cannot carry koharu-suite's `nextCursor`; use the typed client directly
 for pagination and search.
 
 Safe HTML is exposed as `entry.rendered.html` and can be emitted with Astro's `set:html`. The loader does not

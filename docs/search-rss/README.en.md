@@ -20,12 +20,32 @@ These public routes use the existing exact-origin CORS and public rate limit. Cr
 default. Put exact origins in `PUBLIC_CORS_ORIGINS`; do not use wildcard or credentialed CORS.
 `PUBLIC_RATE_LIMIT_MAX` and `PUBLIC_RATE_LIMIT_WINDOW_SECONDS` tune the per-process fixed-window limiter.
 
+## Global latest messages and context
+
+The global latest endpoint returns stable cursor pages ordered by
+`publishedAt DESC, message UUID DESC`:
+
+```http
+GET /api/v1/messages/latest?channel=<suiteChannelId>&limit=50&cursor=<opaque>
+GET /api/v1/messages/:suiteMessageId/context
+```
+
+`latest` accepts no `channel` parameter or up to 32 distinct repeated suite UUIDs. Duplicate IDs are removed;
+omitting the parameter reads every public channel. Filtering happens before database pagination, so it cannot
+create fetch-then-filter gaps. The cursor is bound to the first request's channel set and snapshot; repeat the same
+`channel` parameters on later pages.
+
+`context` returns the full current message plus lightweight, media-free `newer` and `older` references from the
+same channel; boundaries are `null`. Ordering matches the feed and tombstoned messages cannot be anchors or
+neighbors. A channel UUID exists only after its first archived message. Owner Desk copies the full ID, while
+`GET /api/v1/channels` remains the headless fallback. Consumers of all public channels need no manual UUID config.
+
 ## Search API
 
 ```http
 GET /api/v1/search/messages
   ?q=<text>
-  &channel=<suiteChannelId>
+  &channel=<suiteChannelId>  # repeatable, at most 32 distinct UUIDs
   &from=<canonical-UTC>
   &to=<canonical-UTC>
   &sort=relevance|newest
@@ -34,7 +54,8 @@ GET /api/v1/search/messages
 ```
 
 After trimming, `q` must contain 1–200 Unicode code points. `channel`, `from`, and `to` are optional for
-queries of at least three characters. `from` is inclusive and `to` is exclusive. Timestamps must be canonical
+queries of at least three characters. Repeated `channel` values form a server-side visible set before pagination,
+and the cursor is bound to the normalized set. `from` is inclusive and `to` is exclusive. Timestamps must be canonical
 ISO 8601 UTC, such as `2026-07-01T00:00:00.000Z`.
 
 Queries of at least three characters default to `sort=relevance` and may use `newest`. `limit` defaults to 20
@@ -80,7 +101,8 @@ curl --get "$ORIGIN/api/v1/search/messages" \
 
 A missing bound, a range over 31 days, or relevance sorting returns
 `400 short_query_requires_bounded_scope`. Other validation codes are `invalid_query`, `invalid_channel`,
-`channel_not_found`, `invalid_time_range`, `invalid_sort`, `invalid_limit`, and `invalid_cursor`.
+`channel_not_found`, `invalid_time_range`, `invalid_sort`, `invalid_limit`, `too_many_channels`, and
+`invalid_cursor`.
 
 ## RSS
 
