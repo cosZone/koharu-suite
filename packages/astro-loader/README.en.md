@@ -1,6 +1,6 @@
-# `@coszone/koharu-astro`
+# `@koharu/astro-loader`
 
-`@coszone/koharu-astro` is the Astro 6 adapter for
+`@koharu/astro-loader` is the Astro 6 Live Content loader package for
 [koharu-suite](https://github.com/cosZone/koharu-suite). It provides:
 
 - a Zod-validated, public read-only client;
@@ -14,7 +14,7 @@ adapter at import time. A site that does not configure a live collection keeps i
 ## Install
 
 ```bash
-pnpm add @coszone/koharu-astro
+pnpm add @koharu/astro-loader
 ```
 
 Astro `^6.0.0` and Node.js `>=22.20.0` are required. Live collections run at request time, so the consuming site
@@ -23,7 +23,7 @@ must configure an Astro adapter that supports on-demand rendering.
 ## Typed client
 
 ```ts
-import { createKoharuClient } from '@coszone/koharu-astro/client';
+import { createKoharuClient } from '@koharu/astro-loader/client';
 
 const client = createKoharuClient({
   baseUrl: 'https://suite.example.com',
@@ -62,7 +62,7 @@ import {
   koharuMessagesLoader,
   publicChannelSchema,
   publicMessageSchema,
-} from '@coszone/koharu-astro';
+} from '@koharu/astro-loader';
 
 const baseUrl = process.env.KOHARU_SUITE_URL;
 if (!baseUrl) throw new Error('KOHARU_SUITE_URL is required');
@@ -94,7 +94,7 @@ prove.
 ## Errors
 
 ```ts
-import { isKoharuError } from '@coszone/koharu-astro';
+import { isKoharuError } from '@koharu/astro-loader';
 
 try {
   await client.messages.get({ messageId: '...' });

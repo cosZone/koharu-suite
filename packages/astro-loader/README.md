@@ -1,7 +1,7 @@
-# `@coszone/koharu-astro`
+# `@koharu/astro-loader`
 
-`@coszone/koharu-astro` 是 [koharu-suite](https://github.com/cosZone/koharu-suite) 的 Astro 6
-适配器，提供：
+`@koharu/astro-loader` 是 [koharu-suite](https://github.com/cosZone/koharu-suite) 面向 Astro 6 的
+Live Content loader 包，提供：
 
 - 经过 Zod 校验的公开只读 client；
 - 频道与消息的 Astro 6 Live Loaders；
@@ -14,7 +14,7 @@ Live Collection，现有纯静态博客仍然照常构建。
 ## 安装
 
 ```bash
-pnpm add @coszone/koharu-astro
+pnpm add @koharu/astro-loader
 ```
 
 需要 Astro `^6.0.0`、Node.js `>=22.20.0`。Live Collection 在请求时运行，因此消费站点还需要自行配置
@@ -23,7 +23,7 @@ pnpm add @coszone/koharu-astro
 ## Typed client
 
 ```ts
-import { createKoharuClient } from '@coszone/koharu-astro/client';
+import { createKoharuClient } from '@koharu/astro-loader/client';
 
 const client = createKoharuClient({
   baseUrl: 'https://suite.example.com',
@@ -62,7 +62,7 @@ import {
   koharuMessagesLoader,
   publicChannelSchema,
   publicMessageSchema,
-} from '@coszone/koharu-astro';
+} from '@koharu/astro-loader';
 
 const baseUrl = process.env.KOHARU_SUITE_URL;
 if (!baseUrl) throw new Error('KOHARU_SUITE_URL is required');
@@ -93,7 +93,7 @@ HTML 当作 Markdown/MDX 再执行，也不提供无法从公开 API 证明的 `
 ## 错误处理
 
 ```ts
-import { isKoharuError } from '@coszone/koharu-astro';
+import { isKoharuError } from '@koharu/astro-loader';
 
 try {
   await client.messages.get({ messageId: '...' });

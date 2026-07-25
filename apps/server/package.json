@@ -49,7 +49,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@coszone/koharu-astro": "workspace:*",
+    "@koharu/astro-loader": "workspace:*",
     "@testcontainers/postgresql": "catalog:",
     "@types/node": "catalog:",
     "drizzle-kit": "catalog:",

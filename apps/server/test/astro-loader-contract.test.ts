@@ -4,7 +4,7 @@ import {
   messagePageSchema,
   publicMessageSchema,
   searchMessagePageSchema,
-} from '@coszone/koharu-astro/schemas';
+} from '@koharu/astro-loader/schemas';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import type {
@@ -90,7 +90,7 @@ function createDiscovery(): MessageDiscoveryReader {
   };
 }
 
-describe('@coszone/koharu-astro server contracts', () => {
+describe('@koharu/astro-loader server contracts', () => {
   it('parses channels, message pages, details, and search responses from the real Hono routes', async () => {
     const app = createApp({
       discovery: createDiscovery(),

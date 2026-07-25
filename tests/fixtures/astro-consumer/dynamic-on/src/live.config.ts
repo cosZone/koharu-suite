@@ -4,7 +4,7 @@ import {
   koharuMessagesLoader,
   publicChannelSchema,
   publicMessageSchema,
-} from '@coszone/koharu-astro';
+} from '@koharu/astro-loader';
 
 const baseUrl = process.env.KOHARU_SUITE_URL;
 
