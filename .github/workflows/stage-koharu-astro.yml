@@ -17,21 +17,21 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
-  id-token: write
-
 concurrency:
   group: stage-koharu-astro
   cancel-in-progress: false
 
 jobs:
-  stage:
-    name: Audit and stage npm package
+  audit:
+    name: Audit npm package
     if: inputs.confirm_stage
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: npm
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.artifact.outputs.sha256 }}
+      version: ${{ steps.package.outputs.version }}
 
     steps:
       - name: Require owner-completed npm setup
@@ -51,7 +51,7 @@ jobs:
           fi
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -59,11 +59,10 @@ jobs:
           version: 10.28.2
 
       - name: Set up Node.js and npm
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Pin npm with staged publishing support
         run: |
@@ -84,6 +83,12 @@ jobs:
         id: artifact
         run: pnpm pack:koharu-astro
 
+      - name: Record package version
+        id: package
+        run: |
+          version="$(node -p "require('./packages/koharu-astro/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Test audited package in minimal Astro fixtures
         env:
           KOHARU_ASTRO_TARBALL: ${{ steps.artifact.outputs.tarball }}
@@ -94,29 +99,78 @@ jobs:
           KOHARU_ASTRO_TARBALL: ${{ steps.artifact.outputs.tarball }}
         run: pnpm test:astro-template
 
-      - name: Refuse bootstrap or an unversioned source
-        shell: bash
+      - name: Preserve audited tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: koharu-astro-npm-package
+          path: ${{ steps.artifact.outputs.tarball }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+  stage:
+    name: Stage audited npm package
+    needs: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Set up Node.js and npm
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Pin npm with staged publishing support
         run: |
-          version="$(node -p "require('./packages/koharu-astro/package.json').version")"
-          if [[ "$version" == "0.0.0" ]]; then
+          npm install --global npm@11.18.0
+          test "$(npm --version)" = "11.18.0"
+
+      - name: Download audited tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: koharu-astro-npm-package
+          path: .artifacts/koharu-astro
+
+      - name: Verify audited tarball
+        env:
+          EXPECTED_SHA256: ${{ needs.audit.outputs.sha256 }}
+          EXPECTED_VERSION: ${{ needs.audit.outputs.version }}
+          TARBALL: .artifacts/koharu-astro/package.tgz
+        run: |
+          actual_sha256="$(sha256sum "$TARBALL")"
+          actual_sha256="${actual_sha256%% *}"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo "Audited tarball checksum mismatch." >&2
+            exit 1
+          fi
+          tar -xOf "$TARBALL" package/package.json > "$RUNNER_TEMP/koharu-astro-package.json"
+          actual_name="$(node -p "require('$RUNNER_TEMP/koharu-astro-package.json').name")"
+          actual_version="$(node -p "require('$RUNNER_TEMP/koharu-astro-package.json').version")"
+          if [[ "$actual_name" != "@coszone/koharu-astro" || "$actual_version" != "$EXPECTED_VERSION" ]]; then
+            echo "Audited tarball package identity mismatch." >&2
+            exit 1
+          fi
+
+      - name: Refuse bootstrap or an existing version
+        env:
+          VERSION: ${{ needs.audit.outputs.version }}
+        run: |
+          if [[ "$VERSION" == "0.0.0" ]]; then
             echo "Merge the Version Packages PR and complete the owner bootstrap before using trusted publishing." >&2
             exit 1
           fi
-          if npm view "@coszone/koharu-astro@$version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "@coszone/koharu-astro@$version already exists and cannot be overwritten." >&2
+          if npm view "@coszone/koharu-astro@$VERSION" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "@coszone/koharu-astro@$VERSION already exists and cannot be overwritten." >&2
             exit 1
           fi
 
       - name: Stage through npm trusted publishing
         env:
           DIST_TAG: ${{ inputs.dist_tag }}
-          TARBALL: ${{ steps.artifact.outputs.tarball }}
-        run: npm stage publish "$TARBALL" --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
-
-      - name: Preserve audited tarball
-        uses: actions/upload-artifact@v4
-        with:
-          name: koharu-astro-npm-package
-          path: ${{ steps.artifact.outputs.tarball }}
-          if-no-files-found: error
-          retention-days: 14
+          TARBALL: .artifacts/koharu-astro/package.tgz
+        run: npm --loglevel=verbose stage publish "$TARBALL" --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
