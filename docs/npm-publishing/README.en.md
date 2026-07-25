@@ -17,7 +17,8 @@ The command builds the package, writes `.artifacts/koharu-astro/package.tgz`, en
 for common credentials and private paths, validates public npm metadata, runs `npm publish --dry-run --access
 public`, and prints the artifact SHA-256.
 
-Fixtures and the first publish must consume this tarball instead of a `workspace:*` dependency.
+Fixtures must consume an audited tarball instead of a `workspace:*` dependency. Pull request CI packs once and
+passes that same tarball to the minimal fixture and the pinned template fixture.
 
 ## First-package bootstrap: owner checkpoint
 
@@ -28,14 +29,28 @@ Before the first publish, the owner must personally confirm:
 - the Version Packages pull request is merged, the tarball version is `0.1.0`, and the registry is
   `https://registry.npmjs.org/`;
 - `npm view @coszone/koharu-astro` still returns 404;
-- the local tarball SHA-256 matches the CI artifact.
+- the original artifact downloaded from successful main CI after the Version Packages merge has the same SHA-256
+  printed by the `Pack and audit koharu-astro` step.
+
+Download and inspect the file that will actually be published:
+
+```bash
+gh run download <main-ci-run-id> \
+  --name koharu-astro-npm-package \
+  --dir .artifacts/koharu-astro-ci
+shasum -a 256 .artifacts/koharu-astro-ci/package.tgz
+tar -xOf .artifacts/koharu-astro-ci/package.tgz package/package.json
+```
+
+The gzip implementations on macOS and Linux can give content-identical `.tgz` files different compressed-file
+SHA-256 values. Do not replace the CI artifact with a local rebuild. Publish the downloaded and verified original.
 
 A trusted publisher cannot be attached before the package exists, and npm cannot stage a brand-new package. The
 first public release must be an owner-interactive local publish:
 
 ```bash
 npm login --registry=https://registry.npmjs.org/
-npm publish .artifacts/koharu-astro/package.tgz \
+npm publish .artifacts/koharu-astro-ci/package.tgz \
   --access public \
   --tag latest \
   --provenance=false \
