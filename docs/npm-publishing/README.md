@@ -23,7 +23,8 @@ pnpm pack:koharu-astro
 6. 执行不需要 npm 登录的 `npm publish --dry-run --access public`；
 7. 输出 tarball 的 SHA-256。
 
-fixture 和首发必须使用这个 `.tgz`，不能用 `workspace:*` 代替发布制品。
+fixture 必须使用审计后的 `.tgz`，不能用 `workspace:*` 代替发布制品。功能 PR 的 CI 会 pack
+一次，并把同一份 tarball 依次交给 minimal fixture 和固定 template fixture。
 
 ## 首次 package bootstrap：owner checkpoint
 
@@ -34,14 +35,28 @@ fixture 和首发必须使用这个 `.tgz`，不能用 `workspace:*` 代替发�
 - Version Packages PR 已合并，tarball 内版本是 `0.1.0`，registry 是
   `https://registry.npmjs.org/`；
 - `npm view @coszone/koharu-astro` 仍为 404，包名没有被其他主体占用；
-- 本地 tarball SHA-256 与已通过 CI 的 artifact 一致。
+- 从 Version Packages PR 合并后的成功 main CI 下载原始 artifact，其 SHA-256 与 CI
+  `Pack and audit koharu-astro` 步骤输出一致。
+
+下载并检查实际待发布文件：
+
+```bash
+gh run download <main-ci-run-id> \
+  --name koharu-astro-npm-package \
+  --dir .artifacts/koharu-astro-ci
+shasum -a 256 .artifacts/koharu-astro-ci/package.tgz
+tar -xOf .artifacts/koharu-astro-ci/package.tgz package/package.json
+```
+
+macOS 与 Linux 的 gzip 实现可能让两个内容相同的 `.tgz` 得到不同的压缩包 SHA-256。不要用本机
+重建的 tarball 替换 CI artifact；首次发布直接使用上面下载并核对过的原始文件。
 
 新 package 尚不存在时无法预先绑定 trusted publisher，也不能使用 staged publishing。首次公开必须
 由 owner 在本地交互式执行：
 
 ```bash
 npm login --registry=https://registry.npmjs.org/
-npm publish .artifacts/koharu-astro/package.tgz \
+npm publish .artifacts/koharu-astro-ci/package.tgz \
   --access public \
   --tag latest \
   --provenance=false \
