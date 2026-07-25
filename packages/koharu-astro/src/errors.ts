@@ -16,7 +16,6 @@ interface KoharuErrorOptions {
   status?: number | null;
 }
 
-// Keep the original global brand so errors remain recognizable across the package rename.
 const KOHARU_ERROR_TAG = Symbol.for('@coszone/koharu-astro/KoharuError');
 const ERROR_KINDS = new Set<KoharuErrorKind>([
   'aborted',

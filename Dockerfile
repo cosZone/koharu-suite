@@ -17,7 +17,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/admin/package.json apps/admin/package.json
 COPY apps/server/package.json apps/server/package.json
 COPY apps/server/bin apps/server/bin
-COPY packages/astro-loader/package.json packages/astro-loader/package.json
+COPY packages/koharu-astro/package.json packages/koharu-astro/package.json
 COPY packages/ui/package.json packages/ui/package.json
 
 RUN pnpm install --frozen-lockfile
