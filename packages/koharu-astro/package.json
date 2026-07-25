@@ -1,6 +1,6 @@
 {
   "name": "@coszone/koharu-astro",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Typed Koharu Suite client and Astro 6/7 Live Content Collection loaders.",
   "keywords": [
     "astro",
