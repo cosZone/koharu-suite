@@ -1,0 +1,35 @@
+---
+import { getLiveCollection } from 'astro:content';
+
+export const prerender = false;
+
+const channelId = '019bf894-2b6c-7b18-bd70-0ad6349a4af1';
+const [channelsResult, messagesResult] = await Promise.all([
+  getLiveCollection('koharuChannels'),
+  getLiveCollection('koharuMessages', { channelId, limit: 10 }),
+]);
+const error = channelsResult.error ?? messagesResult.error;
+const _channels = channelsResult.entries ?? [];
+const _messages = messagesResult.entries ?? [];
+
+if (error) {
+  Astro.response.status = 503;
+}
+---
+
+<html lang="en">
+  <body>
+    <main data-fixture="dynamic-archive">
+      {
+        error ? (
+          <p data-state="unavailable">Archive unavailable</p>
+        ) : (
+          <>
+            <h1>{_channels[0]?.data.title}</h1>
+            <p data-revision={_messages[0]?.data.revision}>{_messages[0]?.data.content.text}</p>
+          </>
+        )
+      }
+    </main>
+  </body>
+</html>
