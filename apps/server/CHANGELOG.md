@@ -1,0 +1,13 @@
+# @koharu-suite/server
+
+## 0.2.0
+
+### Minor Changes
+
+- 2c393fd: Add PostgreSQL trigram message search, bounded short queries, public RSS feeds, Owner Desk discovery, and
+  deployment diagnostics.
+- 0b9524e: Add auditable Telegram reconciliation, explicit deterministic repairs, scheduled scans, exact import lineage, and
+  Owner Desk recovery controls.
+- c64f268: Add the optional crash-safe local media cache, bounded Telegram originals and thumbnails, revalidated public
+  media responses, deterministic 5 GiB eviction, and Owner Desk/CLI cache operations.
+- 7bad252: Add resumable Telegram Desktop JSON imports with dry-run reporting, source provenance, and revision-aware idempotency.
