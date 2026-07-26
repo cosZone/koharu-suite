@@ -1,5 +1,11 @@
 # @koharu-suite/server
 
+## 0.3.1
+
+### Patch Changes
+
+- 54a7644: Refresh the server image so the embedded Owner Desk ships with the redesigned administration interface.
+
 ## 0.3.0
 
 ### Minor Changes
