@@ -200,7 +200,9 @@ jobs:
               printf '%s' "$digest"
               return
             fi
-            if [[ "$result" != *"no such manifest"* && "$result" != *"manifest unknown"* ]]; then
+            if [[ "$result" != *"no such manifest"* &&
+              "$result" != *"manifest unknown"* &&
+              "$result" != *"$reference: not found"* ]]; then
               echo "Could not inspect immutable GHCR tag: $reference" >&2
               printf '%s\n' "$result" >&2
               exit 1
