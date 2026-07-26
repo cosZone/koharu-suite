@@ -2,7 +2,7 @@
 
 [中文](./README.md)
 
-This guide targets a single-host Docker Compose deployment of the `v0.1.x` Preview. The Preview supports one
+This guide targets a single-host Docker Compose deployment of the `v0.3.x` Preview. The Preview supports one
 worker only. Do not scale `worker`, and do not run another `getUpdates` consumer for the same bot.
 
 ## Runtime boundaries
@@ -30,8 +30,8 @@ The host needs Docker Engine, Docker Compose v2, and access to PostgreSQL, Teleg
 registry. Create a deployment directory, save the repository's `compose.yaml`, and create an untracked `.env`:
 
 ```dotenv
-KOHARU_IMAGE=ghcr.io/coszone/koharu-suite:0.1.0
-KOHARU_VERSION=0.1.0
+KOHARU_IMAGE=ghcr.io/coszone/koharu-suite:0.3.1
+KOHARU_VERSION=0.3.1
 KOHARU_REVISION=<release-commit-sha>
 KOHARU_HTTP_PORT=3000
 POSTGRES_PUBLISHED_PORT=5432

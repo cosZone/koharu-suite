@@ -2,7 +2,7 @@
 
 [English](./README.en.md)
 
-本文面向 `v0.1.x` Preview 的单机 Docker Compose 部署。Preview 只支持一个 worker；不要扩容
+本文面向 `v0.3.x` Preview 的单机 Docker Compose 部署。Preview 只支持一个 worker；不要扩容
 `worker`，也不要让同一个 Bot 同时运行其他 `getUpdates` consumer。
 
 ## 运行边界
@@ -27,8 +27,8 @@ commit 占用的同版本 tag 会直接失败，不会移动 tag 或复用版本
 仓库的主机。先创建部署目录，保存仓库的 `compose.yaml`，然后创建不会进入版本控制的 `.env`：
 
 ```dotenv
-KOHARU_IMAGE=ghcr.io/coszone/koharu-suite:0.1.0
-KOHARU_VERSION=0.1.0
+KOHARU_IMAGE=ghcr.io/coszone/koharu-suite:0.3.1
+KOHARU_VERSION=0.3.1
 KOHARU_REVISION=<release-commit-sha>
 KOHARU_HTTP_PORT=3000
 POSTGRES_PUBLISHED_PORT=5432
