@@ -1,5 +1,11 @@
 # @koharu-suite/server
 
+## 0.3.2
+
+### Patch Changes
+
+- b45f3b3: Preserve Telegram Desktop messages when custom emoji entities omit their document IDs, and record the updated parser version in import reports.
+
 ## 0.3.1
 
 ### Patch Changes
