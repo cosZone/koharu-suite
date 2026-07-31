@@ -16,7 +16,7 @@ const PLACEHOLDER_REASONS: ReadonlyArray<[RegExp, string]> = [
   [/(?:file|media) (?:is )?unavailable/iu, 'unavailable'],
 ];
 
-export const TELEGRAM_DESKTOP_PARSER_VERSION = 1;
+export const TELEGRAM_DESKTOP_PARSER_VERSION = 2;
 
 export interface TelegramDesktopNormalizeContext {
   channel: NormalizedChannelIdentity;
@@ -207,6 +207,10 @@ function normalizeEntityType(
       return { type: entity.collapsed === true ? 'expandable_blockquote' : 'blockquote' };
     case 'custom_emoji': {
       const documentId = entity.document_id;
+      if (documentId === undefined || documentId === null) {
+        warnings.push('custom_emoji_missing_document_id');
+        return null;
+      }
       if (
         (typeof documentId !== 'string' && typeof documentId !== 'number') ||
         String(documentId).length === 0
