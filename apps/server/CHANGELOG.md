@@ -1,5 +1,11 @@
 # @koharu-suite/server
 
+## 0.3.3
+
+### Patch Changes
+
+- 210f6ac: Preserve visible Telegram Desktop custom emoji text when exports omit or leave empty the document ID, retain poll questions as marked text while deferring options, and make documented Compose diagnostics wait for healthy services.
+
 ## 0.3.2
 
 ### Patch Changes
