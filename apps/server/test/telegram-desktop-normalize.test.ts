@@ -112,6 +112,47 @@ describe('Telegram Desktop message normalization', () => {
     });
   });
 
+  it('preserves visible custom emoji text when Telegram Desktop omits document_id', () => {
+    const result = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        id: 54,
+        text_entities: [
+          { text: 'before ', type: 'plain' },
+          { text: '🌸', type: 'custom_emoji' },
+          { text: ' after', type: 'bold' },
+        ],
+        type: 'message',
+      },
+      CONTEXT,
+    );
+
+    expect(result).toMatchObject({
+      kind: 'eligible',
+      snapshot: {
+        message: {
+          entities: [{ length: 6, offset: 9, type: 'bold' }],
+          text: 'before 🌸 after',
+        },
+      },
+      warnings: ['custom_emoji_missing_document_id'],
+    });
+  });
+
+  it('still rejects malformed custom emoji document_id values', () => {
+    expect(
+      normalizeTelegramDesktopMessage(
+        {
+          date_unixtime: '1735787045',
+          id: 55,
+          text_entities: [{ document_id: {}, text: '🌸', type: 'custom_emoji' }],
+          type: 'message',
+        },
+        CONTEXT,
+      ),
+    ).toMatchObject({ code: 'invalid_text', kind: 'item_error' });
+  });
+
   it('rejects dates without zones and IDs outside the exact integer range', () => {
     expect(
       normalizeTelegramDesktopMessage(
