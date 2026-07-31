@@ -155,7 +155,7 @@ Do not skip a failed migration.
 Create and verify a PostgreSQL backup and record the old image digest before upgrading. After migration, run:
 
 ```bash
-docker compose run --rm --no-deps server node dist/cli.js doctor
+docker compose run --rm --no-deps doctor
 ```
 
 `Search` must be `ok`. Doctor verifies the real `pg_extension` row and that

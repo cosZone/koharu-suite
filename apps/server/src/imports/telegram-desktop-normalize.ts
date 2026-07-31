@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fingerprintMessageSnapshot } from '../messages/fingerprint.js';
 import type {
@@ -16,7 +17,7 @@ const PLACEHOLDER_REASONS: ReadonlyArray<[RegExp, string]> = [
   [/(?:file|media) (?:is )?unavailable/iu, 'unavailable'],
 ];
 
-export const TELEGRAM_DESKTOP_PARSER_VERSION = 2;
+export const TELEGRAM_DESKTOP_PARSER_VERSION = 3;
 
 export interface TelegramDesktopNormalizeContext {
   channel: NormalizedChannelIdentity;
@@ -181,6 +182,20 @@ function recordValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function canonicalPollJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalPollJson).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalPollJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 function normalizeEntityType(
   entity: Record<string, unknown>,
   warnings: string[],
@@ -207,13 +222,13 @@ function normalizeEntityType(
       return { type: entity.collapsed === true ? 'expandable_blockquote' : 'blockquote' };
     case 'custom_emoji': {
       const documentId = entity.document_id;
-      if (documentId === undefined || documentId === null) {
+      if (documentId === undefined || documentId === null || documentId === '') {
         warnings.push('custom_emoji_missing_document_id');
         return null;
       }
       if (
         (typeof documentId !== 'string' && typeof documentId !== 'number') ||
-        String(documentId).length === 0
+        (typeof documentId === 'string' && documentId.trim().length === 0)
       ) {
         throw new ItemError('invalid_text', 'custom_emoji entity must contain document_id');
       }
@@ -281,6 +296,31 @@ function normalizeText(record: DesktopMessageRecord, warnings: string[]): Normal
     return { entities: [], text: '' };
   }
   return normalizeSegments(record.text, warnings);
+}
+
+interface NormalizedDesktopPoll {
+  sourceFingerprint: string;
+  text: string;
+}
+
+function normalizePoll(
+  record: DesktopMessageRecord,
+  warnings: string[],
+): NormalizedDesktopPoll | null {
+  if (record.poll === undefined || record.poll === null) {
+    return null;
+  }
+
+  const poll = recordValue(record.poll);
+  if (poll === null || typeof poll.question !== 'string' || poll.question.trim().length === 0) {
+    throw new ItemError('invalid_poll', 'Poll must contain a non-empty question');
+  }
+
+  warnings.push('poll_options_omitted');
+  return {
+    sourceFingerprint: createHash('sha256').update(canonicalPollJson(poll)).digest('hex'),
+    text: `[Poll] ${poll.question}`,
+  };
 }
 
 function placeholderReason(value: string): string | null {
@@ -433,8 +473,9 @@ function normalizeEligible(
   }
   const editedAt = parseDate(record, 'edited_unixtime', 'edited', false, warnings);
   const normalizedText = normalizeText(record, warnings);
+  const poll = normalizePoll(record, warnings);
   const media = normalizeMedia(record, warnings);
-  const text = normalizedText.text.length === 0 ? null : normalizedText.text;
+  const text = normalizedText.text.length === 0 ? (poll?.text ?? null) : normalizedText.text;
   if (text === null && media.length === 0) {
     throw new ItemError('empty_message', 'Message has no visible text or supported media');
   }
@@ -469,6 +510,7 @@ function normalizeEligible(
       telegramMessageId.toString(),
       observedAt.toISOString(),
       fingerprint,
+      ...(poll === null ? [] : ['poll-v1', poll.sourceFingerprint]),
     ].join(':'),
     sourceMessageId: telegramMessageId,
   };

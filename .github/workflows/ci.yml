@@ -92,7 +92,7 @@ jobs:
           BETTER_AUTH_SECRET: ci-only-better-auth-secret-32-chars
           BETTER_AUTH_URL: http://localhost:3000
           TELEGRAM_BOT_TOKEN: 123456789:ci-compose-config-only
-        run: docker compose config --quiet
+        run: docker compose --profile ops config --quiet
 
       - name: Run Compose smoke
         run: ./scripts/compose-smoke/run.sh

@@ -208,7 +208,7 @@ role 所需的受限权限。migration 安装失败会停止，不应跳过后�
 升级前执行可验证的 PostgreSQL 备份，并记录旧镜像 digest。应用 migration 后运行：
 
 ```bash
-docker compose run --rm --no-deps server node dist/cli.js doctor
+docker compose run --rm --no-deps doctor
 ```
 
 `Search` 必须为 `ok`；它会读取 `pg_extension` 和真实 index definition，确认
