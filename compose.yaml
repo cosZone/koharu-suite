@@ -49,6 +49,31 @@ services:
     init: true
     restart: "no"
 
+  doctor:
+    <<: *kodama-image
+    command:
+      - node
+      - dist/cli.js
+      - doctor
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *postgres-environment
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET to at least 32 high-entropy characters}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:?Set BETTER_AUTH_URL to the canonical public origin}
+      PUBLIC_CORS_ORIGINS: ${PUBLIC_CORS_ORIGINS:-}
+      PUBLIC_RATE_LIMIT_MAX: ${PUBLIC_RATE_LIMIT_MAX:-120}
+      PUBLIC_RATE_LIMIT_WINDOW_SECONDS: ${PUBLIC_RATE_LIMIT_WINDOW_SECONDS:-60}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
+      TELEGRAM_WORKER_CONCURRENCY: ${TELEGRAM_WORKER_CONCURRENCY:-4}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    init: true
+    profiles:
+      - ops
+    restart: "no"
+
   server:
     <<: *kodama-image
     command:

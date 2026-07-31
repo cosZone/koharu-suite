@@ -7,9 +7,11 @@ worker only. Do not scale `worker`, and do not run another `getUpdates` consumer
 
 ## Runtime boundaries
 
-One image provides three entry points:
+One image provides four entry points:
 
 - `migrate` applies PostgreSQL migrations and exits;
+- `doctor` runs one-off read-only deployment diagnostics and receives Better Auth and Telegram configuration
+  only for that process lifetime;
 - `server` serves the Admin, public API, `/healthz`, and `/readyz`, and receives only database and Better Auth
   configuration;
 - `worker` collects Telegram updates, processes tasks, and writes its heartbeat, and receives only database
@@ -78,7 +80,7 @@ docker compose run --rm --no-deps server \
 The owner command hides and confirms the password in an interactive TTY. Start both long-running roles:
 
 ```bash
-docker compose up -d server worker
+docker compose up -d --wait --wait-timeout 60 server worker
 docker compose ps
 curl --fail https://blog-admin.example.com/healthz
 curl --fail https://blog-admin.example.com/readyz
@@ -214,10 +216,10 @@ and minimum Node/PostgreSQL requirements first:
 docker compose stop -t 30 worker server
 docker compose pull
 docker compose run --rm migrate
-docker compose run --rm --no-deps server node dist/cli.js doctor
-docker compose up -d worker
+docker compose run --rm --no-deps doctor
+docker compose up -d --wait --wait-timeout 60 worker
 docker compose exec worker node dist/cli.js health worker
-docker compose up -d server
+docker compose up -d --wait --wait-timeout 60 server
 curl --fail https://blog-admin.example.com/readyz
 curl --head https://blog-admin.example.com/api/v1/rss.xml
 ```

@@ -7,9 +7,10 @@
 
 ## 运行边界
 
-同一镜像提供三个入口：
+同一镜像提供四个入口：
 
 - `migrate`：运行 PostgreSQL migration 后退出；
+- `doctor`：一次性运行只读部署诊断；仅在进程存活期间同时接收 Better Auth 与 Telegram 配置；
 - `server`：提供 Admin、公开 API、`/healthz` 与 `/readyz`，只接收数据库和 Better Auth 配置；
 - `worker`：采集 Telegram、处理任务并写 heartbeat，只接收数据库和 Telegram 配置。
 
@@ -74,7 +75,7 @@ docker compose run --rm --no-deps server \
 owner 命令会在交互式 TTY 中隐藏并确认密码。启动两个长期运行的角色：
 
 ```bash
-docker compose up -d server worker
+docker compose up -d --wait --wait-timeout 60 server worker
 docker compose ps
 curl --fail https://blog-admin.example.com/healthz
 curl --fail https://blog-admin.example.com/readyz
@@ -204,10 +205,10 @@ Preview 允许短维护窗口。先阅读 GitHub pre-release notes，确认 migr
 docker compose stop -t 30 worker server
 docker compose pull
 docker compose run --rm migrate
-docker compose run --rm --no-deps server node dist/cli.js doctor
-docker compose up -d worker
+docker compose run --rm --no-deps doctor
+docker compose up -d --wait --wait-timeout 60 worker
 docker compose exec worker node dist/cli.js health worker
-docker compose up -d server
+docker compose up -d --wait --wait-timeout 60 server
 curl --fail https://blog-admin.example.com/readyz
 curl --head https://blog-admin.example.com/api/v1/rss.xml
 ```

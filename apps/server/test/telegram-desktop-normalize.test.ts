@@ -139,13 +139,112 @@ describe('Telegram Desktop message normalization', () => {
     });
   });
 
-  it('still rejects malformed custom emoji document_id values', () => {
+  it('preserves text and later entity offsets when custom emoji document_id is empty', () => {
+    const result = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        id: 55,
+        text_entities: [
+          { text: 'A', type: 'plain' },
+          { document_id: '', text: '🌸', type: 'custom_emoji' },
+          { text: 'B😀', type: 'bold' },
+        ],
+        type: 'message',
+      },
+      CONTEXT,
+    );
+
+    expect(result).toMatchObject({
+      kind: 'eligible',
+      snapshot: {
+        message: {
+          entities: [{ length: 3, offset: 3, type: 'bold' }],
+          text: 'A🌸B😀',
+        },
+      },
+      warnings: ['custom_emoji_missing_document_id'],
+    });
+  });
+
+  it('preserves a poll question as marked text while retaining the raw poll snapshot', () => {
+    const poll = {
+      answers: [
+        { text: 'Spring', voters: 12 },
+        { text: 'Autumn', voters: 8 },
+      ],
+      closed: true,
+      question: 'Which season?',
+      total_voters: 20,
+    };
+    const result = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        id: 57,
+        poll,
+        text: '',
+        text_entities: [],
+        type: 'message',
+      },
+      CONTEXT,
+    );
+
+    expect(result).toMatchObject({
+      kind: 'eligible',
+      observation: { raw: { poll } },
+      snapshot: {
+        message: {
+          contentKind: 'text',
+          entities: [],
+          text: '[Poll] Which season?',
+        },
+      },
+      warnings: ['poll_options_omitted'],
+    });
+
+    const updated = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        id: 57,
+        poll: { ...poll, total_voters: 21 },
+        text: '',
+        text_entities: [],
+        type: 'message',
+      },
+      CONTEXT,
+    );
+    if (result.kind !== 'eligible' || updated.kind !== 'eligible') {
+      throw new Error('Poll fixtures did not normalize');
+    }
+    expect(updated.snapshot).toEqual(result.snapshot);
+    expect(updated.observation.sourceKey).not.toBe(result.observation.sourceKey);
+  });
+
+  it('still rejects a poll without a usable question', () => {
     expect(
       normalizeTelegramDesktopMessage(
         {
           date_unixtime: '1735787045',
-          id: 55,
-          text_entities: [{ document_id: {}, text: '🌸', type: 'custom_emoji' }],
+          id: 58,
+          poll: { answers: [], question: ' ' },
+          type: 'message',
+        },
+        CONTEXT,
+      ),
+    ).toMatchObject({ code: 'invalid_poll', kind: 'item_error' });
+  });
+
+  it.each([
+    ['object', {}],
+    ['array', []],
+    ['boolean', true],
+    ['whitespace string', ' '],
+  ])('still rejects a malformed %s custom emoji document_id', (_label, documentId) => {
+    expect(
+      normalizeTelegramDesktopMessage(
+        {
+          date_unixtime: '1735787045',
+          id: 56,
+          text_entities: [{ document_id: documentId, text: '🌸', type: 'custom_emoji' }],
           type: 'message',
         },
         CONTEXT,
