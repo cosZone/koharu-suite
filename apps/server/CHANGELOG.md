@@ -1,5 +1,11 @@
 # @koharu-suite/server
 
+## 0.4.0
+
+### Minor Changes
+
+- 9ceca0a: Allow owners to hide or restore any archived message from the Owner Desk with audited, reversible tombstones.
+
 ## 0.3.3
 
 ### Patch Changes
