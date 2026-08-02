@@ -19,12 +19,16 @@ import {
   messageSourceMediaObservations,
   messageSourceObservations,
   messages,
+  telegramChannelAllowlist,
   telegramChannels,
   telegramUpdates,
 } from '../../src/db/schema.js';
+import { PostgresTelegramDesktopImportRepository } from '../../src/imports/import-repository.js';
+import { TelegramDesktopImportService } from '../../src/imports/telegram-desktop-service.js';
 import { LocalMediaBlobStore } from '../../src/media-cache/blob-store.js';
 import { DesktopImportMediaCacheService } from '../../src/media-cache/desktop-import-service.js';
 import { PostgresMediaCacheDiscoveryRepository } from '../../src/media-cache/discovery-repository.js';
+import { PostgresMessageRepository } from '../../src/messages/repository.js';
 
 const POSTGRES_IMAGE = 'postgres:18-alpine';
 const JPEG = Uint8Array.from([
@@ -202,6 +206,158 @@ describe('exact Desktop import media cache', () => {
       reason: 'cache this exact completed export',
     });
     expect(JSON.stringify(action)).not.toContain(fixture.desktopRoot);
+  });
+
+  it('caches media added by a richer replay without duplicating the message revision', async () => {
+    if (!connection || !container) throw new Error('Database connection was not created');
+    const database = connection.db;
+    const databaseUrl = container.getConnectionUri();
+    const desktopRoot = await mkdtemp(join(tmpdir(), 'koharu-desktop-richer-export-'));
+    const cacheRoot = await mkdtemp(join(tmpdir(), 'koharu-desktop-richer-cache-'));
+    temporaryDirectories.push(desktopRoot, cacheRoot);
+    await mkdir(join(desktopRoot, 'photos'));
+    await writeFile(join(desktopRoot, 'photos', 'one.jpg'), JPEG);
+
+    const canonicalChannelId = -1_001_234_567_890n;
+    const baseMessage = {
+      date_unixtime: '1753347600',
+      height: 1,
+      id: 1,
+      photo_file_size: String(JPEG.byteLength),
+      text: '',
+      type: 'message',
+      width: 1,
+    };
+    const desktopExport = (photo: string) => ({
+      id: 1_234_567_890,
+      messages: [{ ...baseMessage, photo }],
+      name: 'Richer media replay',
+      type: 'public_channel',
+    });
+    const placeholderInput = join(desktopRoot, 'placeholder.json');
+    const availableInput = join(desktopRoot, 'result.json');
+    await Promise.all([
+      writeFile(
+        placeholderInput,
+        JSON.stringify(
+          desktopExport('(File not included. Change data exporting settings to download.)'),
+        ),
+      ),
+      writeFile(availableInput, JSON.stringify(desktopExport('photos/one.jpg'))),
+      database.insert(telegramChannelAllowlist).values({
+        telegramChatId: canonicalChannelId,
+        title: 'Richer media replay',
+        username: 'richer_media_replay',
+      }),
+    ]);
+
+    const runImport = async (inputPath: string) => {
+      const repository = new PostgresTelegramDesktopImportRepository(databaseUrl, database);
+      try {
+        return await new TelegramDesktopImportService(
+          repository,
+          new PostgresMessageRepository(database),
+        ).run({ apply: true, channelIds: [canonicalChannelId], inputPath });
+      } finally {
+        await repository.close();
+      }
+    };
+
+    const placeholderRun = await runImport(placeholderInput);
+    expect(placeholderRun).toMatchObject({
+      counts: { createdMessages: 1, createdRevisions: 1 },
+      status: 'clean',
+    });
+    const placeholderDiscovery = await new PostgresMediaCacheDiscoveryRepository(
+      database,
+    ).discoverBatch();
+    expect(placeholderDiscovery).toMatchObject({
+      objectsCreated: 0,
+      plansCreated: 0,
+      scanned: 1,
+      sourcesCreated: 0,
+    });
+
+    const availableRun = await runImport(availableInput);
+    expect(availableRun).toMatchObject({
+      counts: { createdMessages: 0, createdRevisions: 0, matchedExisting: 1 },
+      status: 'clean',
+    });
+    expect(availableRun.runId).toBeTypeOf('string');
+
+    const [messageRows, revisionRows, observations, mediaEvidence] = await Promise.all([
+      database.select().from(messages),
+      database.select().from(messageRevisions),
+      database
+        .select()
+        .from(messageSourceObservations)
+        .orderBy(asc(messageSourceObservations.createdAt), asc(messageSourceObservations.id)),
+      database
+        .select({
+          availability: messageSourceMediaObservations.availability,
+          desktopSourcePath: messageSourceMediaObservations.desktopSourcePath,
+          observationId: messageSourceMediaObservations.observationId,
+        })
+        .from(messageSourceMediaObservations)
+        .orderBy(
+          asc(messageSourceMediaObservations.createdAt),
+          asc(messageSourceMediaObservations.id),
+        ),
+    ]);
+    expect(messageRows).toHaveLength(1);
+    expect(revisionRows).toHaveLength(1);
+    expect(observations).toHaveLength(2);
+    expect(mediaEvidence).toEqual([
+      {
+        availability: 'not_included',
+        desktopSourcePath: null,
+        observationId: observations[0]?.id,
+      },
+      {
+        availability: 'available',
+        desktopSourcePath: 'photos/one.jpg',
+        observationId: observations[1]?.id,
+      },
+    ]);
+    expect(observations.map(({ resolution }) => resolution)).toEqual(['created', 'matched']);
+    const availableRunLineage = await database
+      .select()
+      .from(importRunObservations)
+      .where(eq(importRunObservations.runId, availableRun.runId as string));
+    expect(availableRunLineage).toEqual([
+      expect.objectContaining({
+        observationId: observations[1]?.id,
+        replayed: false,
+        resolutionAtRun: 'matched',
+      }),
+    ]);
+
+    const blobs = new LocalMediaBlobStore(cacheRoot);
+    await blobs.initialize();
+    const result = await new DesktopImportMediaCacheService(database, blobs, () =>
+      new PostgresMediaCacheDiscoveryRepository(database).discoverBatch(),
+    ).run({
+      desktopRoot,
+      importRunId: availableRun.runId as string,
+      initiatorId: 'desktop-cli:456',
+      inputPath: availableInput,
+      reason: 'cache newly available Desktop media evidence',
+    });
+
+    expect(result).toMatchObject({
+      auditedObjects: 1,
+      completedPlans: 1,
+      failedPlans: 0,
+      offeredPlans: 1,
+      scannedEvidence: 1,
+      status: 'completed',
+      unclaimedPlans: 0,
+    });
+    const [plan] = await database.select().from(mediaCachePostPlans);
+    const [object] = await database.select().from(mediaCacheObjects);
+    expect(plan).toMatchObject({ state: 'ready' });
+    expect(object).toMatchObject({ state: 'ready' });
+    expect(object?.blobSha256).toMatch(/^[0-9a-f]{64}$/u);
   });
 
   it('atomically completes a mixed Bot/Desktop plan when the exact run covers every object', async () => {

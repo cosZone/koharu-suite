@@ -78,6 +78,7 @@ describe('Telegram Desktop message normalization', () => {
     expect(result.observation.sourceKey).toContain(
       'telegram-desktop:-1001234567890:42:2025-01-02T03:05:05.000Z:',
     );
+    expect(result.observation.sourceKey).not.toContain(':media-evidence-v1:');
     expect(result.observation.sourceMetadata).toEqual({
       forwardedFrom: 'Source channel',
       replyToMessageId: '41',
@@ -378,6 +379,53 @@ describe('Telegram Desktop message normalization', () => {
       kind: 'eligible',
       snapshot: { media: [{ availabilityReason, sourcePath: null }] },
     });
+  });
+
+  it('distinguishes newly available Desktop media evidence from an earlier placeholder', () => {
+    const placeholder = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        height: 1080,
+        id: 59,
+        photo: '(File not included. Change data exporting settings to download.)',
+        photo_file_size: '2048',
+        type: 'message',
+        width: 1920,
+      },
+      CONTEXT,
+    );
+    const available = normalizeTelegramDesktopMessage(
+      {
+        date_unixtime: '1735787045',
+        height: 1080,
+        id: 59,
+        photo: 'photos/photo_59.jpg',
+        photo_file_size: '2048',
+        type: 'message',
+        width: 1920,
+      },
+      CONTEXT,
+    );
+    if (placeholder.kind !== 'eligible' || available.kind !== 'eligible') {
+      throw new Error('Expected eligible media fixtures');
+    }
+
+    expect(fingerprintMessageSnapshot(available.snapshot)).toBe(
+      fingerprintMessageSnapshot(placeholder.snapshot),
+    );
+    const legacyAvailableSourceKey = [
+      'telegram-desktop',
+      CONTEXT.channel.telegramChatId.toString(),
+      available.snapshot.message.telegramMessageId.toString(),
+      available.observation.observedAt?.toISOString(),
+      fingerprintMessageSnapshot(available.snapshot),
+    ].join(':');
+    expect(placeholder.observation.sourceKey).not.toBe(legacyAvailableSourceKey);
+    expect(available.observation.sourceKey).not.toBe(legacyAvailableSourceKey);
+    expect(available.observation.sourceKey).not.toBe(placeholder.observation.sourceKey);
+    expect(placeholder.observation.sourceKey).toContain(':media-evidence-v1:');
+    expect(available.observation.sourceKey).toContain(':media-evidence-v1:');
+    expect(available.observation.sourceKey).not.toContain('photos/photo_59.jpg');
   });
 
   it('preserves unknown media as document metadata with a warning', () => {

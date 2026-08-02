@@ -17,7 +17,7 @@ const PLACEHOLDER_REASONS: ReadonlyArray<[RegExp, string]> = [
   [/(?:file|media) (?:is )?unavailable/iu, 'unavailable'],
 ];
 
-export const TELEGRAM_DESKTOP_PARSER_VERSION = 3;
+export const TELEGRAM_DESKTOP_PARSER_VERSION = 4;
 
 export interface TelegramDesktopNormalizeContext {
   channel: NormalizedChannelIdentity;
@@ -369,6 +369,19 @@ function sourcePath(
     : { availabilityReason: reason, sourcePath: null };
 }
 
+function desktopMediaEvidenceFingerprint(media: readonly SourceNeutralMedia[]): string | null {
+  if (media.length === 0) {
+    return null;
+  }
+  const evidence = media.map((item, position) => ({
+    availabilityReason: item.availabilityReason,
+    kind: item.kind,
+    position,
+    sourcePath: item.sourcePath,
+  }));
+  return createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+}
+
 function desktopMediaKind(sourceMediaType: string | null): NormalizedMediaKind {
   switch (sourceMediaType) {
     case 'animation':
@@ -495,6 +508,7 @@ function normalizeEligible(
     },
   };
   const fingerprint = fingerprintMessageSnapshot(snapshot);
+  const mediaEvidenceFingerprint = desktopMediaEvidenceFingerprint(snapshot.media);
   const observedAt = editedAt ?? publishedAt;
   const normalizedSourceMetadata = sourceMetadata(record);
   const observation: Extract<SourceObservation, { kind: 'telegram_desktop_json' }> = {
@@ -510,6 +524,7 @@ function normalizeEligible(
       telegramMessageId.toString(),
       observedAt.toISOString(),
       fingerprint,
+      ...(mediaEvidenceFingerprint === null ? [] : ['media-evidence-v1', mediaEvidenceFingerprint]),
       ...(poll === null ? [] : ['poll-v1', poll.sourceFingerprint]),
     ].join(':'),
     sourceMessageId: telegramMessageId,
