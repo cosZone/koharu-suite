@@ -1,6 +1,8 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sql } from 'drizzle-orm';
+import { OwnerMessageVisibilityService } from './admin/message-visibility.js';
+import { PostgresOwnerMessageVisibilityRepository } from './admin/message-visibility-repository.js';
 import { PostgresAdminOperations } from './admin/operations.js';
 import { PostgresAdminRepository } from './admin/repository.js';
 import { createApp } from './app.js';
@@ -457,6 +459,9 @@ export async function startServerRuntime(config: ServerRuntimeConfig): Promise<S
         : {}),
       mediaCacheAdmin,
       ...(mediaCacheMutations ? { mediaCacheMutations } : {}),
+      messageVisibility: new OwnerMessageVisibilityService(
+        new PostgresOwnerMessageVisibilityRepository(mainConnection.db),
+      ),
       messages: repository,
       operations: new PostgresAdminOperations(mainConnection.db),
       publicApi: config.publicApi,

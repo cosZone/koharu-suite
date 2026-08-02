@@ -42,7 +42,19 @@ export interface Message {
   publishedAt: string;
   revision: number;
   sourceUrl: string | null;
+  tombstoned?: boolean;
+  updatedAt?: string;
 }
+
+export interface MessageVisibilityResult {
+  actionId: string;
+  changed: boolean;
+  messageId: string;
+  tombstoned: boolean;
+  updatedAt: string;
+}
+
+export type MessageVisibilityFilter = 'all' | 'hidden' | 'visible';
 
 export interface AdminStatus {
   collector: {

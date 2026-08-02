@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  decodeAdminMessageCursor,
   decodeLatestMessageCursor,
   decodeMessageCursor,
+  encodeAdminMessageCursor,
   encodeLatestMessageCursor,
   encodeMessageCursor,
   InvalidCursorError,
@@ -21,6 +23,17 @@ function encodedJson(json: string): string {
 }
 
 describe('message cursor', () => {
+  it('binds an Admin cursor to both channel and visibility filter', () => {
+    const encoded = encodeAdminMessageCursor({ ...CURSOR, visibility: 'hidden' });
+
+    expect(
+      decodeAdminMessageCursor(encoded, { channelId: CHANNEL_ID, visibility: 'hidden' }),
+    ).toEqual({ ...CURSOR, visibility: 'hidden' });
+    expect(() =>
+      decodeAdminMessageCursor(encoded, { channelId: CHANNEL_ID, visibility: 'all' }),
+    ).toThrow(InvalidCursorError);
+  });
+
   it('binds a latest cursor to its snapshot and normalized visible-channel set', () => {
     const latest = { ...CURSOR, snapshotAt: '2026-07-24T01:00:00.000Z' };
     const otherChannel = 'c78e9147-480f-4e63-941c-eefac29534d0';

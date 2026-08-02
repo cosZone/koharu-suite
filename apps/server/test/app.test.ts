@@ -2,9 +2,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import {
+  OwnerMessageVisibilityConflictError,
+  OwnerMessageVisibilityNotFoundError,
+} from '../src/admin/message-visibility.js';
 import { type AppDependencies, createApp } from '../src/app.js';
 import type { AdminPrincipal, RuntimeAuth } from '../src/auth/runtime-auth.js';
-import { encodeMessageCursor } from '../src/http/cursor.js';
+import { encodeAdminMessageCursor, encodeMessageCursor } from '../src/http/cursor.js';
 import type { MessageReader, PublicMessage } from '../src/messages/types.js';
 import { VERSION } from '../src/version.js';
 import { channelPostFixture } from './fixtures/telegram.js';
@@ -24,6 +28,7 @@ const FINDING_CURSOR = Buffer.from(
   }),
   'utf8',
 ).toString('base64url');
+const MESSAGE_UPDATED_AT = '2026-08-02T00:20:00.000Z';
 
 const ownerPrincipal: AdminPrincipal = {
   actorId: 'owner-user-id',
@@ -155,6 +160,25 @@ function createTombstone(): AppDependencies['tombstone'] {
       messageId: MESSAGE_ID,
       replayed: false,
       tombstoned: false,
+    })),
+  };
+}
+
+function createMessageVisibility(): AppDependencies['messageVisibility'] {
+  return {
+    hide: vi.fn(async () => ({
+      actionId: RUN_ID,
+      changed: true,
+      messageId: MESSAGE_ID,
+      tombstoned: true,
+      updatedAt: '2026-08-02T00:21:00.000Z',
+    })),
+    unhide: vi.fn(async () => ({
+      actionId: RUN_ID,
+      changed: true,
+      messageId: MESSAGE_ID,
+      tombstoned: false,
+      updatedAt: '2026-08-02T00:22:00.000Z',
     })),
   };
 }
@@ -454,7 +478,24 @@ describe('owner admin endpoints', () => {
     const rawUpdate = channelPostFixture();
     const app = createApp({
       admin: {
+        getMessage: async (messageId) =>
+          messageId === MESSAGE_ID
+            ? { ...message, tombstoned: true, updatedAt: MESSAGE_UPDATED_AT }
+            : null,
         getRawUpdate: async (messageId) => (messageId === MESSAGE_ID ? rawUpdate : null),
+        listMessages: async (channelId) =>
+          channelId === CHANNEL_ID
+            ? {
+                items: [
+                  {
+                    ...message,
+                    tombstoned: true,
+                    updatedAt: MESSAGE_UPDATED_AT,
+                  },
+                ],
+                nextCursor: null,
+              }
+            : null,
         getStatus: async () => ({
           collector: {
             heartbeatAt: '2026-07-24T12:00:00.000Z',
@@ -534,8 +575,10 @@ describe('owner admin endpoints', () => {
     }));
     const response = await createApp({
       admin: {
+        getMessage: vi.fn(),
         getRawUpdate,
         getStatus: vi.fn(),
+        listMessages: vi.fn(),
       },
       auth: createAuthorizedAuth(serviceTokenPrincipal, authorize),
     }).request(`/api/v1/admin/messages/${MESSAGE_ID}/raw`, {
@@ -568,6 +611,124 @@ describe('owner admin endpoints', () => {
     expect(authorize).toHaveBeenCalledWith(expect.any(Headers), 'admin:read');
     const [headers] = authorize.mock.calls[0] ?? [];
     expect(headers?.get('Authorization')).toBe('Bearer khs_test');
+  });
+
+  it('lists hidden messages only for the owner management view', async () => {
+    const nextCursor = {
+      channelId: CHANNEL_ID,
+      messageId: MESSAGE_ID,
+      publishedAt: message.publishedAt,
+    };
+    const listMessages = vi.fn(async () => ({
+      items: [{ ...message, tombstoned: true, updatedAt: MESSAGE_UPDATED_AT }],
+      nextCursor,
+    }));
+    const admin = {
+      getMessage: vi.fn(async () => ({
+        ...message,
+        tombstoned: true,
+        updatedAt: MESSAGE_UPDATED_AT,
+      })),
+      getRawUpdate: vi.fn(),
+      getStatus: vi.fn(),
+      listMessages,
+    };
+    const serviceTokenResponse = await createApp({
+      admin,
+      auth: createAuthorizedAuth(serviceTokenPrincipal),
+    }).request(`/api/v1/admin/messages?channel=${CHANNEL_ID}`);
+    expect(serviceTokenResponse.status).toBe(403);
+    expect(listMessages).not.toHaveBeenCalled();
+
+    const ownerResponse = await createApp({ admin, auth: createAuthorizedAuth() }).request(
+      `/api/v1/admin/messages?channel=${CHANNEL_ID}&limit=25&visibility=hidden`,
+    );
+    expect(ownerResponse.status).toBe(200);
+    expect(listMessages).toHaveBeenCalledWith(CHANNEL_ID, {
+      limit: 25,
+      visibility: 'hidden',
+    });
+    await expect(ownerResponse.json()).resolves.toMatchObject({
+      items: [{ id: MESSAGE_ID, tombstoned: true, updatedAt: MESSAGE_UPDATED_AT }],
+      nextCursor: encodeAdminMessageCursor({ ...nextCursor, visibility: 'hidden' }),
+    });
+
+    const cursor = encodeAdminMessageCursor({ ...nextCursor, visibility: 'hidden' });
+    const next = await createApp({ admin, auth: createAuthorizedAuth() }).request(
+      `/api/v1/admin/messages?channel=${CHANNEL_ID}&visibility=hidden&cursor=${cursor}`,
+    );
+    expect(next.status).toBe(200);
+    expect(listMessages).toHaveBeenLastCalledWith(CHANNEL_ID, {
+      cursor: nextCursor,
+      limit: 50,
+      visibility: 'hidden',
+    });
+
+    const exact = await createApp({ admin, auth: createAuthorizedAuth() }).request(
+      `/api/v1/admin/messages/${MESSAGE_ID}`,
+    );
+    expect(exact.status).toBe(200);
+    await expect(exact.json()).resolves.toMatchObject({ id: MESSAGE_ID, tombstoned: true });
+  });
+
+  it('changes arbitrary message visibility only through an owner session with CAS input', async () => {
+    const messageVisibility = createMessageVisibility();
+    const body = JSON.stringify({
+      expectedUpdatedAt: MESSAGE_UPDATED_AT,
+      reason: '  no longer suitable for public display  ',
+    });
+    const denied = await createApp({
+      auth: createAuthorizedAuth(serviceTokenPrincipal),
+      messageVisibility,
+    }).request(`/api/v1/admin/messages/${MESSAGE_ID}/hide`, {
+      body,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(denied.status).toBe(403);
+    expect(messageVisibility.hide).not.toHaveBeenCalled();
+
+    const ownerApp = createApp({ auth: createAuthorizedAuth(), messageVisibility });
+    const hidden = await ownerApp.request(`/api/v1/admin/messages/${MESSAGE_ID}/hide`, {
+      body,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(hidden.status).toBe(200);
+    expect(messageVisibility.hide).toHaveBeenCalledWith({
+      actorId: ownerPrincipal.actorId,
+      actorType: 'owner_session',
+      expectedUpdatedAt: MESSAGE_UPDATED_AT,
+      messageId: MESSAGE_ID,
+      reason: 'no longer suitable for public display',
+    });
+
+    const invalid = await ownerApp.request(`/api/v1/admin/messages/${MESSAGE_ID}/unhide`, {
+      body: JSON.stringify({ expectedUpdatedAt: 'not-a-date', reason: '' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(invalid.status).toBe(400);
+
+    vi.mocked(messageVisibility.unhide).mockRejectedValueOnce(
+      new OwnerMessageVisibilityNotFoundError('Message was not found'),
+    );
+    const missing = await ownerApp.request(`/api/v1/admin/messages/${MESSAGE_ID}/unhide`, {
+      body,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(missing.status).toBe(404);
+
+    vi.mocked(messageVisibility.unhide).mockRejectedValueOnce(
+      new OwnerMessageVisibilityConflictError('Message changed after it was loaded'),
+    );
+    const conflict = await ownerApp.request(`/api/v1/admin/messages/${MESSAGE_ID}/unhide`, {
+      body,
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    });
+    expect(conflict.status).toBe(409);
   });
 
   it.each([

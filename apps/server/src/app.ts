@@ -3,6 +3,11 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { type Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
+  OwnerMessageVisibilityConflictError,
+  OwnerMessageVisibilityNotFoundError,
+  type OwnerMessageVisibilityService,
+} from './admin/message-visibility.js';
+import {
   AdminOperationConflictError,
   AdminOperationNotFoundError,
   type PostgresAdminOperations,
@@ -12,8 +17,10 @@ import type { RuntimeAuth } from './auth/runtime-auth.js';
 import type { ServiceTokenScope } from './auth/service-token.js';
 import { type PublicApiConfig, parseTelegramChannelId } from './config.js';
 import {
+  decodeAdminMessageCursor,
   decodeLatestMessageCursor,
   decodeMessageCursor,
+  encodeAdminMessageCursor,
   encodeLatestMessageCursor,
   encodeMessageCursor,
   type LatestMessageCursor,
@@ -76,6 +83,7 @@ export interface AppDependencies {
     | 'setChannelEnabled'
     | 'skipTask'
   >;
+  messageVisibility: Pick<OwnerMessageVisibilityService, 'hide' | 'unhide'>;
   /** @deprecated Owner authorization is enforced by RuntimeAuth. */
   owners: {
     isOwner(userId: string): Promise<boolean>;
@@ -125,7 +133,9 @@ const unavailableDiscoveryReader: MessageDiscoveryReader = {
   }),
 };
 const unavailableAdminReader: AdminReader = {
+  getMessage: async () => null,
   getRawUpdate: async () => null,
+  listMessages: async () => null,
   getStatus: async () => ({
     collector: {
       heartbeatAt: null,
@@ -254,6 +264,14 @@ const unavailableTombstone: AppDependencies['tombstone'] = {
     throw new Error('Message tombstone service is not configured');
   },
 };
+const unavailableMessageVisibility: AppDependencies['messageVisibility'] = {
+  hide: async () => {
+    throw new Error('Owner message visibility service is not configured');
+  },
+  unhide: async () => {
+    throw new Error('Owner message visibility service is not configured');
+  },
+};
 
 function defaultPublicClientAddress(context: Context): string {
   try {
@@ -378,6 +396,9 @@ const reconciliationScanSchema = z
 const reconciliationTombstoneSchema = reconciliationActionSchema
   .extend({ messageId: z.uuid() })
   .strict();
+const ownerMessageVisibilitySchema = reasonSchema
+  .extend({ expectedUpdatedAt: z.iso.datetime({ offset: true }) })
+  .strict();
 
 function isPublicApiPath(path: string, mediaEnabled: boolean): boolean {
   return (
@@ -446,6 +467,7 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     media: dependencies.media ?? unavailableMediaReader,
     mediaCacheAdmin: dependencies.mediaCacheAdmin ?? unavailableMediaCacheAdmin,
     mediaCacheMutations: dependencies.mediaCacheMutations ?? unavailableMediaCacheMutations,
+    messageVisibility: dependencies.messageVisibility ?? unavailableMessageVisibility,
     messages: dependencies.messages ?? unavailableMessageReader,
     operations: dependencies.operations ?? unavailableOperations,
     publicApi: dependencies.publicApi ?? defaultPublicApi,
@@ -511,6 +533,15 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     }
     if (error instanceof RangeError) {
       return context.json(apiError('invalid_media_cache_action', error.message), 400);
+    }
+    throw error;
+  };
+  const messageVisibilityFailure = (context: Context, error: unknown) => {
+    if (error instanceof OwnerMessageVisibilityNotFoundError) {
+      return context.json(apiError('message_not_found', error.message), 404);
+    }
+    if (error instanceof OwnerMessageVisibilityConflictError) {
+      return context.json(apiError('message_visibility_conflict', error.message), 409);
     }
     throw error;
   };
@@ -1173,6 +1204,75 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
       return mediaCacheMutationFailure(context, error);
     }
   });
+  app.get('/api/v1/admin/messages', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const channelId = uuidSchema.safeParse(context.req.query('channel'));
+    const limit = listLimitSchema.safeParse(context.req.query('limit'));
+    const visibility = z
+      .enum(['all', 'hidden', 'visible'])
+      .default('all')
+      .safeParse(context.req.query('visibility'));
+    if (!channelId.success || !limit.success || !visibility.success) {
+      return context.json(
+        apiError(
+          'invalid_admin_message_query',
+          'A valid channel, limit and visibility are required',
+        ),
+        400,
+      );
+    }
+    let cursor: MessageCursor | undefined;
+    const encodedCursor = context.req.query('cursor');
+    if (encodedCursor !== undefined) {
+      try {
+        const decoded = decodeAdminMessageCursor(encodedCursor, {
+          channelId: channelId.data,
+          visibility: visibility.data,
+        });
+        cursor = {
+          channelId: decoded.channelId,
+          messageId: decoded.messageId,
+          publishedAt: decoded.publishedAt,
+        };
+      } catch {
+        return context.json(apiError('invalid_cursor', 'cursor is invalid'), 400);
+      }
+    }
+    const page = await resolved.admin.listMessages(channelId.data, {
+      ...(cursor ? { cursor } : {}),
+      limit: limit.data,
+      visibility: visibility.data,
+    });
+    if (page === null) {
+      return context.json(apiError('channel_not_found', 'Channel was not found'), 404);
+    }
+    return context.json({
+      items: page.items,
+      nextCursor: page.nextCursor
+        ? encodeAdminMessageCursor({ ...page.nextCursor, visibility: visibility.data })
+        : null,
+    });
+  });
+  app.get('/api/v1/admin/messages/:id', async (context) => {
+    const authorization = await authorizeAdmin(context, 'admin:read');
+    if ('response' in authorization) return authorization.response;
+    if (authorization.principal.actorType !== 'owner_session') {
+      return context.json(apiError('owner_session_required', 'An owner session is required'), 403);
+    }
+    const messageId = uuidSchema.safeParse(context.req.param('id'));
+    if (!messageId.success) {
+      return context.json(apiError('invalid_message_id', 'id must be a suite message UUID'), 400);
+    }
+    const message = await resolved.admin.getMessage(messageId.data);
+    if (!message) {
+      return context.json(apiError('message_not_found', 'Message was not found'), 404);
+    }
+    return context.json(message);
+  });
   app.get('/api/v1/admin/messages/:id/raw', async (context) => {
     const authorization = await authorizeAdmin(context, 'admin:read');
     if ('response' in authorization) {
@@ -1195,6 +1295,44 @@ export function createApp(dependencies: Partial<AppDependencies> = {}) {
     }
     return context.json({ update });
   });
+  for (const action of ['hide', 'unhide'] as const) {
+    app.post(`/api/v1/admin/messages/:id/${action}`, async (context) => {
+      const authorization = await authorizeAdmin(context, 'content:write');
+      if ('response' in authorization) return authorization.response;
+      if (authorization.principal.actorType !== 'owner_session') {
+        return context.json(
+          apiError('owner_session_required', 'An owner session is required'),
+          403,
+        );
+      }
+      const messageId = uuidSchema.safeParse(context.req.param('id'));
+      const body = ownerMessageVisibilitySchema.safeParse(
+        await context.req.json().catch(() => null),
+      );
+      if (!messageId.success || !body.success) {
+        return context.json(
+          apiError(
+            'invalid_message_visibility_action',
+            'A valid message, expected timestamp and 1–500 character reason are required',
+          ),
+          400,
+        );
+      }
+      try {
+        return context.json(
+          await resolved.messageVisibility[action]({
+            actorId: authorization.principal.actorId,
+            actorType: 'owner_session',
+            expectedUpdatedAt: body.data.expectedUpdatedAt,
+            messageId: messageId.data,
+            reason: body.data.reason,
+          }),
+        );
+      } catch (error) {
+        return messageVisibilityFailure(context, error);
+      }
+    });
+  }
   app.get('/api/v1/admin/tasks/blocked', async (context) => {
     const authorization = await authorizeAdmin(context, 'admin:read');
     if ('response' in authorization) {

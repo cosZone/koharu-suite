@@ -94,6 +94,10 @@ Imports continue through the same source-neutral writer. Replaying identical or 
 run lineage without duplicating canonical content. Absence from one Desktop export does not mean deletion. Only
 the owner may hide or unhide a message associated with an absence candidate, and must provide a reason.
 
+The owner can also hide or restore any archived message directly from the Owner Desk Messages page with an
+explicit reason. This path does not depend on a reconciliation finding and never writes back to Telegram. It uses
+an independent Owner audit event while preserving the same reversible public tombstone behavior.
+
 Only when you know that an export completely covers a bounded range, repeat
 `--complete-range=<channel>:<startMessageId>:<endMessageId>` on apply:
 
@@ -110,7 +114,7 @@ The range must belong to a selected channel and is stored only for a clean impor
 
 ## Visibility and evidence retention
 
-Owner-hidden messages use tombstones:
+Messages hidden from either an absence finding or the Owner Desk Messages page use the same tombstone:
 
 - public lists filter them out;
 - public detail returns an ordinary `404`;
