@@ -9,6 +9,12 @@ export interface MessageCursor {
   publishedAt: string;
 }
 
+export type AdminMessageVisibility = 'all' | 'hidden' | 'visible';
+
+export interface AdminMessageCursor extends MessageCursor {
+  visibility: AdminMessageVisibility;
+}
+
 export interface LatestMessageCursor extends MessageCursor {
   snapshotAt: string;
 }
@@ -23,6 +29,10 @@ interface MessageCursorPayload extends MessageCursor {
 
 interface LatestMessageCursorPayload extends LatestMessageCursor {
   channelFilterHash: string;
+  v: 1;
+}
+
+interface AdminMessageCursorPayload extends AdminMessageCursor {
   v: 1;
 }
 
@@ -101,6 +111,42 @@ function parsePayload(value: unknown): MessageCursorPayload {
     channelId: candidate.channelId,
     messageId: candidate.messageId,
     publishedAt: candidate.publishedAt,
+  });
+}
+
+function adminCursorPayload(cursor: AdminMessageCursor): AdminMessageCursorPayload {
+  validateCursor(cursor);
+  if (!['all', 'hidden', 'visible'].includes(cursor.visibility)) invalidCursor();
+  return { ...cursorPayload(cursor), visibility: cursor.visibility };
+}
+
+function parseAdminPayload(value: unknown): AdminMessageCursorPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return invalidCursor();
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 5 ||
+    !keys.includes('v') ||
+    !keys.includes('publishedAt') ||
+    !keys.includes('channelId') ||
+    !keys.includes('messageId') ||
+    !keys.includes('visibility')
+  ) {
+    return invalidCursor();
+  }
+  const candidate = value as Partial<AdminMessageCursorPayload>;
+  if (
+    candidate.v !== 1 ||
+    (candidate.visibility !== 'all' &&
+      candidate.visibility !== 'hidden' &&
+      candidate.visibility !== 'visible')
+  ) {
+    return invalidCursor();
+  }
+  return adminCursorPayload({
+    channelId: candidate.channelId ?? '',
+    messageId: candidate.messageId ?? '',
+    publishedAt: candidate.publishedAt ?? '',
+    visibility: candidate.visibility,
   });
 }
 
@@ -213,6 +259,33 @@ export function decodeMessageCursor(
     channelId: payload.channelId,
     messageId: payload.messageId,
     publishedAt: payload.publishedAt,
+  };
+}
+
+export function encodeAdminMessageCursor(cursor: AdminMessageCursor): string {
+  return Buffer.from(JSON.stringify(adminCursorPayload(cursor)), 'utf8').toString('base64url');
+}
+
+export function decodeAdminMessageCursor(
+  encoded: string,
+  options: { channelId: string; visibility: AdminMessageVisibility },
+): AdminMessageCursor {
+  const { json, parsed } = decodePayload(encoded);
+  const payload = parseAdminPayload(parsed);
+  if (JSON.stringify(payload) !== json) return invalidCursor();
+  const channelId = options.channelId.toLowerCase();
+  if (
+    !isUuid(channelId) ||
+    payload.channelId !== channelId ||
+    payload.visibility !== options.visibility
+  ) {
+    return invalidCursor();
+  }
+  return {
+    channelId: payload.channelId,
+    messageId: payload.messageId,
+    publishedAt: payload.publishedAt,
+    visibility: payload.visibility,
   };
 }
 

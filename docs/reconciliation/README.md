@@ -89,6 +89,10 @@ pnpm exec kodama import telegram-desktop \
 canonical 内容。Desktop export 缺少某条消息本身不代表删除；只有 owner 可以对明确的 absence
 candidate 带理由 hide/unhide。
 
+Owner 也可以在 Owner Desk 的“消息”页对任意已归档消息带理由隐藏或恢复。这个入口不依赖
+reconciliation finding，不会回写 Telegram；操作使用独立的 Owner 审计记录，但继续复用同一个
+可恢复 tombstone 公开语义。
+
 只有你确认 export 对一个明确范围完整时，才在 apply 中重复使用
 `--complete-range=<channel>:<startMessageId>:<endMessageId>`：
 
@@ -105,7 +109,7 @@ pnpm exec kodama import telegram-desktop \
 
 ## 可见性与证据保留
 
-被 owner 隐藏的消息使用 tombstone：
+无论 Owner 从 absence finding 还是“消息”页隐藏，消息都使用同一个 tombstone：
 
 - 从公开列表过滤；
 - 公开详情返回普通 `404`；

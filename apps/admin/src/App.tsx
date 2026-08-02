@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { HashRouter, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom';
+import {
+  HashRouter,
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from 'react-router-dom';
 import { toast } from 'sonner';
 import { LoginCard } from '@/components/auth/login-card';
 import type { ActionPage, Desk } from '@/components/desk/desk-context';
@@ -29,6 +37,8 @@ import type {
   MediaCachePrunePreview,
   MediaCacheStatus,
   Message,
+  MessageVisibilityFilter,
+  MessageVisibilityResult,
   ReconciliationFinding,
   ReconciliationRun,
   RerenderResult,
@@ -36,16 +46,130 @@ import type {
 import type { SearchPublicMessage } from './SearchAndFeedsPanel';
 import { startStatusPoller } from './status-poller';
 
-async function fetchJson<T extends object>(input: string, init?: RequestInit): Promise<T> {
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null,
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+export async function fetchJson<T extends object>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   const body = (await response.json()) as T | ApiError;
 
   if (!response.ok) {
     const message = 'error' in body ? body.error.message : `Request failed with ${response.status}`;
-    throw new Error(message);
+    throw new ApiRequestError(message, response.status, 'error' in body ? body.error.code : null);
   }
 
   return body as T;
+}
+
+export function hydrateManagedMessage(current: Message | null, items: Message[]): Message | null {
+  if (!current) return null;
+  return items.find((candidate) => candidate.id === current.id) ?? current;
+}
+
+export async function recoverMessageVisibilityConflict(
+  reason: unknown,
+  messageId: string,
+  refresh: (messageId: string) => Promise<void>,
+): Promise<boolean> {
+  if (
+    !(reason instanceof ApiRequestError) ||
+    reason.status !== 409 ||
+    reason.code !== 'message_visibility_conflict'
+  ) {
+    return false;
+  }
+  await refresh(messageId);
+  return true;
+}
+
+export interface MessageRequestToken {
+  generation: number;
+  scope: string;
+}
+
+export class MessageRequestGuard {
+  private generation = 0;
+
+  begin(scope: string): MessageRequestToken {
+    this.generation += 1;
+    return { generation: this.generation, scope };
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+  }
+
+  isCurrent(token: MessageRequestToken): boolean {
+    return token.generation === this.generation;
+  }
+}
+
+export interface MessageLoadingToken {
+  generation: number;
+  scope: string;
+}
+
+export class MessageLoadingOwner {
+  private generation = 0;
+
+  begin(scope: string): MessageLoadingToken {
+    this.generation += 1;
+    return { generation: this.generation, scope };
+  }
+
+  isCurrent(token: MessageLoadingToken): boolean {
+    return token.generation === this.generation;
+  }
+}
+
+export function resolveRefreshedMessageSelection(input: {
+  current: Message | null;
+  items: Message[];
+  preferRequested: boolean;
+  preferred: Message | undefined;
+}): Message | null {
+  if (input.preferRequested && input.preferred) return input.preferred;
+  if (input.current) {
+    return input.items.find((candidate) => candidate.id === input.current?.id) ?? input.current;
+  }
+  return input.items[0] ?? null;
+}
+
+export function isMessageInChannel(
+  message: Message | null,
+  channelId: string | null,
+): message is Message {
+  return message !== null && channelId !== null && message.channel.id === channelId;
+}
+
+export const SEARCH_MESSAGE_LOAD_ERROR = '无法加载这条消息的管理状态，请重试。';
+
+export async function completeSearchSelection(input: {
+  isCurrent(): boolean;
+  load(): Promise<Message>;
+  navigate(path: '/messages'): void;
+  reportError(message: string): void;
+  select(message: Message): void;
+}): Promise<boolean> {
+  try {
+    const managedMessage = await input.load();
+    if (!input.isCurrent()) return false;
+    input.select(managedMessage);
+    input.navigate('/messages');
+    return true;
+  } catch {
+    if (!input.isCurrent()) return false;
+    input.reportError(SEARCH_MESSAGE_LOAD_ERROR);
+    return false;
+  }
 }
 
 function errorMessage(reason: unknown, fallback: string): string {
@@ -66,6 +190,20 @@ export async function publishMediaCacheMutationReceipt(input: {
   }
 }
 
+function adminMessagesUrl(
+  channelId: string,
+  visibility: MessageVisibilityFilter,
+  cursor?: string,
+): string {
+  const search = new URLSearchParams({ channel: channelId, limit: '50', visibility });
+  if (cursor) search.set('cursor', cursor);
+  return `/api/v1/admin/messages?${search.toString()}`;
+}
+
+function messageScopeKey(channelId: string, visibility: MessageVisibilityFilter): string {
+  return `${channelId}:${visibility}`;
+}
+
 function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Promise<void> }) {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -78,6 +216,9 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   const [selectedChannel, setSelectedChannel] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  const [messagesNextCursor, setMessagesNextCursor] = useState<string | null>(null);
+  const [messageVisibilityFilter, setMessageVisibilityFilter] =
+    useState<MessageVisibilityFilter>('all');
   const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
   const [raw, setRaw] = useState<unknown>(null);
   const [rawLoading, setRawLoading] = useState(false);
@@ -96,8 +237,18 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   );
   const [rerenderResult, setRerenderResult] = useState<RerenderResult | null>(null);
   const messageSelectionVersion = useRef(0);
+  const messageLoadingOwner = useRef(new MessageLoadingOwner());
+  const messageRequestGuard = useRef(new MessageRequestGuard());
+  const currentMessageScope = selectedChannel
+    ? messageScopeKey(selectedChannel, messageVisibilityFilter)
+    : null;
+  const currentMessageScopeRef = useRef(currentMessageScope);
+  currentMessageScopeRef.current = currentMessageScope;
   const skipAutoSelectRef = useRef(false);
   const location = useLocation();
+  const locationPathRef = useRef(location.pathname);
+  locationPathRef.current = location.pathname;
+  const navigate = useNavigate();
   const mainRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
@@ -203,19 +354,30 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
 
   useEffect(() => {
     if (!selectedChannel) {
+      messageLoadingOwner.current.begin('no-channel');
       setMessages([]);
+      setMessagesNextCursor(null);
+      setMessagesLoading(false);
+      setSelectedMessage(null);
+      setRaw(null);
       return;
     }
 
     const controller = new AbortController();
+    const scope = messageScopeKey(selectedChannel, messageVisibilityFilter);
+    const loadingToken = messageLoadingOwner.current.begin(scope);
+    const requestToken = messageRequestGuard.current.begin(scope);
     const selectionVersion = messageSelectionVersion.current;
     setMessagesLoading(true);
-    fetchJson<{ items: Message[] }>(
-      `/api/v1/messages?channel=${encodeURIComponent(selectedChannel)}`,
+    fetchJson<{ items: Message[]; nextCursor: string | null }>(
+      adminMessagesUrl(selectedChannel, messageVisibilityFilter),
       { signal: controller.signal },
     )
       .then((result) => {
+        if (!messageRequestGuard.current.isCurrent(requestToken)) return;
         setMessages(result.items);
+        setMessagesNextCursor(result.nextCursor);
+        setSelectedMessage((current) => hydrateManagedMessage(current, result.items));
         if (messageSelectionVersion.current === selectionVersion) {
           if (skipAutoSelectRef.current) {
             skipAutoSelectRef.current = false;
@@ -229,16 +391,17 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
         if (reason instanceof DOMException && reason.name === 'AbortError') {
           return;
         }
+        if (!messageRequestGuard.current.isCurrent(requestToken)) return;
         setActionError({ page: 'messages', message: errorMessage(reason, '无法加载消息') });
       })
       .finally(() => {
-        if (!controller.signal.aborted) {
+        if (messageLoadingOwner.current.isCurrent(loadingToken)) {
           setMessagesLoading(false);
         }
       });
 
     return () => controller.abort();
-  }, [selectedChannel]);
+  }, [messageVisibilityFilter, selectedChannel]);
 
   function retryLoad() {
     setLoadError(null);
@@ -247,7 +410,7 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   }
 
   async function revealRaw() {
-    if (!selectedMessage) {
+    if (!isMessageInChannel(selectedMessage, selectedChannel) || messagesLoading) {
       return;
     }
 
@@ -267,17 +430,228 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
   }
 
   function selectArchiveChannel(channelId: string) {
+    if (channelId === selectedChannel) return;
+    messageRequestGuard.current.invalidate();
+    messageLoadingOwner.current.begin(messageScopeKey(channelId, messageVisibilityFilter));
     messageSelectionVersion.current += 1;
+    setMessages([]);
+    setMessagesNextCursor(null);
+    setMessagesLoading(true);
+    setSelectedMessage(null);
+    setRaw(null);
     setSelectedChannel(channelId);
   }
 
   function selectSearchMessage(message: SearchPublicMessage) {
     messageSelectionVersion.current += 1;
+    const selectionVersion = messageSelectionVersion.current;
+    const selectionPath = location.pathname;
     setSelectedMessage(message);
     setRaw(null);
     if (message.channel.id !== selectedChannel) {
+      messageRequestGuard.current.invalidate();
+      messageLoadingOwner.current.begin(
+        messageScopeKey(message.channel.id, messageVisibilityFilter),
+      );
       skipAutoSelectRef.current = true;
+      setMessages([]);
+      setMessagesNextCursor(null);
+      setMessagesLoading(true);
       setSelectedChannel(message.channel.id);
+    }
+    void completeSearchSelection({
+      isCurrent: () =>
+        messageSelectionVersion.current === selectionVersion &&
+        locationPathRef.current === selectionPath,
+      load: () => fetchJson<Message>(`/api/v1/admin/messages/${message.id}`, { cache: 'no-store' }),
+      navigate: (path) => navigate(path),
+      reportError: (error) => toast.error(error),
+      select: (managedMessage) => setSelectedMessage(managedMessage),
+    });
+  }
+
+  function changeMessageVisibilityFilter(filter: MessageVisibilityFilter) {
+    if (filter === messageVisibilityFilter) return;
+    messageRequestGuard.current.invalidate();
+    if (selectedChannel) {
+      messageLoadingOwner.current.begin(messageScopeKey(selectedChannel, filter));
+    }
+    messageSelectionVersion.current += 1;
+    setMessages([]);
+    setMessagesNextCursor(null);
+    setMessagesLoading(true);
+    setSelectedMessage(null);
+    setRaw(null);
+    setMessageVisibilityFilter(filter);
+  }
+
+  async function refreshMessageManagement(
+    preferredMessageId?: string,
+    currentRequestToken?: MessageRequestToken,
+    shouldPreferMessage: () => boolean = () => true,
+  ): Promise<void> {
+    if (!selectedChannel) return;
+    const scope = messageScopeKey(selectedChannel, messageVisibilityFilter);
+    if (currentMessageScopeRef.current !== scope) return;
+    if (
+      currentRequestToken &&
+      (currentRequestToken.scope !== scope ||
+        !messageRequestGuard.current.isCurrent(currentRequestToken))
+    ) {
+      return;
+    }
+    const requestToken = currentRequestToken ?? messageRequestGuard.current.begin(scope);
+    const loadingToken = messageLoadingOwner.current.begin(scope);
+    setMessagesLoading(true);
+    try {
+      const result = await fetchJson<{ items: Message[]; nextCursor: string | null }>(
+        adminMessagesUrl(selectedChannel, messageVisibilityFilter),
+        { cache: 'no-store' },
+      );
+      if (!messageRequestGuard.current.isCurrent(requestToken)) return;
+      let preferred =
+        preferredMessageId && shouldPreferMessage()
+          ? result.items.find((candidate) => candidate.id === preferredMessageId)
+          : undefined;
+      if (!preferred && preferredMessageId && shouldPreferMessage()) {
+        try {
+          const exact = await fetchJson<Message>(`/api/v1/admin/messages/${preferredMessageId}`, {
+            cache: 'no-store',
+          });
+          if (!messageRequestGuard.current.isCurrent(requestToken)) return;
+          if (exact.channel.id === selectedChannel) preferred = exact;
+        } catch (reason) {
+          if (!(reason instanceof ApiRequestError && reason.status === 404)) throw reason;
+        }
+      }
+      if (!messageRequestGuard.current.isCurrent(requestToken)) return;
+      setMessages(result.items);
+      setMessagesNextCursor(result.nextCursor);
+      setSelectedMessage((current) =>
+        resolveRefreshedMessageSelection({
+          current,
+          items: result.items,
+          preferred,
+          preferRequested: shouldPreferMessage(),
+        }),
+      );
+      if (shouldPreferMessage()) setRaw(null);
+    } finally {
+      if (messageLoadingOwner.current.isCurrent(loadingToken)) {
+        setMessagesLoading(false);
+      }
+    }
+  }
+
+  async function changeMessageVisibility(
+    message: Message,
+    action: 'hide' | 'unhide',
+    reason: string,
+  ) {
+    if (!message.updatedAt) {
+      setActionError({ page: 'messages', message: '请从消息列表重新选择这条消息后再操作。' });
+      return;
+    }
+    if (!selectedChannel || message.channel.id !== selectedChannel || messagesLoading) {
+      setActionError({ page: 'messages', message: '消息视图正在切换，请等待当前频道加载完成。' });
+      return;
+    }
+    const operationSelectionVersion = messageSelectionVersion.current;
+    const shouldPreferOperationTarget = () =>
+      messageSelectionVersion.current === operationSelectionVersion;
+    const operationToken = messageRequestGuard.current.begin(
+      messageScopeKey(selectedChannel, messageVisibilityFilter),
+    );
+    const busyKey = `message:${message.id}:${action}`;
+    setBusyAction(busyKey);
+    setActionError(null);
+    try {
+      const result = await fetchJson<MessageVisibilityResult>(
+        `/api/v1/admin/messages/${message.id}/${action}`,
+        {
+          body: JSON.stringify({ expectedUpdatedAt: message.updatedAt, reason }),
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+        },
+      );
+      if (!messageRequestGuard.current.isCurrent(operationToken)) {
+        toast.success('消息可见性操作已完成；当前已切换到其他消息视图。');
+        return;
+      }
+      const updated = {
+        ...message,
+        tombstoned: result.tombstoned,
+        updatedAt: result.updatedAt,
+      };
+      setMessages((current) => {
+        const next = current.map((candidate) =>
+          candidate.id === message.id ? updated : candidate,
+        );
+        return next.filter(
+          (candidate) =>
+            messageVisibilityFilter === 'all' ||
+            (messageVisibilityFilter === 'hidden' && candidate.tombstoned) ||
+            (messageVisibilityFilter === 'visible' && !candidate.tombstoned),
+        );
+      });
+      setSelectedMessage((current) => (current?.id === message.id ? updated : current));
+      clearReason(message.id);
+      let refreshFailed = false;
+      try {
+        await refreshMessageManagement(message.id, operationToken, shouldPreferOperationTarget);
+      } catch {
+        if (messageRequestGuard.current.isCurrent(operationToken)) {
+          refreshFailed = true;
+        }
+      }
+      if (!messageRequestGuard.current.isCurrent(operationToken)) {
+        toast.success('消息可见性操作已完成；当前已切换到其他消息视图。');
+        return;
+      }
+      toast.success(
+        action === 'hide'
+          ? '消息已从公开页面、API、搜索与 RSS 隐藏；来源证据仍保留。'
+          : '消息已恢复公开访问。',
+      );
+      if (refreshFailed) {
+        setActionError({
+          page: 'messages',
+          message: '可见性操作已完成，但列表刷新失败；请手动重新载入确认最新状态。',
+        });
+      }
+    } catch (reason) {
+      if (!messageRequestGuard.current.isCurrent(operationToken)) return;
+      try {
+        if (
+          await recoverMessageVisibilityConflict(reason, message.id, (messageId) =>
+            refreshMessageManagement(messageId, operationToken, shouldPreferOperationTarget),
+          )
+        ) {
+          if (!messageRequestGuard.current.isCurrent(operationToken)) return;
+          setActionError({
+            page: 'messages',
+            message: '消息在操作前已发生变化，管理列表已刷新；请核对最新状态后重试。',
+          });
+        } else {
+          setActionError({ page: 'messages', message: errorMessage(reason, '操作失败') });
+        }
+      } catch (refreshReason) {
+        if (!messageRequestGuard.current.isCurrent(operationToken)) return;
+        if (
+          reason instanceof ApiRequestError &&
+          reason.status === 409 &&
+          reason.code === 'message_visibility_conflict'
+        ) {
+          setActionError({
+            page: 'messages',
+            message: errorMessage(refreshReason, '消息状态冲突，且刷新失败；请手动重新载入。'),
+          });
+        } else {
+          setActionError({ page: 'messages', message: errorMessage(reason, '操作失败') });
+        }
+      }
+    } finally {
+      setBusyAction((current) => (current === busyKey ? null : current));
     }
   }
 
@@ -296,8 +670,32 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     } catch (reason) {
       setActionError({ page, message: errorMessage(reason, '操作失败') });
     } finally {
-      setBusyAction(null);
+      setBusyAction((current) => (current === busyKey ? null : current));
     }
+  }
+
+  async function loadMoreMessages() {
+    if (!selectedChannel || !messagesNextCursor) return;
+    await runAction('more-messages', 'messages', async () => {
+      const requestToken = messageRequestGuard.current.begin(
+        messageScopeKey(selectedChannel, messageVisibilityFilter),
+      );
+      const result = await fetchJson<{ items: Message[]; nextCursor: string | null }>(
+        adminMessagesUrl(selectedChannel, messageVisibilityFilter, messagesNextCursor),
+      );
+      if (!messageRequestGuard.current.isCurrent(requestToken)) return null;
+      setMessages((current) => {
+        const known = new Set(current.map((message) => message.id));
+        return [...current, ...result.items.filter((message) => !known.has(message.id))];
+      });
+      setMessagesNextCursor(result.nextCursor);
+      setSelectedMessage((current) =>
+        current
+          ? (result.items.find((candidate) => candidate.id === current.id) ?? current)
+          : current,
+      );
+      return null;
+    });
   }
 
   async function actOnTask(task: BlockedTask, action: 'retry' | 'skip', reason: string) {
@@ -450,6 +848,15 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
         method: 'POST',
       });
       await refreshReconciliation();
+      if (action === 'hide' || action === 'unhide') {
+        const preferredMessageId =
+          finding.messageId &&
+          (selectedMessage?.id === finding.messageId ||
+            messages.some((message) => message.id === finding.messageId))
+            ? finding.messageId
+            : undefined;
+        await refreshMessageManagement(preferredMessageId);
+      }
       clearReason(finding.id);
       return `${verb}已完成。`;
     });
@@ -681,6 +1088,10 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     await onSessionRevoked('已安全退出。');
   }
 
+  const scopedSelectedMessage = isMessageInChannel(selectedMessage, selectedChannel)
+    ? selectedMessage
+    : null;
+
   const desk: Desk = {
     status,
     channels,
@@ -701,17 +1112,23 @@ function DeskShell({ onSessionRevoked }: { onSessionRevoked(message: string): Pr
     selectedChannel,
     messages,
     messagesLoading,
-    selectedMessage,
-    raw,
+    messagesNextCursor,
+    messageVisibilityFilter,
+    selectedMessage: scopedSelectedMessage,
+    raw: scopedSelectedMessage ? raw : null,
     rawLoading,
     onReasonChange,
     onSelectArchiveChannel: selectArchiveChannel,
     onSelectMessage: (message) => {
+      messageSelectionVersion.current += 1;
       setSelectedMessage(message);
       setRaw(null);
     },
     onSelectSearchMessage: selectSearchMessage,
     onRevealRaw: revealRaw,
+    onMessageVisibility: changeMessageVisibility,
+    onLoadMoreMessages: loadMoreMessages,
+    onMessageVisibilityFilterChange: changeMessageVisibilityFilter,
     onTaskAction: actOnTask,
     onFindingAction: actOnFinding,
     onLoadMoreFindings: loadMoreFindings,

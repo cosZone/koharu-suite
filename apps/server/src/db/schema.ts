@@ -288,11 +288,17 @@ export const operationAuditEvents = pgTable(
     actorId: text('actor_id').notNull(),
     action: varchar('action', { length: 64 })
       .$type<
-        'channel.disable' | 'channel.enable' | 'content.rerender' | 'task.retry' | 'task.skip'
+        | 'channel.disable'
+        | 'channel.enable'
+        | 'content.rerender'
+        | 'message.hide'
+        | 'message.unhide'
+        | 'task.retry'
+        | 'task.skip'
       >()
       .notNull(),
     targetType: varchar('target_type', { length: 32 })
-      .$type<'channel' | 'renderer' | 'task'>()
+      .$type<'channel' | 'message' | 'renderer' | 'task'>()
       .notNull(),
     targetId: text('target_id').notNull(),
     reason: text('reason'),

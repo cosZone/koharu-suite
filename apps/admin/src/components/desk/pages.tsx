@@ -71,12 +71,20 @@ export function MessagesPage() {
     <div className="p-3">
       <PageAlert page="messages" />
       <MessageBrowser
+        busyAction={desk.busyAction}
         loading={desk.messagesLoading}
+        messageVisibilityFilter={desk.messageVisibilityFilter}
         messages={desk.messages}
+        nextCursor={desk.messagesNextCursor}
+        onLoadMore={desk.onLoadMoreMessages}
+        onMessageVisibility={desk.onMessageVisibility}
+        onMessageVisibilityFilterChange={desk.onMessageVisibilityFilterChange}
+        onReasonChange={desk.onReasonChange}
         onRevealRaw={desk.onRevealRaw}
         onSelectMessage={desk.onSelectMessage}
         raw={desk.raw}
         rawLoading={desk.rawLoading}
+        reason={desk.selectedMessage ? (desk.reasons[desk.selectedMessage.id] ?? '') : ''}
         selectedMessage={desk.selectedMessage}
       />
     </div>

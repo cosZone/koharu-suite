@@ -9,6 +9,7 @@ import type {
   MediaCachePrunePreview,
   MediaCacheStatus,
   Message,
+  MessageVisibilityFilter,
   ReconciliationFinding,
   ReconciliationRun,
   RerenderResult,
@@ -38,6 +39,8 @@ export interface Desk {
   selectedChannel: string | null;
   messages: Message[];
   messagesLoading: boolean;
+  messagesNextCursor: string | null;
+  messageVisibilityFilter: MessageVisibilityFilter;
   selectedMessage: Message | null;
   raw: unknown;
   rawLoading: boolean;
@@ -46,6 +49,9 @@ export interface Desk {
   onSelectMessage(message: Message): void;
   onSelectSearchMessage(message: SearchPublicMessage): void;
   onRevealRaw(): void;
+  onMessageVisibility(message: Message, action: 'hide' | 'unhide', reason: string): void;
+  onLoadMoreMessages(): void;
+  onMessageVisibilityFilterChange(filter: MessageVisibilityFilter): void;
   onTaskAction(task: BlockedTask, action: 'retry' | 'skip', reason: string): void;
   onFindingAction(
     finding: ReconciliationFinding,
