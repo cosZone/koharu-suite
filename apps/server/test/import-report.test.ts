@@ -33,7 +33,7 @@ describe('Telegram Desktop import report', () => {
       completedAt: '2026-07-24T00:01:00.000Z',
       fileSha256: 'a'.repeat(64),
       mode: 'dry-run',
-      parserVersion: 3,
+      parserVersion: 4,
       schemaVersion: 1,
       status: 'clean',
     });
