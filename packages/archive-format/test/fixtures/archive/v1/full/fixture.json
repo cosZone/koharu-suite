@@ -1,0 +1,137 @@
+{
+  "sections": { "media": true, "provenance": true },
+  "channels": [
+    {
+      "recordType": "channel",
+      "telegramChatId": "-1001338193436",
+      "title": "Full fixture channel",
+      "username": "full_fixture"
+    }
+  ],
+  "messages": [
+    {
+      "recordType": "message",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "publishedAt": "2026-08-03T00:00:00.000Z",
+      "currentRevisionNumber": 1,
+      "visibility": { "state": "public", "changedAt": null }
+    }
+  ],
+  "revisions": [
+    {
+      "recordType": "revision",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "revisionNumber": 1,
+      "contentKind": "caption",
+      "text": "two references",
+      "entities": [],
+      "authorSignature": null,
+      "mediaGroupId": "album-1",
+      "editedAt": null
+    }
+  ],
+  "revision-media": [
+    {
+      "recordType": "revision-media",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "revisionNumber": 1,
+      "position": 0,
+      "kind": "photo",
+      "availability": "available",
+      "mimeType": "image/jpeg",
+      "fileName": "first.jpg",
+      "fileSize": "18",
+      "width": 10,
+      "height": 10,
+      "duration": null,
+      "source": {
+        "kind": "telegram_bot_update",
+        "telegramFileId": "file-1",
+        "telegramFileUniqueId": "unique-1",
+        "mediaType": "photo",
+        "metadata": {}
+      },
+      "original": {
+        "sha256": "f9c233fc3e2f21acddfc25103f5877c75249b1242e27050809aeba8d8ca848b2",
+        "byteLength": "18",
+        "detectedMimeType": "image/jpeg",
+        "included": true
+      }
+    },
+    {
+      "recordType": "revision-media",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "revisionNumber": 1,
+      "position": 1,
+      "kind": "photo",
+      "availability": "available",
+      "mimeType": "image/jpeg",
+      "fileName": "second.jpg",
+      "fileSize": "18",
+      "width": 10,
+      "height": 10,
+      "duration": null,
+      "source": {
+        "kind": "telegram_bot_update",
+        "telegramFileId": "file-2",
+        "telegramFileUniqueId": "unique-2",
+        "mediaType": "photo",
+        "metadata": {}
+      },
+      "original": {
+        "sha256": "f9c233fc3e2f21acddfc25103f5877c75249b1242e27050809aeba8d8ca848b2",
+        "byteLength": "18",
+        "detectedMimeType": "image/jpeg",
+        "included": true
+      }
+    }
+  ],
+  "provenance-observations": [
+    {
+      "recordType": "provenance-observation",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "revisionNumber": 1,
+      "source": {
+        "kind": "telegram_desktop_json",
+        "sourceFileSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceChatId": "1338193436",
+        "sourceMessageId": "3902"
+      },
+      "observedAt": "2026-08-03T00:00:00.000Z",
+      "metadata": {},
+      "payload": { "type": "message" }
+    }
+  ],
+  "provenance-media": [
+    {
+      "recordType": "provenance-media",
+      "telegramChatId": "-1001338193436",
+      "telegramMessageId": "3902",
+      "revisionNumber": 1,
+      "source": {
+        "kind": "telegram_desktop_json",
+        "sourceFileSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceChatId": "1338193436",
+        "sourceMessageId": "3902"
+      },
+      "position": 0,
+      "kind": "photo",
+      "availability": "available",
+      "telegramFileId": null,
+      "telegramFileUniqueId": null,
+      "mediaType": "photo",
+      "metadata": {}
+    }
+  ],
+  "blobs": [
+    {
+      "sha256": "f9c233fc3e2f21acddfc25103f5877c75249b1242e27050809aeba8d8ca848b2",
+      "utf8": "shared-media-bytes"
+    }
+  ]
+}
