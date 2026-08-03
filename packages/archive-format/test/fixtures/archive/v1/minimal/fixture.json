@@ -1,0 +1,83 @@
+{
+  "sections": { "media": false, "provenance": false },
+  "channels": [
+    {
+      "recordType": "channel",
+      "telegramChatId": "-9007199254740994",
+      "title": "Fixture channel",
+      "username": "fixture_channel"
+    }
+  ],
+  "messages": [
+    {
+      "recordType": "message",
+      "telegramChatId": "-9007199254740994",
+      "telegramMessageId": "9007199254740993",
+      "publishedAt": "2026-08-03T00:00:00.000Z",
+      "currentRevisionNumber": 1,
+      "visibility": { "state": "public", "changedAt": null }
+    },
+    {
+      "recordType": "message",
+      "telegramChatId": "-9007199254740994",
+      "telegramMessageId": "9007199254740994",
+      "publishedAt": "2026-08-03T00:01:00.000Z",
+      "currentRevisionNumber": 1,
+      "visibility": { "state": "hidden", "changedAt": "2026-08-03T00:02:00.000Z" }
+    }
+  ],
+  "revisions": [
+    {
+      "recordType": "revision",
+      "telegramChatId": "-9007199254740994",
+      "telegramMessageId": "9007199254740993",
+      "revisionNumber": 1,
+      "contentKind": "text",
+      "text": "hello",
+      "entities": [{ "offset": 0, "length": 5, "type": "bold" }],
+      "authorSignature": null,
+      "mediaGroupId": null,
+      "editedAt": null
+    },
+    {
+      "recordType": "revision",
+      "telegramChatId": "-9007199254740994",
+      "telegramMessageId": "9007199254740994",
+      "revisionNumber": 1,
+      "contentKind": "none",
+      "text": null,
+      "entities": [],
+      "authorSignature": null,
+      "mediaGroupId": null,
+      "editedAt": null
+    }
+  ],
+  "revision-media": [
+    {
+      "recordType": "revision-media",
+      "telegramChatId": "-9007199254740994",
+      "telegramMessageId": "9007199254740994",
+      "revisionNumber": 1,
+      "position": 0,
+      "kind": "photo",
+      "availability": "not_included",
+      "mimeType": "image/jpeg",
+      "fileName": null,
+      "fileSize": "123",
+      "width": 10,
+      "height": 10,
+      "duration": null,
+      "source": {
+        "kind": "telegram_desktop_json",
+        "telegramFileId": null,
+        "telegramFileUniqueId": null,
+        "mediaType": "photo",
+        "metadata": {}
+      },
+      "original": null
+    }
+  ],
+  "provenance-observations": [],
+  "provenance-media": [],
+  "blobs": []
+}
