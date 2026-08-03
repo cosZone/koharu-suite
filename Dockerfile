@@ -17,6 +17,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/admin/package.json apps/admin/package.json
 COPY apps/server/package.json apps/server/package.json
 COPY apps/server/bin apps/server/bin
+COPY packages/archive-format/package.json packages/archive-format/package.json
 COPY packages/koharu-astro/package.json packages/koharu-astro/package.json
 COPY packages/ui/package.json packages/ui/package.json
 
@@ -25,9 +26,11 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
 COPY apps/admin apps/admin
 COPY apps/server apps/server
+COPY packages/archive-format packages/archive-format
 COPY packages/ui packages/ui
 
-RUN pnpm --filter @koharu-suite/ui build \
+RUN pnpm --filter @koharu-suite/archive-format build \
+  && pnpm --filter @koharu-suite/ui build \
   && pnpm --filter @koharu-suite/admin build \
   && pnpm --filter @koharu-suite/server build \
   && pnpm --filter @koharu-suite/server deploy --prod --legacy /opt/koharu-suite

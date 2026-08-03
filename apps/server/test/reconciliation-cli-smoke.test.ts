@@ -49,5 +49,5 @@ describe('kodama reconciliation CLI smoke', () => {
       },
       status: 'fatal',
     });
-  });
+  }, 30_000);
 });

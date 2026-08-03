@@ -6,6 +6,7 @@ import { pack as createTarPack } from 'tar-stream';
 import { describe, expect, it } from 'vitest';
 import {
   type ArchiveWriteEntry,
+  type ArchiveWriteSourceEntry,
   assertZstdRuntimeSupport,
   readTarZstd,
   type WriteTarZstdOptions,
@@ -489,7 +490,7 @@ function writeEntries(order: readonly [string, string][]): ArchiveWriteEntry[] {
 }
 
 async function write(
-  entries: readonly ArchiveWriteEntry[],
+  entries: readonly ArchiveWriteSourceEntry[],
   options: WriteTarZstdOptions = {},
 ): Promise<{ archive: Buffer; summary: unknown }> {
   const chunks: Buffer[] = [];
@@ -522,6 +523,27 @@ describe('deterministic tar.zst writer', () => {
       'checksums.sha256',
       'data/messages/000001.jsonl',
     ]);
+  });
+
+  it('opens lazy entry bodies only when their entry is consumed', async () => {
+    const opened: string[] = [];
+    const entries: ArchiveWriteSourceEntry[] = ['manifest.json', 'checksums.sha256'].map(
+      (path, index) => ({
+        body: () => {
+          opened.push(path);
+          expect(opened).toEqual(
+            index === 0 ? ['manifest.json'] : ['manifest.json', 'checksums.sha256'],
+          );
+          return Readable.from([Buffer.from('{}')]);
+        },
+        byteLength: 2,
+        path,
+      }),
+    );
+
+    expect(opened).toEqual([]);
+    await write(entries);
+    expect(opened).toEqual(['manifest.json', 'checksums.sha256']);
   });
 
   it('rejects duplicate paths and bodies that do not match their declared length', async () => {
@@ -559,6 +581,8 @@ describe('deterministic tar.zst writer', () => {
   });
 
   it('aborts a stalled body after the finite no-progress timeout', async () => {
+    const body = new Readable({ read() {} });
+    const opened: string[] = [];
     await expectRejectsCode(
       () =>
         write(
@@ -566,13 +590,26 @@ describe('deterministic tar.zst writer', () => {
             {
               path: 'manifest.json',
               byteLength: 1,
-              body: new Readable({ read() {} }),
+              body: () => {
+                opened.push('manifest.json');
+                return body;
+              },
+            },
+            {
+              path: 'checksums.sha256',
+              byteLength: 1,
+              body: () => {
+                opened.push('checksums.sha256');
+                return Readable.from([Buffer.from('1')]);
+              },
             },
           ],
           { limits: { noProgressTimeoutMs: 20 } },
         ),
       'NO_PROGRESS_TIMEOUT',
     );
+    expect(opened).toEqual(['manifest.json']);
+    expect(body.destroyed).toBe(true);
   });
 
   it('aborts and destroys a stalled output after the finite no-progress timeout', async () => {
