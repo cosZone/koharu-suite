@@ -11,10 +11,25 @@ import {
   archiveRecordSchema,
   type ChecksumEntry,
   canonicalJsonBytes,
+  DEFAULT_ARCHIVE_CONTAINER_LIMITS,
   DEFAULT_ARCHIVE_SHARD_BYTES,
   DEFAULT_ARCHIVE_SHARD_RECORDS,
   DEFAULT_ARCHIVE_VALIDATION_LIMITS,
 } from '@koharu-suite/archive-format';
+
+const TAR_BLOCK_BYTES = 512;
+const TAR_END_BYTES = TAR_BLOCK_BYTES * 2;
+const MAX_TAR_ENTRY_OVERHEAD_BYTES = TAR_BLOCK_BYTES * 2 - 1;
+const MAX_ARCHIVE_JSONL_BYTES = Math.min(
+  DEFAULT_ARCHIVE_CONTAINER_LIMITS.maxTotalEntryBytes -
+    DEFAULT_ARCHIVE_VALIDATION_LIMITS.maxManifestBytes -
+    DEFAULT_ARCHIVE_VALIDATION_LIMITS.maxChecksumBytes,
+  DEFAULT_ARCHIVE_CONTAINER_LIMITS.maxExpandedBytes -
+    DEFAULT_ARCHIVE_VALIDATION_LIMITS.maxManifestBytes -
+    DEFAULT_ARCHIVE_VALIDATION_LIMITS.maxChecksumBytes -
+    DEFAULT_ARCHIVE_CONTAINER_LIMITS.maxEntries * MAX_TAR_ENTRY_OVERHEAD_BYTES -
+    TAR_END_BYTES,
+);
 
 const FAMILY_ORDER: readonly ArchiveRecordFamily[] = [
   'channels',
@@ -58,6 +73,16 @@ function familyIndex(family: ArchiveRecordFamily): number {
   return FAMILY_ORDER.indexOf(family);
 }
 
+function spoolByteLimit(value: number | undefined): number {
+  const limit = value ?? MAX_ARCHIVE_JSONL_BYTES;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ARCHIVE_JSONL_BYTES) {
+    throw new RangeError(
+      `Archive spool byte limit must be between 1 and ${MAX_ARCHIVE_JSONL_BYTES}`,
+    );
+  }
+  return limit;
+}
+
 async function writeAll(file: FileHandle, bytes: Uint8Array): Promise<void> {
   let offset = 0;
   while (offset < bytes.byteLength) {
@@ -85,15 +110,18 @@ export class ArchiveSpool {
   readonly #files: ArchiveFileDescriptor[] = [];
   readonly #localEntries: Array<{ byteLength: number; localPath: string; path: string }> = [];
   readonly #knownMissingOriginals = new Map<string, bigint>();
+  readonly #maxJsonlBytes: number;
   readonly #signal: AbortSignal | undefined;
   #active: ActiveShard | null = null;
   #finished = false;
   #lastFamilyIndex = -1;
   #missingReferences = 0;
+  #totalJsonlBytes = 0;
   #totalRecords = 0;
 
-  constructor(input: { directory: string; signal?: AbortSignal }) {
+  constructor(input: { directory: string; maxJsonlBytes?: number; signal?: AbortSignal }) {
     this.#directory = input.directory;
+    this.#maxJsonlBytes = spoolByteLimit(input.maxJsonlBytes);
     this.#signal = input.signal;
   }
 
@@ -111,12 +139,16 @@ export class ArchiveSpool {
     if (this.#totalRecords >= DEFAULT_ARCHIVE_VALIDATION_LIMITS.maxTotalRecords) {
       throw new Error('archive_record_limit_exceeded');
     }
+    const lineByteLength = encoded.byteLength + 1;
+    if (this.#totalJsonlBytes > this.#maxJsonlBytes - lineByteLength) {
+      throw new Error('archive_spool_byte_limit_exceeded');
+    }
 
     if (
       this.#active !== null &&
       (this.#active.family !== family ||
         this.#active.recordCount >= DEFAULT_ARCHIVE_SHARD_RECORDS ||
-        this.#active.byteLength + encoded.byteLength + 1 > DEFAULT_ARCHIVE_SHARD_BYTES)
+        this.#active.byteLength + lineByteLength > DEFAULT_ARCHIVE_SHARD_BYTES)
     ) {
       await this.#closeActive();
     }
@@ -130,6 +162,7 @@ export class ArchiveSpool {
     this.#active.byteLength += line.byteLength;
     this.#active.recordCount += 1;
     this.#lastFamilyIndex = index;
+    this.#totalJsonlBytes += line.byteLength;
     this.#totalRecords += 1;
     this.#count(record);
   }

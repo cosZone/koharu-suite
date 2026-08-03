@@ -40,7 +40,7 @@ export interface ReadTarZstdOptions {
 export interface ArchiveWriteEntry {
   path: string;
   byteLength: number;
-  body: Readable;
+  body: Readable | (() => Readable);
 }
 
 export interface WriteTarZstdOptions {
@@ -567,8 +567,9 @@ export async function writeTarZstd(
         uname: '',
         gname: '',
       });
+      const body = typeof entry.body === 'function' ? entry.body() : entry.body;
       await pipeline(
-        entry.body,
+        body,
         new ExactByteLengthTransform(entry.byteLength),
         tarEntry as unknown as Writable,
         {

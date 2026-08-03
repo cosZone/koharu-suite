@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { canonicalJsonBytes } from '@koharu-suite/archive-format';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ArchiveSpool } from '../src/archive/spool.js';
 
@@ -127,5 +128,32 @@ describe('ArchiveSpool', () => {
       }),
     ).rejects.toThrow('archive_family_order_invalid');
     await spool.closeAfterFailure();
+  });
+
+  it('rejects a line before writing when the cumulative JSONL budget would be exceeded', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'koharu-archive-spool-'));
+    roots.push(root);
+    const first = {
+      recordType: 'channel' as const,
+      telegramChatId: '-1001',
+      title: 'First channel',
+      username: null,
+    };
+    const second = {
+      recordType: 'channel' as const,
+      telegramChatId: '-1002',
+      title: 'Second channel',
+      username: null,
+    };
+    const firstLine = Buffer.concat([Buffer.from(canonicalJsonBytes(first)), Buffer.from('\n')]);
+    const spool = new ArchiveSpool({ directory: root, maxJsonlBytes: firstLine.byteLength });
+
+    await spool.write('channels', first);
+    await expect(spool.write('channels', second)).rejects.toThrow(
+      'archive_spool_byte_limit_exceeded',
+    );
+    await spool.closeAfterFailure();
+
+    await expect(readFile(join(root, 'data/channels/000000.jsonl'))).resolves.toEqual(firstLine);
   });
 });

@@ -108,6 +108,7 @@ export class ArchiveExportService {
       runId = await this.repository.createRun({
         includeProvenance: input.includeProvenance,
         selection: input.selection,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
       workspace = await prepareArchiveArtifact({
         outputPath: input.outputPath,
@@ -122,6 +123,9 @@ export class ArchiveExportService {
       const snapshot = await this.repository.readSnapshot(
         {
           includeProvenance: input.includeProvenance,
+          onSnapshotAt: (value) => {
+            snapshotAt = value;
+          },
           selection: input.selection,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         },
@@ -168,7 +172,7 @@ export class ArchiveExportService {
           path: 'checksums.sha256',
         },
         ...prepared.localEntries.map((entry) => ({
-          body: createReadStream(entry.localPath),
+          body: () => createReadStream(entry.localPath),
           byteLength: entry.byteLength,
           path: entry.path,
         })),
@@ -178,7 +182,10 @@ export class ArchiveExportService {
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
       await lease.assertActive(input.signal);
-      const validation = await workspace.validateAndPublish();
+      const publishingLease = lease;
+      const validation = await workspace.validateAndPublish({
+        assertCanPublish: () => publishingLease.assertActive(input.signal),
+      });
       artifactPublished = true;
       if (
         validation.report.status !== 'clean' ||
@@ -207,6 +214,7 @@ export class ArchiveExportService {
         artifactByteLength: validation.artifactByteLength,
         artifactSha256: validation.artifactSha256,
         counts: prepared.counts,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
         snapshotAt: snapshot.snapshotAt,
       });
       return report;
@@ -215,7 +223,13 @@ export class ArchiveExportService {
       const code = safeFailureCode(error);
       const status = runStatus(error, input.signal);
       if (runId !== undefined) {
-        await this.repository.failRun(runId, { code, status }).catch(() => undefined);
+        await this.repository
+          .failRun(runId, {
+            code,
+            ...(snapshotAt === undefined ? {} : { snapshotAt }),
+            status,
+          })
+          .catch(() => undefined);
       }
       const report = createFatalArchiveExportReport({
         artifactPublished: publishedBy(error, artifactPublished),

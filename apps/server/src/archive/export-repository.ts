@@ -17,10 +17,10 @@ import {
   sha256HexSchema,
 } from '@koharu-suite/archive-format';
 import { and, asc, eq, gt, inArray, or, type SQL, sql } from 'drizzle-orm';
+import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import type { Database } from '../db/client.js';
+import * as databaseSchema from '../db/schema.js';
 import {
-  archiveExportRuns,
   mediaCacheBlobs,
   mediaCacheObjects,
   messageMedia,
@@ -32,12 +32,15 @@ import {
 const ARCHIVE_EXPORT_ADVISORY_LOCK = 6_309_648_946_926_690;
 const DEFAULT_PAGE_SIZE = 1_000;
 const MAX_PAGE_SIZE = 10_000;
+const DEFAULT_DATABASE_WAIT_TIMEOUT_MS = 10_000;
 const SAFE_REPORT_SCHEMA_VERSION = 1;
 const SAFE_ERROR_CODE = /^[a-z][a-z0-9_.-]{0,127}$/u;
 
 type ArchiveSelection = ArchiveManifest['selection'];
 type ArchiveCounts = ArchiveManifest['counts'];
-type ArchiveTransaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+type ArchiveTransaction = Parameters<
+  Parameters<PostgresJsDatabase<typeof databaseSchema>['transaction']>[0]
+>[0];
 
 export type ArchiveExportRepositoryErrorCode =
   | 'archive_export_aborted'
@@ -45,6 +48,7 @@ export type ArchiveExportRepositoryErrorCode =
   | 'archive_export_invalid_database_state'
   | 'archive_export_invalid_page_size'
   | 'archive_export_lock_lost'
+  | 'archive_export_timed_out'
   | 'archive_export_unknown_channel';
 
 export class ArchiveExportRepositoryError extends Error {
@@ -59,6 +63,7 @@ export class ArchiveExportRepositoryError extends Error {
 
 export interface ArchiveExportSnapshotOptions {
   includeProvenance: boolean;
+  onSnapshotAt?: (snapshotAt: string) => void;
   pageSize?: number;
   selection: ArchiveSelection;
   signal?: AbortSignal;
@@ -79,22 +84,25 @@ export type ArchiveExportRecordVisitor = (
 export interface CreateArchiveExportRunInput {
   includeProvenance: boolean;
   selection: ArchiveSelection;
+  signal?: AbortSignal;
 }
 
 export interface CompleteArchiveExportRunInput {
   artifactByteLength: string;
   artifactSha256: string;
   counts: ArchiveCounts;
+  signal?: AbortSignal;
   snapshotAt: string;
 }
 
 export interface FailArchiveExportRunInput {
   code: string;
+  signal?: AbortSignal;
+  snapshotAt?: string;
   status: 'failed' | 'interrupted';
 }
 
 interface SafeArchiveExportRunReport {
-  [key: string]: unknown;
   code: string | null;
   counts: ArchiveCounts | null;
   schemaVersion: 1;
@@ -110,6 +118,10 @@ interface SnapshotBoundaryRow {
 export interface ArchiveExportLease {
   assertActive: (signal?: AbortSignal) => Promise<void>;
   release: () => Promise<void>;
+}
+
+export interface ArchiveExportRepositoryOptions {
+  databaseWaitTimeoutMs?: number;
 }
 
 interface CanonicalSnapshotCounts {
@@ -211,8 +223,88 @@ function assertActive(signal?: AbortSignal): void {
   }
 }
 
+function databaseWaitTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_DATABASE_WAIT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeout) || timeout < 1) {
+    throw new TypeError('Archive export database wait timeout must be a positive integer');
+  }
+  return timeout;
+}
+
+async function boundedQuery<T>(
+  query: PromiseLike<T> & { cancel(): unknown },
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  assertActive(signal);
+  let timedOut = false;
+  let rejectWait: ((reason: unknown) => void) | undefined;
+  const waiting = new Promise<never>((_resolve, reject) => {
+    rejectWait = reject;
+  });
+  const cancel = (error: ArchiveExportRepositoryError) => {
+    void Promise.resolve(query.cancel()).catch(() => undefined);
+    rejectWait?.(error);
+  };
+  const abort = () => cancel(new ArchiveExportRepositoryError('archive_export_aborted'));
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    cancel(new ArchiveExportRepositoryError('archive_export_timed_out'));
+  }, timeoutMs);
+  try {
+    return await Promise.race([query, waiting]);
+  } catch (error) {
+    if (signal?.aborted) throw new ArchiveExportRepositoryError('archive_export_aborted');
+    if (timedOut) throw new ArchiveExportRepositoryError('archive_export_timed_out');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+async function boundedReservation(
+  client: postgres.Sql,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<postgres.ReservedSql> {
+  assertActive(signal);
+  const reservation = client.reserve();
+  let timedOut = false;
+  let rejectWait: ((reason: unknown) => void) | undefined;
+  const waiting = new Promise<never>((_resolve, reject) => {
+    rejectWait = reject;
+  });
+  const abort = () => rejectWait?.(new ArchiveExportRepositoryError('archive_export_aborted'));
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    rejectWait?.(new ArchiveExportRepositoryError('archive_export_timed_out'));
+  }, timeoutMs);
+  try {
+    return await Promise.race([reservation, waiting]);
+  } catch (error) {
+    void reservation.then(
+      (session) => session.release(),
+      () => undefined,
+    );
+    if (signal?.aborted) throw new ArchiveExportRepositoryError('archive_export_aborted');
+    if (timedOut) throw new ArchiveExportRepositoryError('archive_export_timed_out');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
 function failDatabaseState(): never {
   throw new ArchiveExportRepositoryError('archive_export_invalid_database_state');
+}
+
+function databaseErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  return typeof error.code === 'string' ? error.code : undefined;
 }
 
 function canonicalTimestamp(value: Date | string): string {
@@ -321,27 +413,38 @@ async function visit(
 
 export class PostgresArchiveExportRepository {
   private readonly cancelClient;
+  private readonly databaseWaitTimeoutMs: number;
   private readonly lockClient;
+  private readonly snapshotClient;
+  private readonly snapshotDatabase;
   private lockBackendPid: number | undefined;
   private lockSession: postgres.ReservedSql | undefined;
   private lockSessionLost = false;
 
   constructor(
-    databaseUrl: string,
-    private readonly database: Database,
+    private readonly databaseUrl: string,
+    options: ArchiveExportRepositoryOptions = {},
   ) {
+    this.databaseWaitTimeoutMs = databaseWaitTimeout(options.databaseWaitTimeoutMs);
     this.cancelClient = postgres(databaseUrl, {
       connect_timeout: 5,
       max: 1,
       max_lifetime: null,
     });
     this.lockClient = postgres(databaseUrl, {
+      connect_timeout: 5,
       max: 1,
       max_lifetime: null,
       onclose: () => {
         this.lockSessionLost = true;
       },
     });
+    this.snapshotClient = postgres(databaseUrl, {
+      connect_timeout: 5,
+      max: 1,
+      max_lifetime: null,
+    });
+    this.snapshotDatabase = drizzle(this.snapshotClient, { schema: databaseSchema });
   }
 
   async acquireExportLease(signal?: AbortSignal): Promise<ArchiveExportLease> {
@@ -351,31 +454,46 @@ export class PostgresArchiveExportRepository {
     }
 
     this.lockSessionLost = false;
-    const session = await this.lockClient.reserve();
-    let acquired = false;
+    const session = await boundedReservation(this.lockClient, this.databaseWaitTimeoutMs, signal);
     try {
       assertActive(signal);
-      const [result] = await session<{ acquired: boolean; backendPid: number }[]>`
-        select
-          pg_try_advisory_lock(${ARCHIVE_EXPORT_ADVISORY_LOCK}) as acquired,
-          pg_backend_pid() as "backendPid"
-      `;
+      const [result] = await boundedQuery(
+        session<{ acquired: boolean; backendPid: number }[]>`
+          select
+            pg_try_advisory_lock(${ARCHIVE_EXPORT_ADVISORY_LOCK}) as acquired,
+            pg_backend_pid() as "backendPid"
+        `,
+        this.databaseWaitTimeoutMs,
+        signal,
+      );
       if (!result?.acquired) {
         throw new ArchiveExportRepositoryError('archive_export_busy');
       }
-      acquired = true;
       assertActive(signal);
       this.lockBackendPid = result.backendPid;
       this.lockSession = session;
     } catch (error) {
-      if (acquired) {
-        try {
-          await session`select pg_advisory_unlock(${ARCHIVE_EXPORT_ADVISORY_LOCK})`;
-        } catch {
-          // Releasing or closing the reserved connection also releases the session lock.
-        }
+      if (
+        error instanceof ArchiveExportRepositoryError &&
+        (error.code === 'archive_export_aborted' || error.code === 'archive_export_timed_out')
+      ) {
+        await this.lockClient.end({ timeout: 1 }).catch(() => undefined);
+        throw error;
       }
-      session.release();
+      let safeToRelease = false;
+      try {
+        const [result] = await boundedQuery(
+          session<{ released: boolean }[]>`
+            select pg_advisory_unlock(${ARCHIVE_EXPORT_ADVISORY_LOCK}) as released
+          `,
+          this.databaseWaitTimeoutMs,
+        );
+        safeToRelease = result !== undefined;
+      } catch {
+        // The pool is closed below because the session may still hold the advisory lock.
+      }
+      if (safeToRelease) session.release();
+      else await this.lockClient.end({ timeout: 1 }).catch(() => undefined);
       throw error;
     }
 
@@ -397,23 +515,35 @@ export class PostgresArchiveExportRepository {
       await Promise.all([
         this.cancelClient.end({ timeout: 1 }),
         this.lockClient.end({ timeout: 1 }),
+        this.snapshotClient.end({ timeout: 1 }),
       ]);
     }
   }
 
   async createRun(input: CreateArchiveExportRunInput): Promise<string> {
     const selection = normalizeSelection(input.selection);
-    const [run] = await this.database
-      .insert(archiveExportRuns)
-      .values({
-        formatVersion: ARCHIVE_FORMAT_VERSION,
-        includeProvenance: input.includeProvenance,
-        report: safeRunReport('running'),
-        schemaVersion: ARCHIVE_SCHEMA_VERSION,
+    const report = safeRunReport('running');
+    const [run] = await this.withDatabaseSession(
+      input.signal,
+      (session) => session<{ id: string }[]>`
+      insert into archive_export_runs (
         selection,
-        status: 'running',
-      })
-      .returning({ id: archiveExportRuns.id });
+        include_provenance,
+        format_version,
+        schema_version,
+        status,
+        report
+      ) values (
+        ${session.json(selection)},
+        ${input.includeProvenance},
+        ${ARCHIVE_FORMAT_VERSION},
+        ${ARCHIVE_SCHEMA_VERSION},
+        'running',
+        ${session.json(report as unknown as postgres.JSONValue)}
+      )
+      returning id
+    `,
+    );
     if (!run) failDatabaseState();
     return run.id;
   }
@@ -425,34 +555,83 @@ export class PostgresArchiveExportRepository {
       throw new TypeError('Completed archive artifact cannot be empty');
     const snapshotAt = new Date(canonicalUtcTimestampSchema.parse(input.snapshotAt));
     const counts = archiveManifestCountsSchema.parse(input.counts);
-    const [updated] = await this.database
-      .update(archiveExportRuns)
-      .set({
-        artifactByteLength: BigInt(artifactByteLength),
-        artifactSha256,
-        completedAt: sql`clock_timestamp()`,
-        report: safeRunReport('clean', { counts }),
-        snapshotAt,
-        status: 'completed',
-        updatedAt: sql`clock_timestamp()`,
-      })
-      .where(and(eq(archiveExportRuns.id, id), eq(archiveExportRuns.status, 'running')))
-      .returning({ id: archiveExportRuns.id });
+    const report = safeRunReport('clean', { counts });
+    const [updated] = await this.withDatabaseSession(
+      input.signal,
+      (session) => session<
+        {
+          id: string;
+        }[]
+      >`
+      update archive_export_runs
+      set
+        artifact_byte_length = ${artifactByteLength}::bigint,
+        artifact_sha256 = ${artifactSha256},
+        completed_at = clock_timestamp(),
+        report = ${session.json(report as unknown as postgres.JSONValue)},
+        snapshot_at = ${snapshotAt},
+        status = 'completed',
+        updated_at = clock_timestamp()
+      where id = ${id} and status = 'running'
+      returning id
+    `,
+    );
     if (!updated) failDatabaseState();
   }
 
   async failRun(id: string, input: FailArchiveExportRunInput): Promise<void> {
-    const [updated] = await this.database
-      .update(archiveExportRuns)
-      .set({
-        completedAt: sql`clock_timestamp()`,
-        report: safeRunReport(input.status, { code: input.code }),
-        status: input.status,
-        updatedAt: sql`clock_timestamp()`,
-      })
-      .where(and(eq(archiveExportRuns.id, id), eq(archiveExportRuns.status, 'running')))
-      .returning({ id: archiveExportRuns.id });
+    const snapshotAt =
+      input.snapshotAt === undefined
+        ? undefined
+        : new Date(canonicalUtcTimestampSchema.parse(input.snapshotAt));
+    const report = safeRunReport(input.status, { code: input.code });
+    const [updated] = await this.withDatabaseSession(input.signal, (session) =>
+      snapshotAt === undefined
+        ? session<{ id: string }[]>`
+            update archive_export_runs
+            set
+              completed_at = clock_timestamp(),
+              report = ${session.json(report as unknown as postgres.JSONValue)},
+              status = ${input.status},
+              updated_at = clock_timestamp()
+            where id = ${id} and status = 'running'
+            returning id
+          `
+        : session<{ id: string }[]>`
+            update archive_export_runs
+            set
+              completed_at = clock_timestamp(),
+              report = ${session.json(report as unknown as postgres.JSONValue)},
+              snapshot_at = ${snapshotAt},
+              status = ${input.status},
+              updated_at = clock_timestamp()
+            where id = ${id} and status = 'running'
+            returning id
+          `,
+    );
     if (!updated) failDatabaseState();
+  }
+
+  private async withDatabaseSession<T>(
+    signal: AbortSignal | undefined,
+    query: (session: postgres.ReservedSql) => PromiseLike<T> & { cancel(): void },
+  ): Promise<T> {
+    const client = postgres(this.databaseUrl, {
+      connect_timeout: 5,
+      max: 1,
+      max_lifetime: null,
+    });
+    let safeToRelease = false;
+    let session: postgres.ReservedSql | undefined;
+    try {
+      session = await boundedReservation(client, this.databaseWaitTimeoutMs, signal);
+      const result = await boundedQuery(query(session), this.databaseWaitTimeoutMs, signal);
+      safeToRelease = true;
+      return result;
+    } finally {
+      if (safeToRelease) session?.release();
+      await client.end({ timeout: 1 }).catch(() => undefined);
+    }
   }
 
   async readSnapshot(
@@ -463,116 +642,150 @@ export class PostgresArchiveExportRepository {
     const pageSize = parsePageSize(options.pageSize);
     assertActive(options.signal);
 
+    let backendPid: number | undefined;
+    let cancelPromise: Promise<void> | undefined;
+    let initialTimedOut = false;
+    const cancelSnapshot = () => {
+      cancelPromise ??=
+        backendPid === undefined
+          ? this.snapshotClient.end({ timeout: 1 })
+          : this.cancelSnapshotBackend(backendPid).catch(() =>
+              this.snapshotClient.end({ timeout: 1 }),
+            );
+    };
+    options.signal?.addEventListener('abort', cancelSnapshot, { once: true });
+    if (options.signal?.aborted) cancelSnapshot();
+    const initialTimer = setTimeout(() => {
+      if (backendPid !== undefined) return;
+      initialTimedOut = true;
+      cancelSnapshot();
+    }, this.databaseWaitTimeoutMs);
+
     try {
-      return await this.database.transaction(
-        async (transaction) => {
-          const [boundary] = await transaction.execute<SnapshotBoundaryRow>(sql`
+      return await this.snapshotDatabase.transaction(
+        async (transactionClient) => {
+          if (initialTimedOut) {
+            throw new ArchiveExportRepositoryError('archive_export_timed_out');
+          }
+          assertActive(options.signal);
+          await transactionClient.execute(
+            sql.raw(`set local lock_timeout = '${this.databaseWaitTimeoutMs}ms'`),
+          );
+          if (initialTimedOut) {
+            throw new ArchiveExportRepositoryError('archive_export_timed_out');
+          }
+          assertActive(options.signal);
+          const [boundary] = await transactionClient.execute<SnapshotBoundaryRow>(sql`
           select
             pg_backend_pid() as "backendPid",
             statement_timestamp() as "snapshotAt",
             pg_current_snapshot()::text as "snapshotId"
-        `);
+          `);
           if (!boundary) failDatabaseState();
-          let cancelPromise: Promise<void> | undefined;
-          const cancelSnapshot = () => {
-            cancelPromise ??= this.cancelSnapshotBackend(boundary.backendPid);
-          };
-          options.signal?.addEventListener('abort', cancelSnapshot, { once: true });
+          backendPid = boundary.backendPid;
+          clearTimeout(initialTimer);
           if (options.signal?.aborted) cancelSnapshot();
-          try {
-            const snapshotAt = canonicalTimestamp(boundary.snapshotAt);
-            assertActive(options.signal);
-
-            const selectedChannelIds = await this.resolveSelectedChannelIds(transaction, selection);
-            const expected = await this.readCanonicalCounts(transaction, selectedChannelIds);
-            const counts: ArchiveCounts = {
-              blobs: 0,
-              channels: 0,
-              hiddenMessages: 0,
-              messages: 0,
-              provenanceMedia: 0,
-              provenanceObservations: 0,
-              revisionMedia: 0,
-              revisions: 0,
-              visibleMessages: 0,
-            };
-
-            await this.visitChannels(
-              transaction,
-              selectedChannelIds,
-              pageSize,
-              visitor,
-              counts,
-              options.signal,
-            );
-            await this.visitMessages(
-              transaction,
-              selectedChannelIds,
-              pageSize,
-              visitor,
-              counts,
-              options.signal,
-            );
-            await this.visitRevisions(
-              transaction,
-              selectedChannelIds,
-              pageSize,
-              visitor,
-              counts,
-              options.signal,
-            );
-            await this.visitRevisionMedia(
-              transaction,
-              selectedChannelIds,
-              pageSize,
-              visitor,
-              counts,
-              options.signal,
-            );
-            if (options.includeProvenance) {
-              await this.visitProvenanceObservations(
-                transaction,
-                selectedChannelIds,
-                pageSize,
-                visitor,
-                counts,
-                options.signal,
-              );
-              await this.visitProvenanceMedia(
-                transaction,
-                selectedChannelIds,
-                pageSize,
-                visitor,
-                counts,
-                options.signal,
-              );
-            }
-
-            if (
-              counts.channels !== expected.channels ||
-              counts.messages !== expected.messages ||
-              counts.visibleMessages !== expected.visibleMessages ||
-              counts.hiddenMessages !== expected.hiddenMessages ||
-              counts.revisions !== expected.revisions ||
-              counts.revisionMedia !== expected.revisionMedia
-            ) {
-              failDatabaseState();
-            }
-            archiveManifestCountsSchema.parse(counts);
-            const [finished] = await transaction.execute<{ createdAt: Date }>(
-              sql`select clock_timestamp() as "createdAt"`,
-            );
-            if (!finished) failDatabaseState();
-            return {
-              counts,
-              createdAt: canonicalTimestamp(finished.createdAt),
-              selection,
-              snapshotAt,
-            };
-          } finally {
-            options.signal?.removeEventListener('abort', cancelSnapshot);
-            await cancelPromise?.catch(() => undefined);
+          const snapshotAt = canonicalTimestamp(boundary.snapshotAt);
+          options.onSnapshotAt?.(snapshotAt);
+          if (initialTimedOut) {
+            throw new ArchiveExportRepositoryError('archive_export_timed_out');
           }
+          assertActive(options.signal);
+
+          const selectedChannelIds = await this.resolveSelectedChannelIds(
+            transactionClient,
+            selection,
+          );
+          const expected = await this.readCanonicalCounts(
+            transactionClient,
+            selectedChannelIds,
+            options.signal,
+          );
+          const counts: ArchiveCounts = {
+            blobs: 0,
+            channels: 0,
+            hiddenMessages: 0,
+            messages: 0,
+            provenanceMedia: 0,
+            provenanceObservations: 0,
+            revisionMedia: 0,
+            revisions: 0,
+            visibleMessages: 0,
+          };
+
+          await this.visitChannels(
+            transactionClient,
+            selectedChannelIds,
+            pageSize,
+            visitor,
+            counts,
+            options.signal,
+          );
+          await this.visitMessages(
+            transactionClient,
+            selectedChannelIds,
+            pageSize,
+            visitor,
+            counts,
+            options.signal,
+          );
+          await this.visitRevisions(
+            transactionClient,
+            selectedChannelIds,
+            pageSize,
+            visitor,
+            counts,
+            options.signal,
+          );
+          await this.visitRevisionMedia(
+            transactionClient,
+            selectedChannelIds,
+            pageSize,
+            visitor,
+            counts,
+            options.signal,
+          );
+          if (options.includeProvenance) {
+            await this.visitProvenanceObservations(
+              transactionClient,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+            await this.visitProvenanceMedia(
+              transactionClient,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+          }
+
+          if (
+            counts.channels !== expected.channels ||
+            counts.messages !== expected.messages ||
+            counts.visibleMessages !== expected.visibleMessages ||
+            counts.hiddenMessages !== expected.hiddenMessages ||
+            counts.revisions !== expected.revisions ||
+            counts.revisionMedia !== expected.revisionMedia
+          ) {
+            failDatabaseState();
+          }
+          archiveManifestCountsSchema.parse(counts);
+          assertActive(options.signal);
+          const [finished] = await transactionClient.execute<{ createdAt: Date }>(
+            sql`select clock_timestamp() as "createdAt"`,
+          );
+          if (!finished) failDatabaseState();
+          return {
+            counts,
+            createdAt: canonicalTimestamp(finished.createdAt),
+            selection,
+            snapshotAt,
+          };
         },
         { accessMode: 'read only', isolationLevel: 'repeatable read' },
       );
@@ -580,12 +793,33 @@ export class PostgresArchiveExportRepository {
       if (options.signal?.aborted) {
         throw new ArchiveExportRepositoryError('archive_export_aborted');
       }
+      if (initialTimedOut) {
+        throw new ArchiveExportRepositoryError('archive_export_timed_out');
+      }
+      if (databaseErrorCode(error) === '55P03') {
+        throw new ArchiveExportRepositoryError('archive_export_timed_out');
+      }
       throw error;
+    } finally {
+      clearTimeout(initialTimer);
+      options.signal?.removeEventListener('abort', cancelSnapshot);
+      await cancelPromise?.catch(() => undefined);
     }
   }
 
   private async cancelSnapshotBackend(backendPid: number): Promise<void> {
-    await this.cancelClient`select pg_cancel_backend(${backendPid})`;
+    try {
+      await boundedQuery(
+        this.cancelClient`select pg_cancel_backend(${backendPid})`,
+        this.databaseWaitTimeoutMs,
+      );
+    } catch (error) {
+      await Promise.all([
+        this.cancelClient.end({ timeout: 1 }).catch(() => undefined),
+        this.snapshotClient.end({ timeout: 1 }).catch(() => undefined),
+      ]);
+      throw error;
+    }
   }
 
   private async releaseExportLease(): Promise<void> {
@@ -593,23 +827,29 @@ export class PostgresArchiveExportRepository {
     const backendPid = this.lockBackendPid;
     if (!session) return;
 
+    let safeToRelease = false;
     try {
       if (backendPid === undefined || this.lockSessionLost) {
         throw new ArchiveExportRepositoryError('archive_export_lock_lost');
       }
-      const [result] = await session<{ backendPid: number; released: boolean }[]>`
-        select
-          pg_backend_pid() as "backendPid",
-          pg_advisory_unlock(${ARCHIVE_EXPORT_ADVISORY_LOCK}) as released
-      `;
+      const [result] = await boundedQuery(
+        session<{ backendPid: number; released: boolean }[]>`
+          select
+            pg_backend_pid() as "backendPid",
+            pg_advisory_unlock(${ARCHIVE_EXPORT_ADVISORY_LOCK}) as released
+        `,
+        this.databaseWaitTimeoutMs,
+      );
       if (result?.backendPid !== backendPid || !result.released) {
         throw new ArchiveExportRepositoryError('archive_export_lock_lost');
       }
+      safeToRelease = true;
     } finally {
       this.lockBackendPid = undefined;
       this.lockSessionLost = true;
-      session.release();
       this.lockSession = undefined;
+      if (safeToRelease) session.release();
+      else await this.lockClient.end({ timeout: 1 }).catch(() => undefined);
     }
   }
 
@@ -623,11 +863,23 @@ export class PostgresArchiveExportRepository {
 
     let currentBackendPid: number | undefined;
     try {
-      const [result] = await session<{ backendPid: number }[]>`
-        select pg_backend_pid() as "backendPid"
-      `;
+      const [result] = await boundedQuery(
+        session<{ backendPid: number }[]>`
+          select pg_backend_pid() as "backendPid"
+        `,
+        this.databaseWaitTimeoutMs,
+        signal,
+      );
       currentBackendPid = result?.backendPid;
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof ArchiveExportRepositoryError &&
+        (error.code === 'archive_export_aborted' || error.code === 'archive_export_timed_out')
+      ) {
+        this.lockSessionLost = true;
+        await this.lockClient.end({ timeout: 1 }).catch(() => undefined);
+        throw error;
+      }
       this.lockSessionLost = true;
       throw new ArchiveExportRepositoryError('archive_export_lock_lost');
     }
@@ -660,13 +912,16 @@ export class PostgresArchiveExportRepository {
   private async readCanonicalCounts(
     transaction: ArchiveTransaction,
     selectedChannelIds: readonly string[] | null,
+    signal?: AbortSignal,
   ): Promise<CanonicalSnapshotCounts> {
     const channelWhere = channelScope(telegramChannels.id, selectedChannelIds);
     const messageWhere = channelScope(messages.channelId, selectedChannelIds);
+    assertActive(signal);
     const [channelCount] = await transaction
       .select({ count: sql<string>`count(*)::text` })
       .from(telegramChannels)
       .where(channelWhere);
+    assertActive(signal);
     const [messageCount] = await transaction
       .select({
         count: sql<string>`count(*)::text`,
@@ -675,11 +930,13 @@ export class PostgresArchiveExportRepository {
       })
       .from(messages)
       .where(messageWhere);
+    assertActive(signal);
     const [revisionCount] = await transaction
       .select({ count: sql<string>`count(*)::text` })
       .from(messageRevisions)
       .innerJoin(messages, eq(messages.id, messageRevisions.messageId))
       .where(messageWhere);
+    assertActive(signal);
     const [mediaCount] = await transaction
       .select({ count: sql<string>`count(*)::text` })
       .from(messageMedia)
@@ -1018,6 +1275,7 @@ export class PostgresArchiveExportRepository {
     counts: ArchiveCounts,
     signal?: AbortSignal,
   ): Promise<void> {
+    assertActive(signal);
     await transaction.execute(sql`
       declare archive_provenance_observations no scroll cursor for
       ${this.provenanceBase(selectedChannelIds)}
@@ -1054,7 +1312,11 @@ export class PostgresArchiveExportRepository {
         if (rows.length < pageSize) return;
       }
     } finally {
-      await transaction.execute(sql`close archive_provenance_observations`).catch(() => undefined);
+      if (!signal?.aborted) {
+        await transaction
+          .execute(sql`close archive_provenance_observations`)
+          .catch(() => undefined);
+      }
     }
   }
 
@@ -1066,6 +1328,7 @@ export class PostgresArchiveExportRepository {
     counts: ArchiveCounts,
     signal?: AbortSignal,
   ): Promise<void> {
+    assertActive(signal);
     await transaction.execute(sql`
       declare archive_provenance_media no scroll cursor for
       ${this.provenanceBase(selectedChannelIds)}
@@ -1110,7 +1373,9 @@ export class PostgresArchiveExportRepository {
         if (rows.length < pageSize) return;
       }
     } finally {
-      await transaction.execute(sql`close archive_provenance_media`).catch(() => undefined);
+      if (!signal?.aborted) {
+        await transaction.execute(sql`close archive_provenance_media`).catch(() => undefined);
+      }
     }
   }
 

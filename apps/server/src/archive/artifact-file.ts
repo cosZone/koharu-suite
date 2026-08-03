@@ -43,7 +43,9 @@ export interface ArchiveArtifactWorkspace {
   /** Creates the only writable stream for this workspace. */
   createArchiveWriteStream(): Writable;
   /** Durably closes, validates, and atomically publishes the staged archive. */
-  validateAndPublish(): Promise<ArchiveValidationResult>;
+  validateAndPublish(options?: {
+    assertCanPublish?: () => Promise<void>;
+  }): Promise<ArchiveValidationResult>;
   /** Idempotently removes only this workspace's random staging resources. */
   cleanup(): Promise<void>;
 }
@@ -59,6 +61,12 @@ interface TrustedOutputParent {
 interface OpenedArchive {
   file: FileHandle;
   initial: Readonly<Stats>;
+}
+
+class ArchivePublicationGuardError extends Error {
+  constructor(readonly original: unknown) {
+    super('Archive publication guard rejected publication');
+  }
 }
 
 export interface ArchiveArtifactOperations {
@@ -233,7 +241,9 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
     return this.#stream;
   }
 
-  async validateAndPublish(): Promise<ArchiveValidationResult> {
+  async validateAndPublish(
+    options: { assertCanPublish?: () => Promise<void> } = {},
+  ): Promise<ArchiveValidationResult> {
     if (this.#cleaned || this.#file === undefined || this.#directory === undefined) {
       throw new ArchiveArtifactError('artifact_not_written');
     }
@@ -255,6 +265,9 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
       await this.#assertTrustedParent();
       await publishStaging({
         assertParent: () => this.#assertTrustedParent(),
+        ...(options.assertCanPublish === undefined
+          ? {}
+          : { assertCanPublish: options.assertCanPublish }),
         finalPath: this.#finalPath,
         overwrite: this.#overwrite,
         stagingPath: this.stagingPath,
@@ -292,6 +305,7 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
       }
       return validation;
     } catch (error) {
+      if (error instanceof ArchivePublicationGuardError) throw error.original;
       if (error instanceof ArchiveArtifactError) throw error;
       if (error instanceof ArchiveValidationError) {
         throw new ArchiveArtifactError('artifact_validation_failed', {
@@ -430,6 +444,7 @@ function sameOpenedFile(initial: Readonly<Stats>, final: Readonly<Stats>): boole
 }
 
 async function publishStaging(input: {
+  assertCanPublish?: () => Promise<void>;
   assertParent: () => Promise<void>;
   finalPath: string;
   overwrite: boolean;
@@ -439,6 +454,7 @@ async function publishStaging(input: {
   try {
     await input.assertParent();
     if (!input.overwrite) {
+      await assertPublicationAllowed(input.assertCanPublish);
       await link(input.stagingPath, input.finalPath);
       artifactPublished = true;
       await unlink(input.stagingPath);
@@ -455,9 +471,11 @@ async function publishStaging(input: {
       if (!isNodeError(error, 'ENOENT')) throw error;
     }
     await input.assertParent();
+    await assertPublicationAllowed(input.assertCanPublish);
     await rename(input.stagingPath, input.finalPath);
     artifactPublished = true;
   } catch (error) {
+    if (error instanceof ArchivePublicationGuardError) throw error;
     if (error instanceof ArchiveArtifactError) throw error;
     if (isNodeError(error, 'EEXIST')) {
       throw new ArchiveArtifactError('output_exists', { cause: error });
@@ -466,6 +484,15 @@ async function publishStaging(input: {
       artifactPublished,
       cause: error,
     });
+  }
+}
+
+async function assertPublicationAllowed(assertCanPublish?: () => Promise<void>): Promise<void> {
+  if (assertCanPublish === undefined) return;
+  try {
+    await assertCanPublish();
+  } catch (error) {
+    throw new ArchivePublicationGuardError(error);
   }
 }
 

@@ -127,7 +127,7 @@ describe('ArchiveExportService', () => {
     expect((await stat(outputPath)).mode & 0o777).toBe(0o600);
     expect((await inspectArchiveArtifact({ inputPath: outputPath })).status).toBe('clean');
     expect(repo.completeRun).toHaveBeenCalledOnce();
-    expect(repo.assertActive).toHaveBeenCalledTimes(4);
+    expect(repo.assertActive).toHaveBeenCalledTimes(5);
     expect(repo.failRun).not.toHaveBeenCalled();
     expect(repo.release).toHaveBeenCalledOnce();
   });
@@ -198,7 +198,33 @@ describe('ArchiveExportService', () => {
     expect(repo.release).not.toHaveBeenCalled();
   });
 
-  it('fails instead of completing when the export lease is lost before run completion', async () => {
+  it('records an acquired snapshot boundary when snapshot streaming fails', async () => {
+    const root = await privateRoot();
+    const repo = repository();
+    repo.readSnapshot = async (options) => {
+      options.onSnapshotAt?.('2026-08-03T00:00:00.000Z');
+      throw new Error('snapshot streaming failed');
+    };
+
+    const error = await new ArchiveExportService(repo)
+      .run({
+        includeProvenance: false,
+        outputPath: join(root, 'archive.tar.zst'),
+        overwrite: false,
+        selection: { mode: 'all' },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ArchiveExportError);
+    expect(repo.failRun).toHaveBeenCalledWith('00000000-0000-4000-8000-000000000001', {
+      code: 'archive_export_failed',
+      snapshotAt: '2026-08-03T00:00:00.000Z',
+      status: 'failed',
+    });
+    expect(repo.release).toHaveBeenCalledOnce();
+  });
+
+  it('refuses to publish when the export lease is lost during validation', async () => {
     const root = await privateRoot();
     const outputPath = join(root, 'archive.tar.zst');
     const repo = repository();
@@ -219,9 +245,14 @@ describe('ArchiveExportService', () => {
 
     expect(error).toBeInstanceOf(ArchiveExportError);
     expect((error as ArchiveExportError).code).toBe('archive_export_lock_lost');
-    expect((error as ArchiveExportError).report.artifactPublished).toBe(true);
+    expect((error as ArchiveExportError).report.artifactPublished).toBe(false);
+    await expect(stat(outputPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(repo.completeRun).not.toHaveBeenCalled();
-    expect(repo.failRun).toHaveBeenCalledOnce();
+    expect(repo.failRun).toHaveBeenCalledWith('00000000-0000-4000-8000-000000000001', {
+      code: 'archive_export_lock_lost',
+      snapshotAt: '2026-08-03T00:00:00.000Z',
+      status: 'failed',
+    });
     expect(repo.release).toHaveBeenCalledOnce();
   });
 
@@ -245,7 +276,7 @@ describe('ArchiveExportService', () => {
     expect(error).toBeInstanceOf(ArchiveExportError);
     expect((error as ArchiveExportError).code).toBe('archive_export_lock_lost');
     expect((error as ArchiveExportError).report.artifactPublished).toBe(true);
-    expect(repo.assertActive).toHaveBeenCalledTimes(4);
+    expect(repo.assertActive).toHaveBeenCalledTimes(5);
     expect(repo.completeRun).not.toHaveBeenCalled();
     expect(repo.failRun).toHaveBeenCalledOnce();
     expect(repo.release).toHaveBeenCalledTimes(2);

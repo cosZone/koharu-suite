@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { PostgresArchiveExportRepository } from '../../src/archive/export-repository.js';
 import { createDatabaseConnection, type DatabaseConnection } from '../../src/db/client.js';
@@ -56,6 +56,27 @@ async function waitForBlockedArchiveSnapshot(
     await delay(25);
   }
   throw new Error('Archive snapshot query did not reach a blocked PostgreSQL state');
+}
+
+async function waitForBlockedQuery(
+  databaseConnection: DatabaseConnection,
+  queryPattern: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const rows = await databaseConnection.db.execute<{ [key: string]: unknown; pid: number }>(sql`
+      select pid
+      from pg_stat_activity
+      where datname = current_database()
+        and pid <> pg_backend_pid()
+        and state = 'active'
+        and wait_event_type = 'Lock'
+        and query like ${queryPattern}
+        and query not ilike 'lock table%'
+    `);
+    if (rows.length > 0) return;
+    await delay(25);
+  }
+  throw new Error(`Query ${queryPattern} did not reach a blocked PostgreSQL state`);
 }
 
 async function insertCanonicalFixture(
@@ -283,10 +304,110 @@ describe('PostgreSQL archive export repository', () => {
     );
   });
 
+  it('persists the acquired snapshot boundary when an export run fails', async () => {
+    if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
+    const snapshotAt = '2026-08-03T00:00:00.000Z';
+
+    try {
+      const runId = await repository.createRun({
+        includeProvenance: false,
+        selection: { mode: 'all' },
+      });
+      await repository.failRun(runId, {
+        code: 'archive_export_failed',
+        snapshotAt,
+        status: 'failed',
+      });
+
+      const [run] = await connection.db
+        .select({ snapshotAt: archiveExportRuns.snapshotAt, status: archiveExportRuns.status })
+        .from(archiveExportRuns)
+        .where(eq(archiveExportRuns.id, runId));
+      expect(run).toMatchObject({ snapshotAt: new Date(snapshotAt), status: 'failed' });
+    } finally {
+      await repository.close();
+    }
+  });
+
+  it.each(['create', 'complete', 'fail'] as const)(
+    'cancels a blocked %s run lifecycle query',
+    async (operation) => {
+      if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+      const blocker = createDatabaseConnection(databaseUrl);
+      const repository = new PostgresArchiveExportRepository(databaseUrl);
+      const controller = new AbortController();
+      const runId =
+        operation === 'create'
+          ? undefined
+          : await repository.createRun({
+              includeProvenance: false,
+              selection: { mode: 'all' },
+            });
+      let releaseBlocker: (() => void) | undefined;
+      let markLocked: (() => void) | undefined;
+      const locked = new Promise<void>((resolve) => {
+        markLocked = resolve;
+      });
+      const blockerReleased = new Promise<void>((resolve) => {
+        releaseBlocker = resolve;
+      });
+      const blockingTransaction = blocker.db.transaction(async (transaction) => {
+        await transaction.execute(sql`lock table ${archiveExportRuns} in access exclusive mode`);
+        markLocked?.();
+        await blockerReleased;
+      });
+
+      try {
+        await locked;
+        const writing =
+          operation === 'create'
+            ? repository.createRun({
+                includeProvenance: false,
+                selection: { mode: 'all' },
+                signal: controller.signal,
+              })
+            : operation === 'complete'
+              ? repository.completeRun(runId as string, {
+                  artifactByteLength: '42',
+                  artifactSha256: 'a'.repeat(64),
+                  counts: {
+                    blobs: 0,
+                    channels: 0,
+                    hiddenMessages: 0,
+                    messages: 0,
+                    provenanceMedia: 0,
+                    provenanceObservations: 0,
+                    revisionMedia: 0,
+                    revisions: 0,
+                    visibleMessages: 0,
+                  },
+                  signal: controller.signal,
+                  snapshotAt: '2026-08-03T00:00:00.000Z',
+                })
+              : repository.failRun(runId as string, {
+                  code: 'archive_export_failed',
+                  signal: controller.signal,
+                  status: 'failed',
+                });
+        await waitForBlockedQuery(blocker, '%archive_export_runs%');
+        controller.abort();
+
+        await expect(writing).rejects.toMatchObject({ code: 'archive_export_aborted' });
+      } finally {
+        releaseBlocker?.();
+        await blockingTransaction;
+        await repository.close();
+        await blocker.close();
+      }
+    },
+    30_000,
+  );
+
   it('streams deterministic canonical records with hidden state and original media identity', async () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
     await insertCanonicalFixture(connection);
-    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
     const visited: Array<{ family: string; record: Record<string, unknown> }> = [];
 
     try {
@@ -342,7 +463,7 @@ describe('PostgreSQL archive export repository', () => {
   it('rejects an unknown selected channel before visiting any records', async () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
     await insertCanonicalFixture(connection);
-    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
     let visits = 0;
 
     try {
@@ -392,7 +513,7 @@ describe('PostgreSQL archive export repository', () => {
       resolutionAtRun: 'matched',
       runId: replayRun.id,
     });
-    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
     const records: Record<string, unknown>[] = [];
 
     try {
@@ -466,7 +587,7 @@ describe('PostgreSQL archive export repository', () => {
       if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
       const fixture = await insertCanonicalFixture(connection);
       await insertDesktopProvenance(connection, fixture, { mapping });
-      const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+      const repository = new PostgresArchiveExportRepository(databaseUrl);
 
       try {
         await expect(
@@ -488,7 +609,7 @@ describe('PostgreSQL archive export repository', () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
     const fixture = await insertCanonicalFixture(connection);
     const writer = createDatabaseConnection(databaseUrl);
-    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
     let resumeVisitor: (() => void) | undefined;
     let markVisitorReached: (() => void) | undefined;
     const visitorReached = new Promise<void>((resolve) => {
@@ -542,7 +663,7 @@ describe('PostgreSQL archive export repository', () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
     await insertCanonicalFixture(connection);
     const blocker = createDatabaseConnection(databaseUrl);
-    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
     const controller = new AbortController();
     let releaseBlocker: (() => void) | undefined;
     let markLocked: (() => void) | undefined;
@@ -580,10 +701,77 @@ describe('PostgreSQL archive export repository', () => {
     }
   }, 30_000);
 
+  it('bounds PostgreSQL lock waits after acquiring the snapshot boundary', async () => {
+    if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+    await insertCanonicalFixture(connection);
+    const blocker = createDatabaseConnection(databaseUrl);
+    const repository = new PostgresArchiveExportRepository(databaseUrl, {
+      databaseWaitTimeoutMs: 2_000,
+    });
+    let releaseBlocker: (() => void) | undefined;
+    let markLocked: (() => void) | undefined;
+    let snapshotAt: string | undefined;
+    const locked = new Promise<void>((resolve) => {
+      markLocked = resolve;
+    });
+    const blockerReleased = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const blockingTransaction = blocker.db.transaction(async (transaction) => {
+      await transaction.execute(sql`lock table ${telegramChannels} in access exclusive mode`);
+      markLocked?.();
+      await blockerReleased;
+    });
+
+    try {
+      await locked;
+      await expect(
+        repository.readSnapshot(
+          {
+            includeProvenance: false,
+            onSnapshotAt: (value) => {
+              snapshotAt = value;
+            },
+            selection: { mode: 'all' },
+          },
+          () => undefined,
+        ),
+      ).rejects.toMatchObject({ code: 'archive_export_timed_out' });
+      expect(snapshotAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    } finally {
+      releaseBlocker?.();
+      await blockingTransaction;
+      await repository.close();
+      await blocker.close();
+    }
+  }, 30_000);
+
+  it('cancels before the initial snapshot boundary is acquired', async () => {
+    if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+    const repository = new PostgresArchiveExportRepository(databaseUrl);
+    const controller = new AbortController();
+
+    try {
+      const reading = repository.readSnapshot(
+        {
+          includeProvenance: false,
+          selection: { mode: 'all' },
+          signal: controller.signal,
+        },
+        () => undefined,
+      );
+      controller.abort();
+
+      await expect(reading).rejects.toMatchObject({ code: 'archive_export_aborted' });
+    } finally {
+      await repository.close();
+    }
+  });
+
   it('holds one session lease until release and permits the next exporter afterwards', async () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
-    const first = new PostgresArchiveExportRepository(databaseUrl, connection.db);
-    const second = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const first = new PostgresArchiveExportRepository(databaseUrl);
+    const second = new PostgresArchiveExportRepository(databaseUrl);
 
     try {
       const firstLease = await first.acquireExportLease();
@@ -599,10 +787,41 @@ describe('PostgreSQL archive export repository', () => {
     }
   });
 
+  it('bounds concurrent lease session reservation', async () => {
+    if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+    const repository = new PostgresArchiveExportRepository(databaseUrl, {
+      databaseWaitTimeoutMs: 1_000,
+    });
+
+    try {
+      const attempts = await Promise.allSettled([
+        repository.acquireExportLease(),
+        repository.acquireExportLease(),
+      ]);
+      const acquired = attempts.filter(
+        (
+          attempt,
+        ): attempt is PromiseFulfilledResult<
+          Awaited<ReturnType<typeof repository.acquireExportLease>>
+        > => attempt.status === 'fulfilled',
+      );
+      const rejected = attempts.filter(
+        (attempt): attempt is PromiseRejectedResult => attempt.status === 'rejected',
+      );
+
+      expect(acquired).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]?.reason).toMatchObject({ code: 'archive_export_timed_out' });
+      await acquired[0]?.value.release();
+    } finally {
+      await repository.close();
+    }
+  });
+
   it('fails the first exporter closed after its lock session dies while a second takes the lease', async () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
-    const first = new PostgresArchiveExportRepository(databaseUrl, connection.db);
-    const second = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const first = new PostgresArchiveExportRepository(databaseUrl);
+    const second = new PostgresArchiveExportRepository(databaseUrl);
     const firstLease = await first.acquireExportLease();
 
     try {

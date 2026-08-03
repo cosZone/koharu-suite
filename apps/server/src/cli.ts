@@ -405,15 +405,11 @@ async function main(): Promise<void> {
         {
           exportArchive: async (input) => {
             const databaseUrl = resolveDatabaseUrl(options['database-url']);
-            const connection = createDatabaseConnection(databaseUrl);
-            const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+            const repository = new PostgresArchiveExportRepository(databaseUrl);
             try {
               return await new ArchiveExportService(repository).run(input);
             } finally {
-              await closeImportResources(
-                () => repository.close(),
-                () => connection.close(),
-              );
+              await repository.close();
             }
           },
           inspectArchive: (input) => inspectArchiveArtifact(input),
