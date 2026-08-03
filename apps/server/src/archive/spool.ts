@@ -214,7 +214,6 @@ export class ArchiveSpool {
   async #closeActive(): Promise<void> {
     const shard = this.#active;
     if (shard === null) return;
-    this.#active = null;
     await shard.file.sync();
     await shard.file.close();
     const sha256 = shard.hash.digest('hex');
@@ -235,6 +234,7 @@ export class ArchiveSpool {
       localPath: shard.localPath,
       path: shard.path,
     });
+    this.#active = null;
   }
 
   async #openShard(family: ArchiveRecordFamily): Promise<ActiveShard> {

@@ -2,7 +2,7 @@
 
 import { parseArgs } from 'node:util';
 import { PostgresAdminOperations } from './admin/operations.js';
-import { runArchiveCli } from './archive/cli.js';
+import { renderArchiveCliParseFailure, runArchiveCli } from './archive/cli.js';
 import { PostgresArchiveExportRepository } from './archive/export-repository.js';
 import { ArchiveExportService } from './archive/export-service.js';
 import { inspectArchiveArtifact } from './archive/inspect-service.js';
@@ -197,6 +197,8 @@ function printHelp(): void {
 
 function parseCli(): {
   command: string | undefined;
+  extraPositionals: string[];
+  optionNames: string[];
   options: CliOptions;
   subcommand: string | undefined;
 } {
@@ -238,9 +240,44 @@ function parseCli(): {
 
   return {
     command: positionals[0],
+    extraPositionals: positionals.slice(2),
+    optionNames: Object.keys(values),
     options: values,
     subcommand: positionals[1],
   };
+}
+
+function archiveJsonInvocation(): { json: true; subcommand: string | undefined } | null {
+  const args = normalizeCliArguments(process.argv.slice(2));
+  const archiveIndex = args.indexOf('archive');
+  if (archiveIndex < 0 || !args.includes('--json')) return null;
+  return { json: true, subcommand: args[archiveIndex + 1] };
+}
+
+async function writeStandardOutput(output: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      process.stdout.off('error', onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error: Error) => finish(error);
+    process.stdout.once('error', onError);
+    try {
+      process.stdout.write(output, (error) => {
+        if (error) {
+          setImmediate(() => finish(error));
+          return;
+        }
+        finish();
+      });
+    } catch (error) {
+      finish(error as Error);
+    }
+  });
 }
 
 function serviceTokenScopes(permissions: ServiceTokenPermissions): string {
@@ -267,7 +304,19 @@ function sensitiveEnvironmentValues(): string[] {
 }
 
 async function main(): Promise<void> {
-  const { command, options, subcommand } = parseCli();
+  let parsed: ReturnType<typeof parseCli>;
+  try {
+    parsed = parseCli();
+  } catch (error) {
+    const archiveJson = archiveJsonInvocation();
+    if (archiveJson !== null) {
+      await writeStandardOutput(renderArchiveCliParseFailure(archiveJson));
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+  const { command, extraPositionals, optionNames, options, subcommand } = parsed;
 
   if (options.version) {
     process.stdout.write(`${VERSION}\n`);
@@ -343,9 +392,11 @@ async function main(): Promise<void> {
       process.exitCode = await runArchiveCli(
         {
           ...(options.channel === undefined ? {} : { channels: options.channel }),
+          ...(extraPositionals.length === 0 ? {} : { extraPositionals }),
           includeProvenance: options['include-provenance'] === true,
           ...(options.input === undefined ? {} : { inputPath: options.input }),
           json: options.json === true,
+          optionNames,
           ...(options.output === undefined ? {} : { outputPath: options.output }),
           overwrite: options.overwrite === true,
           signal: cancellation.signal,
@@ -366,7 +417,7 @@ async function main(): Promise<void> {
             }
           },
           inspectArchive: (input) => inspectArchiveArtifact(input),
-          write: (output) => process.stdout.write(output),
+          write: writeStandardOutput,
         },
       );
     } finally {

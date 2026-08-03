@@ -17,9 +17,11 @@ export type ArchiveCliExitCode = 0 | 1 | 2;
 
 export interface ArchiveCliInput {
   channels?: readonly string[];
+  extraPositionals?: readonly string[];
   includeProvenance: boolean;
   inputPath?: string;
   json: boolean;
+  optionNames?: readonly string[];
   outputPath?: string;
   overwrite: boolean;
   signal?: AbortSignal;
@@ -42,7 +44,7 @@ export interface ArchiveInspectCliInput {
 export interface ArchiveCliDependencies {
   exportArchive?: (input: ArchiveExportCliInput) => Promise<ArchiveExportReport>;
   inspectArchive?: (input: ArchiveInspectCliInput) => Promise<ArchiveReport>;
-  write: (output: string) => void;
+  write: (output: string) => Promise<void> | void;
 }
 
 interface ArchiveCliFailureReport {
@@ -61,6 +63,40 @@ type ArchiveCliResult =
   | { kind: 'failure'; report: ArchiveCliFailureReport };
 
 class ArchiveCliUsageError extends Error {}
+
+const EXPORT_OPTIONS = new Set([
+  'channel',
+  'database-url',
+  'include-provenance',
+  'json',
+  'output',
+  'overwrite',
+]);
+const INSPECT_OPTIONS = new Set(['input', 'json']);
+
+function operationForSubcommand(
+  subcommand: string | undefined,
+): ArchiveCliFailureReport['operation'] {
+  return subcommand === 'export' || subcommand === 'inspect' ? subcommand : 'archive';
+}
+
+function rejectUnexpectedInput(
+  input: ArchiveCliInput,
+  operation: 'export' | 'inspect',
+  allowedOptions: ReadonlySet<string>,
+): void {
+  if ((input.extraPositionals?.length ?? 0) > 0) {
+    throw new ArchiveCliUsageError(
+      `archive ${operation} does not accept extra positional arguments`,
+    );
+  }
+  const unexpected = (input.optionNames ?? [])
+    .filter((name) => !allowedOptions.has(name))
+    .sort()[0];
+  if (unexpected !== undefined) {
+    throw new ArchiveCliUsageError(`archive ${operation} does not accept --${unexpected}`);
+  }
+}
 
 function requiredPath(value: string | undefined, message: string): string {
   if (value === undefined || value.length === 0) throw new ArchiveCliUsageError(message);
@@ -87,6 +123,7 @@ function exportSelection(channels: readonly string[] | undefined): ArchiveManife
 }
 
 function validateExportInput(input: ArchiveCliInput): ArchiveExportCliInput {
+  rejectUnexpectedInput(input, 'export', EXPORT_OPTIONS);
   if (input.inputPath !== undefined) {
     throw new ArchiveCliUsageError('archive export does not accept --input');
   }
@@ -101,6 +138,7 @@ function validateExportInput(input: ArchiveCliInput): ArchiveExportCliInput {
 }
 
 function validateInspectInput(input: ArchiveCliInput): ArchiveInspectCliInput {
+  rejectUnexpectedInput(input, 'inspect', INSPECT_OPTIONS);
   if (input.outputPath !== undefined) {
     throw new ArchiveCliUsageError('archive inspect does not accept --output');
   }
@@ -170,8 +208,7 @@ export async function runArchiveCli(
   input: ArchiveCliInput,
   dependencies: ArchiveCliDependencies,
 ): Promise<ArchiveCliExitCode> {
-  const operation =
-    input.subcommand === 'export' || input.subcommand === 'inspect' ? input.subcommand : 'archive';
+  const operation = operationForSubcommand(input.subcommand);
   let result: ArchiveCliResult;
   try {
     if (input.subcommand === 'export') {
@@ -204,6 +241,21 @@ export async function runArchiveCli(
     result = failureResult(operation, 'archive_command_failed', `Archive ${operation} failed`);
     output = serializeResult(result, input.json);
   }
-  dependencies.write(output);
+  await dependencies.write(output);
   return resultExitCode(result);
+}
+
+export function renderArchiveCliParseFailure(input: {
+  json: boolean;
+  subcommand: string | undefined;
+}): string {
+  const operation = operationForSubcommand(input.subcommand);
+  return serializeResult(
+    failureResult(
+      operation,
+      'invalid_arguments',
+      `Archive ${operation} received invalid arguments`,
+    ),
+    input.json,
+  );
 }

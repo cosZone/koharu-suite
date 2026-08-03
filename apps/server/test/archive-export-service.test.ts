@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ArchiveManifest, ArchiveRecord } from '@koharu-suite/archive-format';
@@ -32,15 +32,19 @@ function counts(): ArchiveManifest['counts'] {
 }
 
 function repository(): ArchiveExportRepositoryPort & {
+  acquireExportLease: ReturnType<typeof vi.fn>;
   assertActive: ReturnType<typeof vi.fn>;
   completeRun: ReturnType<typeof vi.fn>;
+  createRun: ReturnType<typeof vi.fn>;
   failRun: ReturnType<typeof vi.fn>;
   release: ReturnType<typeof vi.fn>;
 } {
   const release = vi.fn(async () => undefined);
   const assertActive = vi.fn(async () => undefined);
   const completeRun = vi.fn(async () => undefined);
+  const createRun = vi.fn(async () => '00000000-0000-4000-8000-000000000001');
   const failRun = vi.fn(async () => undefined);
+  const acquireExportLease = vi.fn(async () => ({ assertActive, release }));
   const records: Array<[ArchiveManifest['files'][number]['family'], ArchiveRecord]> = [
     [
       'channels',
@@ -79,10 +83,10 @@ function repository(): ArchiveExportRepositoryPort & {
     ],
   ];
   return {
-    acquireExportLease: async () => ({ assertActive, release }),
+    acquireExportLease,
     assertActive,
     completeRun,
-    createRun: async () => '00000000-0000-4000-8000-000000000001',
+    createRun,
     failRun,
     readSnapshot: async (_options, visitor) => {
       for (const [family, record] of records) await visitor(family, record);
@@ -148,6 +152,50 @@ describe('ArchiveExportService', () => {
     expect(await readFile(outputPath, 'utf8')).toBe('sentinel');
     expect(repo.failRun).toHaveBeenCalledOnce();
     expect(repo.release).toHaveBeenCalledOnce();
+  });
+
+  it('records output preflight failures after creating the export run', async () => {
+    const root = await privateRoot();
+    await chmod(root, 0o777);
+    const repo = repository();
+
+    const error = await new ArchiveExportService(repo)
+      .run({
+        includeProvenance: false,
+        outputPath: join(root, 'archive.tar.zst'),
+        overwrite: false,
+        selection: { mode: 'all' },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ArchiveExportError);
+    expect((error as ArchiveExportError).code).toBe('output_parent_untrusted');
+    expect(repo.createRun).toHaveBeenCalledOnce();
+    expect(repo.failRun).toHaveBeenCalledOnce();
+    expect(repo.acquireExportLease).not.toHaveBeenCalled();
+  });
+
+  it('records a busy lease as a failed export run', async () => {
+    const root = await privateRoot();
+    const repo = repository();
+    repo.acquireExportLease.mockRejectedValueOnce(
+      new ArchiveExportRepositoryError('archive_export_busy'),
+    );
+
+    const error = await new ArchiveExportService(repo)
+      .run({
+        includeProvenance: false,
+        outputPath: join(root, 'archive.tar.zst'),
+        overwrite: false,
+        selection: { mode: 'all' },
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ArchiveExportError);
+    expect((error as ArchiveExportError).code).toBe('archive_export_busy');
+    expect(repo.createRun).toHaveBeenCalledOnce();
+    expect(repo.failRun).toHaveBeenCalledOnce();
+    expect(repo.release).not.toHaveBeenCalled();
   });
 
   it('fails instead of completing when the export lease is lost before run completion', async () => {

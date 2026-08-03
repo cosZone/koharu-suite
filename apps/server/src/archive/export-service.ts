@@ -93,15 +93,8 @@ export class ArchiveExportService {
 
   async run(input: ExportArchiveArtifactInput): Promise<ArchiveExportReport> {
     const startedAt = new Date();
-    const workspace = await prepareArchiveArtifact({
-      outputPath: input.outputPath,
-      overwrite: input.overwrite,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
-    const spool = new ArchiveSpool({
-      directory: workspace.workDirectory,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
+    let workspace: Awaited<ReturnType<typeof prepareArchiveArtifact>> | undefined;
+    let spool: ArchiveSpool | undefined;
     let artifactPublished = false;
     let counts: ArchiveManifest['counts'] | undefined;
     let lease:
@@ -112,18 +105,27 @@ export class ArchiveExportService {
 
     try {
       input.signal?.throwIfAborted();
-      lease = await this.repository.acquireExportLease(input.signal);
       runId = await this.repository.createRun({
         includeProvenance: input.includeProvenance,
         selection: input.selection,
       });
+      workspace = await prepareArchiveArtifact({
+        outputPath: input.outputPath,
+        overwrite: input.overwrite,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      });
+      spool = new ArchiveSpool({
+        directory: workspace.workDirectory,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      });
+      lease = await this.repository.acquireExportLease(input.signal);
       const snapshot = await this.repository.readSnapshot(
         {
           includeProvenance: input.includeProvenance,
           selection: input.selection,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         },
-        (family, record) => spool.write(family, record),
+        (family, record) => spool?.write(family, record),
       );
       snapshotAt = snapshot.snapshotAt;
       await lease.assertActive(input.signal);
@@ -209,7 +211,7 @@ export class ArchiveExportService {
       });
       return report;
     } catch (error) {
-      await spool.closeAfterFailure();
+      await spool?.closeAfterFailure();
       const code = safeFailureCode(error);
       const status = runStatus(error, input.signal);
       if (runId !== undefined) {
@@ -227,7 +229,7 @@ export class ArchiveExportService {
       });
       throw new ArchiveExportError(code, report, { cause: error });
     } finally {
-      await workspace.cleanup();
+      await workspace?.cleanup();
       await lease?.release().catch(() => undefined);
     }
   }

@@ -50,7 +50,9 @@ export interface ArchiveArtifactWorkspace {
 
 interface TrustedOutputParent {
   directory: FileHandle;
+  effectiveUserId: number;
   finalPath: string;
+  identity: Pick<Stats, 'dev' | 'ino'>;
   parentPath: string;
 }
 
@@ -80,19 +82,25 @@ export async function prepareArchiveArtifact(
   let stagingFile: FileHandle | undefined;
 
   try {
+    await assertTrustedOutputParent(trusted);
     await mkdir(workDirectory, { mode: PRIVATE_DIRECTORY_MODE });
+    await assertTrustedOutputParent(trusted);
     await chmod(workDirectory, PRIVATE_DIRECTORY_MODE);
     stagingFile = await open(
       stagingPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       PRIVATE_FILE_MODE,
     );
+    await assertTrustedOutputParent(trusted);
     await chmod(stagingPath, PRIVATE_FILE_MODE);
     return new NodeArchiveArtifactWorkspace({
       directory: trusted.directory,
+      effectiveUserId: trusted.effectiveUserId,
       finalPath: trusted.finalPath,
+      identity: trusted.identity,
       operations,
       overwrite: input.overwrite ?? false,
+      parentPath: trusted.parentPath,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
       stagingFile,
       stagingPath,
@@ -100,8 +108,10 @@ export async function prepareArchiveArtifact(
     });
   } catch (error) {
     await stagingFile?.close().catch(() => undefined);
-    await unlink(stagingPath).catch(() => undefined);
-    await rm(workDirectory, { force: true, recursive: true }).catch(() => undefined);
+    if (await trustedParentStillActive(trusted)) {
+      await unlink(stagingPath).catch(() => undefined);
+      await rm(workDirectory, { force: true, recursive: true }).catch(() => undefined);
+    }
     await trusted.directory.close().catch(() => undefined);
     throw new ArchiveArtifactError(
       archiveArtifactReason(error, 'artifact_write_failed', input.signal),
@@ -165,29 +175,38 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
 
   #cleaned = false;
   #directory: FileHandle | undefined;
+  readonly #effectiveUserId: number;
   #file: FileHandle | undefined;
   readonly #finalPath: string;
+  readonly #identity: Pick<Stats, 'dev' | 'ino'>;
   readonly #operations: ArchiveArtifactOperations;
   readonly #overwrite: boolean;
+  readonly #parentPath: string;
   readonly #signal: AbortSignal | undefined;
   #stream: Writable | undefined;
   #streamError: unknown;
 
   constructor(input: {
     directory: FileHandle;
+    effectiveUserId: number;
     finalPath: string;
+    identity: Pick<Stats, 'dev' | 'ino'>;
     operations: ArchiveArtifactOperations;
     overwrite: boolean;
+    parentPath: string;
     signal?: AbortSignal;
     stagingFile: FileHandle;
     stagingPath: string;
     workDirectory: string;
   }) {
     this.#directory = input.directory;
+    this.#effectiveUserId = input.effectiveUserId;
     this.#file = input.stagingFile;
     this.#finalPath = input.finalPath;
+    this.#identity = input.identity;
     this.#operations = input.operations;
     this.#overwrite = input.overwrite;
+    this.#parentPath = input.parentPath;
     this.#signal = input.signal;
     this.stagingPath = input.stagingPath;
     this.workDirectory = input.workDirectory;
@@ -224,6 +243,7 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
 
     try {
       this.#signal?.throwIfAborted();
+      await this.#assertTrustedParent();
       await this.#file.sync();
       await this.#file.close();
       this.#file = undefined;
@@ -232,13 +252,16 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
         ...(this.#signal === undefined ? {} : { signal: this.#signal }),
       });
       this.#signal?.throwIfAborted();
+      await this.#assertTrustedParent();
       await publishStaging({
+        assertParent: () => this.#assertTrustedParent(),
         finalPath: this.#finalPath,
         overwrite: this.#overwrite,
         stagingPath: this.stagingPath,
       });
       let published: Stats;
       try {
+        await this.#assertTrustedParent();
         published = await lstat(this.#finalPath);
       } catch (error) {
         throw new ArchiveArtifactError('finalization_failed', {
@@ -289,10 +312,33 @@ class NodeArchiveArtifactWorkspace implements ArchiveArtifactWorkspace {
     this.#stream?.destroy();
     await this.#file?.close().catch(() => undefined);
     this.#file = undefined;
-    await unlink(this.stagingPath).catch(() => undefined);
-    await rm(this.workDirectory, { force: true, recursive: true }).catch(() => undefined);
+    if (await this.#parentStillActive()) {
+      await unlink(this.stagingPath).catch(() => undefined);
+      await rm(this.workDirectory, { force: true, recursive: true }).catch(() => undefined);
+    }
     await this.#directory?.close().catch(() => undefined);
     this.#directory = undefined;
+  }
+
+  async #assertTrustedParent(): Promise<void> {
+    const directory = this.#directory;
+    if (directory === undefined) throw new ArchiveArtifactError('output_parent_untrusted');
+    await assertTrustedOutputParent({
+      directory,
+      effectiveUserId: this.#effectiveUserId,
+      finalPath: this.#finalPath,
+      identity: this.#identity,
+      parentPath: this.#parentPath,
+    });
+  }
+
+  async #parentStillActive(): Promise<boolean> {
+    try {
+      await this.#assertTrustedParent();
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -328,10 +374,13 @@ async function openTrustedOutputParent(
     ) {
       throw new ArchiveArtifactError('output_parent_untrusted');
     }
+    await assertTrustedAncestorChain(parentPath, effectiveUserId);
     signal?.throwIfAborted();
     return {
       directory,
+      effectiveUserId,
       finalPath: join(parentPath, leaf),
+      identity: { dev: metadata.dev, ino: metadata.ino },
       parentPath,
     };
   } catch (error) {
@@ -381,12 +430,14 @@ function sameOpenedFile(initial: Readonly<Stats>, final: Readonly<Stats>): boole
 }
 
 async function publishStaging(input: {
+  assertParent: () => Promise<void>;
   finalPath: string;
   overwrite: boolean;
   stagingPath: string;
 }): Promise<void> {
   let artifactPublished = false;
   try {
+    await input.assertParent();
     if (!input.overwrite) {
       await link(input.stagingPath, input.finalPath);
       artifactPublished = true;
@@ -395,6 +446,7 @@ async function publishStaging(input: {
     }
 
     try {
+      await input.assertParent();
       const existing = await lstat(input.finalPath);
       if (!existing.isFile() || existing.isSymbolicLink()) {
         throw new ArchiveArtifactError('output_not_regular');
@@ -402,6 +454,7 @@ async function publishStaging(input: {
     } catch (error) {
       if (!isNodeError(error, 'ENOENT')) throw error;
     }
+    await input.assertParent();
     await rename(input.stagingPath, input.finalPath);
     artifactPublished = true;
   } catch (error) {
@@ -413,6 +466,59 @@ async function publishStaging(input: {
       artifactPublished,
       cause: error,
     });
+  }
+}
+
+async function assertTrustedAncestorChain(
+  parentPath: string,
+  effectiveUserId: number,
+): Promise<void> {
+  let current = parentPath;
+  while (true) {
+    const metadata = await lstat(current);
+    const sticky = (metadata.mode & 0o1000) !== 0;
+    const writableByOthers = (metadata.mode & UNSAFE_DIRECTORY_MODE_MASK) !== 0;
+    if (
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      (metadata.uid !== 0 && metadata.uid !== effectiveUserId) ||
+      (writableByOthers && !sticky)
+    ) {
+      throw new ArchiveArtifactError('output_parent_untrusted');
+    }
+    const next = dirname(current);
+    if (next === current) return;
+    current = next;
+  }
+}
+
+async function assertTrustedOutputParent(trusted: TrustedOutputParent): Promise<void> {
+  const [resolved, pathMetadata, handleMetadata] = await Promise.all([
+    realpath(trusted.parentPath),
+    lstat(trusted.parentPath),
+    trusted.directory.stat(),
+  ]);
+  if (
+    resolved !== trusted.parentPath ||
+    !pathMetadata.isDirectory() ||
+    pathMetadata.isSymbolicLink() ||
+    pathMetadata.dev !== trusted.identity.dev ||
+    pathMetadata.ino !== trusted.identity.ino ||
+    handleMetadata.dev !== trusted.identity.dev ||
+    handleMetadata.ino !== trusted.identity.ino ||
+    pathMetadata.uid !== trusted.effectiveUserId ||
+    (pathMetadata.mode & UNSAFE_DIRECTORY_MODE_MASK) !== 0
+  ) {
+    throw new ArchiveArtifactError('output_parent_untrusted');
+  }
+}
+
+async function trustedParentStillActive(trusted: TrustedOutputParent): Promise<boolean> {
+  try {
+    await assertTrustedOutputParent(trusted);
+    return true;
+  } catch {
+    return false;
   }
 }
 

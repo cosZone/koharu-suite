@@ -103,6 +103,7 @@ interface SafeArchiveExportRunReport {
 
 interface SnapshotBoundaryRow {
   [key: string]: unknown;
+  backendPid: number;
   snapshotAt: Date;
 }
 
@@ -130,15 +131,6 @@ interface RevisionCursor extends MessageCursor {
 }
 
 interface RevisionMediaCursor extends RevisionCursor {
-  position: number;
-}
-
-interface ProvenanceCursor {
-  observationId: string;
-  sortKey: string;
-}
-
-interface ProvenanceMediaCursor extends ProvenanceCursor {
   position: number;
 }
 
@@ -301,6 +293,14 @@ function rawChannelScope(ids: readonly string[] | null): SQL {
   )})`;
 }
 
+function rawObservationChannelScope(ids: readonly string[] | null): SQL {
+  if (ids === null) return sql.empty();
+  return sql`and mso.channel_id in (${sql.join(
+    ids.map((id) => sql`${id}`),
+    sql`, `,
+  )})`;
+}
+
 function countRow(value: unknown): number {
   if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/u.test(value)) failDatabaseState();
   const parsed = Number(value);
@@ -320,6 +320,7 @@ async function visit(
 }
 
 export class PostgresArchiveExportRepository {
+  private readonly cancelClient;
   private readonly lockClient;
   private lockBackendPid: number | undefined;
   private lockSession: postgres.ReservedSql | undefined;
@@ -329,6 +330,11 @@ export class PostgresArchiveExportRepository {
     databaseUrl: string,
     private readonly database: Database,
   ) {
+    this.cancelClient = postgres(databaseUrl, {
+      connect_timeout: 5,
+      max: 1,
+      max_lifetime: null,
+    });
     this.lockClient = postgres(databaseUrl, {
       max: 1,
       max_lifetime: null,
@@ -388,7 +394,10 @@ export class PostgresArchiveExportRepository {
     try {
       await this.releaseExportLease();
     } finally {
-      await this.lockClient.end({ timeout: 1 });
+      await Promise.all([
+        this.cancelClient.end({ timeout: 1 }),
+        this.lockClient.end({ timeout: 1 }),
+      ]);
     }
   }
 
@@ -454,106 +463,129 @@ export class PostgresArchiveExportRepository {
     const pageSize = parsePageSize(options.pageSize);
     assertActive(options.signal);
 
-    return this.database.transaction(
-      async (transaction) => {
-        const [boundary] = await transaction.execute<SnapshotBoundaryRow>(sql`
+    try {
+      return await this.database.transaction(
+        async (transaction) => {
+          const [boundary] = await transaction.execute<SnapshotBoundaryRow>(sql`
           select
+            pg_backend_pid() as "backendPid",
             statement_timestamp() as "snapshotAt",
             pg_current_snapshot()::text as "snapshotId"
         `);
-        if (!boundary) failDatabaseState();
-        const snapshotAt = canonicalTimestamp(boundary.snapshotAt);
-        assertActive(options.signal);
+          if (!boundary) failDatabaseState();
+          let cancelPromise: Promise<void> | undefined;
+          const cancelSnapshot = () => {
+            cancelPromise ??= this.cancelSnapshotBackend(boundary.backendPid);
+          };
+          options.signal?.addEventListener('abort', cancelSnapshot, { once: true });
+          if (options.signal?.aborted) cancelSnapshot();
+          try {
+            const snapshotAt = canonicalTimestamp(boundary.snapshotAt);
+            assertActive(options.signal);
 
-        const selectedChannelIds = await this.resolveSelectedChannelIds(transaction, selection);
-        const expected = await this.readCanonicalCounts(transaction, selectedChannelIds);
-        const counts: ArchiveCounts = {
-          blobs: 0,
-          channels: 0,
-          hiddenMessages: 0,
-          messages: 0,
-          provenanceMedia: 0,
-          provenanceObservations: 0,
-          revisionMedia: 0,
-          revisions: 0,
-          visibleMessages: 0,
-        };
+            const selectedChannelIds = await this.resolveSelectedChannelIds(transaction, selection);
+            const expected = await this.readCanonicalCounts(transaction, selectedChannelIds);
+            const counts: ArchiveCounts = {
+              blobs: 0,
+              channels: 0,
+              hiddenMessages: 0,
+              messages: 0,
+              provenanceMedia: 0,
+              provenanceObservations: 0,
+              revisionMedia: 0,
+              revisions: 0,
+              visibleMessages: 0,
+            };
 
-        await this.visitChannels(
-          transaction,
-          selectedChannelIds,
-          pageSize,
-          visitor,
-          counts,
-          options.signal,
-        );
-        await this.visitMessages(
-          transaction,
-          selectedChannelIds,
-          pageSize,
-          visitor,
-          counts,
-          options.signal,
-        );
-        await this.visitRevisions(
-          transaction,
-          selectedChannelIds,
-          pageSize,
-          visitor,
-          counts,
-          options.signal,
-        );
-        await this.visitRevisionMedia(
-          transaction,
-          selectedChannelIds,
-          pageSize,
-          visitor,
-          counts,
-          options.signal,
-        );
-        if (options.includeProvenance) {
-          await this.visitProvenanceObservations(
-            transaction,
-            selectedChannelIds,
-            pageSize,
-            visitor,
-            counts,
-            options.signal,
-          );
-          await this.visitProvenanceMedia(
-            transaction,
-            selectedChannelIds,
-            pageSize,
-            visitor,
-            counts,
-            options.signal,
-          );
-        }
+            await this.visitChannels(
+              transaction,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+            await this.visitMessages(
+              transaction,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+            await this.visitRevisions(
+              transaction,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+            await this.visitRevisionMedia(
+              transaction,
+              selectedChannelIds,
+              pageSize,
+              visitor,
+              counts,
+              options.signal,
+            );
+            if (options.includeProvenance) {
+              await this.visitProvenanceObservations(
+                transaction,
+                selectedChannelIds,
+                pageSize,
+                visitor,
+                counts,
+                options.signal,
+              );
+              await this.visitProvenanceMedia(
+                transaction,
+                selectedChannelIds,
+                pageSize,
+                visitor,
+                counts,
+                options.signal,
+              );
+            }
 
-        if (
-          counts.channels !== expected.channels ||
-          counts.messages !== expected.messages ||
-          counts.visibleMessages !== expected.visibleMessages ||
-          counts.hiddenMessages !== expected.hiddenMessages ||
-          counts.revisions !== expected.revisions ||
-          counts.revisionMedia !== expected.revisionMedia
-        ) {
-          failDatabaseState();
-        }
-        archiveManifestCountsSchema.parse(counts);
-        const [finished] = await transaction.execute<{ createdAt: Date }>(
-          sql`select clock_timestamp() as "createdAt"`,
-        );
-        if (!finished) failDatabaseState();
-        return {
-          counts,
-          createdAt: canonicalTimestamp(finished.createdAt),
-          selection,
-          snapshotAt,
-        };
-      },
-      { accessMode: 'read only', isolationLevel: 'repeatable read' },
-    );
+            if (
+              counts.channels !== expected.channels ||
+              counts.messages !== expected.messages ||
+              counts.visibleMessages !== expected.visibleMessages ||
+              counts.hiddenMessages !== expected.hiddenMessages ||
+              counts.revisions !== expected.revisions ||
+              counts.revisionMedia !== expected.revisionMedia
+            ) {
+              failDatabaseState();
+            }
+            archiveManifestCountsSchema.parse(counts);
+            const [finished] = await transaction.execute<{ createdAt: Date }>(
+              sql`select clock_timestamp() as "createdAt"`,
+            );
+            if (!finished) failDatabaseState();
+            return {
+              counts,
+              createdAt: canonicalTimestamp(finished.createdAt),
+              selection,
+              snapshotAt,
+            };
+          } finally {
+            options.signal?.removeEventListener('abort', cancelSnapshot);
+            await cancelPromise?.catch(() => undefined);
+          }
+        },
+        { accessMode: 'read only', isolationLevel: 'repeatable read' },
+      );
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw new ArchiveExportRepositoryError('archive_export_aborted');
+      }
+      throw error;
+    }
+  }
+
+  private async cancelSnapshotBackend(backendPid: number): Promise<void> {
+    await this.cancelClient`select pg_cancel_backend(${backendPid})`;
   }
 
   private async releaseExportLease(): Promise<void> {
@@ -986,47 +1018,43 @@ export class PostgresArchiveExportRepository {
     counts: ArchiveCounts,
     signal?: AbortSignal,
   ): Promise<void> {
-    let cursor: ProvenanceCursor | null = null;
-    while (true) {
-      assertActive(signal);
-      const currentCursor: ProvenanceCursor | null = cursor;
-      const rows: ProvenanceRow[] = await transaction.execute<ProvenanceRow>(sql`
-        ${this.provenanceBase(selectedChannelIds)}
-        select *
-        from portable_provenance
-        where ${
-          currentCursor === null
-            ? sql`true`
-            : sql`("sortKey" collate "C" > ${currentCursor.sortKey} collate "C"
-                or ("sortKey" = ${currentCursor.sortKey}
-                  and "observationId" > ${currentCursor.observationId}))`
+    await transaction.execute(sql`
+      declare archive_provenance_observations no scroll cursor for
+      ${this.provenanceBase(selectedChannelIds)}
+      select *
+      from portable_provenance
+      order by "sortKey" collate "C", "observationId"
+    `);
+    try {
+      while (true) {
+        assertActive(signal);
+        const rows = await transaction.execute<ProvenanceRow>(sql`
+          fetch forward ${sql.raw(pageSize.toString())} from archive_provenance_observations
+        `);
+        for (const row of rows) {
+          this.assertProvenanceRow(row);
+          const source = this.provenanceSource(row);
+          const payload =
+            row.payloadType === 'message' || row.payloadType === 'service'
+              ? { type: row.payloadType }
+              : {};
+          const record = archiveProvenanceObservationRecordSchema.parse({
+            metadata: {},
+            observedAt: row.observedAt === null ? null : canonicalTimestamp(row.observedAt),
+            payload,
+            recordType: 'provenance-observation',
+            revisionNumber: row.revisionNumber,
+            source,
+            telegramChatId: row.telegramChatId.toString(),
+            telegramMessageId: row.telegramMessageId.toString(),
+          });
+          await visit(visitor, 'provenance-observations', record, signal);
+          counts.provenanceObservations += 1;
         }
-        order by "sortKey" collate "C", "observationId"
-        limit ${pageSize}
-      `);
-      for (const row of rows) {
-        this.assertProvenanceRow(row);
-        const source = this.provenanceSource(row);
-        const payload =
-          row.payloadType === 'message' || row.payloadType === 'service'
-            ? { type: row.payloadType }
-            : {};
-        const record = archiveProvenanceObservationRecordSchema.parse({
-          metadata: {},
-          observedAt: row.observedAt === null ? null : canonicalTimestamp(row.observedAt),
-          payload,
-          recordType: 'provenance-observation',
-          revisionNumber: row.revisionNumber,
-          source,
-          telegramChatId: row.telegramChatId.toString(),
-          telegramMessageId: row.telegramMessageId.toString(),
-        });
-        await visit(visitor, 'provenance-observations', record, signal);
-        counts.provenanceObservations += 1;
+        if (rows.length < pageSize) return;
       }
-      if (rows.length < pageSize) return;
-      const last = rows.at(-1) ?? failDatabaseState();
-      cursor = { observationId: last.observationId, sortKey: last.sortKey };
+    } finally {
+      await transaction.execute(sql`close archive_provenance_observations`).catch(() => undefined);
     }
   }
 
@@ -1038,62 +1066,51 @@ export class PostgresArchiveExportRepository {
     counts: ArchiveCounts,
     signal?: AbortSignal,
   ): Promise<void> {
-    let cursor: ProvenanceMediaCursor | null = null;
-    while (true) {
-      assertActive(signal);
-      const currentCursor: ProvenanceMediaCursor | null = cursor;
-      const rows: ProvenanceMediaRow[] = await transaction.execute<ProvenanceMediaRow>(sql`
-        ${this.provenanceBase(selectedChannelIds)}
-        select
-          pp.*,
-          msmo.position,
-          msmo.media_kind as "mediaKind",
-          msmo.availability::text as "availability",
-          msmo.telegram_file_id as "telegramFileId",
-          msmo.telegram_file_unique_id as "telegramFileUniqueId"
-        from portable_provenance pp
-        inner join message_source_media_observations msmo
-          on msmo.observation_id = pp."observationId"
-          and msmo.source_kind = pp."sourceKind"
-        where ${
-          currentCursor === null
-            ? sql`true`
-            : sql`(pp."sortKey" collate "C" > ${currentCursor.sortKey} collate "C"
-                or (pp."sortKey" = ${currentCursor.sortKey}
-                  and msmo.position > ${currentCursor.position})
-                or (pp."sortKey" = ${currentCursor.sortKey}
-                  and msmo.position = ${currentCursor.position}
-                  and pp."observationId" > ${currentCursor.observationId}))`
+    await transaction.execute(sql`
+      declare archive_provenance_media no scroll cursor for
+      ${this.provenanceBase(selectedChannelIds)}
+      select
+        pp.*,
+        msmo.position,
+        msmo.media_kind as "mediaKind",
+        msmo.availability::text as "availability",
+        msmo.telegram_file_id as "telegramFileId",
+        msmo.telegram_file_unique_id as "telegramFileUniqueId"
+      from portable_provenance pp
+      inner join message_source_media_observations msmo
+        on msmo.observation_id = pp."observationId"
+        and msmo.source_kind = pp."sourceKind"
+      order by pp."sortKey" collate "C", msmo.position, pp."observationId"
+    `);
+    try {
+      while (true) {
+        assertActive(signal);
+        const rows = await transaction.execute<ProvenanceMediaRow>(sql`
+          fetch forward ${sql.raw(pageSize.toString())} from archive_provenance_media
+        `);
+        for (const row of rows) {
+          this.assertProvenanceRow(row);
+          const record = archiveProvenanceMediaRecordSchema.parse({
+            availability: availability(row.availability),
+            kind: row.mediaKind,
+            mediaType: null,
+            metadata: {},
+            position: row.position,
+            recordType: 'provenance-media',
+            revisionNumber: row.revisionNumber,
+            source: this.provenanceSource(row),
+            telegramChatId: row.telegramChatId.toString(),
+            telegramFileId: row.telegramFileId,
+            telegramFileUniqueId: row.telegramFileUniqueId,
+            telegramMessageId: row.telegramMessageId.toString(),
+          });
+          await visit(visitor, 'provenance-media', record, signal);
+          counts.provenanceMedia += 1;
         }
-        order by pp."sortKey" collate "C", msmo.position, pp."observationId"
-        limit ${pageSize}
-      `);
-      for (const row of rows) {
-        this.assertProvenanceRow(row);
-        const record = archiveProvenanceMediaRecordSchema.parse({
-          availability: availability(row.availability),
-          kind: row.mediaKind,
-          mediaType: null,
-          metadata: {},
-          position: row.position,
-          recordType: 'provenance-media',
-          revisionNumber: row.revisionNumber,
-          source: this.provenanceSource(row),
-          telegramChatId: row.telegramChatId.toString(),
-          telegramFileId: row.telegramFileId,
-          telegramFileUniqueId: row.telegramFileUniqueId,
-          telegramMessageId: row.telegramMessageId.toString(),
-        });
-        await visit(visitor, 'provenance-media', record, signal);
-        counts.provenanceMedia += 1;
+        if (rows.length < pageSize) return;
       }
-      if (rows.length < pageSize) return;
-      const last = rows.at(-1) ?? failDatabaseState();
-      cursor = {
-        observationId: last.observationId,
-        position: last.position,
-        sortKey: last.sortKey,
-      };
+    } finally {
+      await transaction.execute(sql`close archive_provenance_media`).catch(() => undefined);
     }
   }
 
@@ -1149,6 +1166,7 @@ export class PostgresArchiveExportRepository {
             where tc_inner.id = mso.channel_id
           )
         where mso.source_kind = 'telegram_desktop_json'
+          ${rawObservationChannelScope(selectedChannelIds)}
       ), desktop_links as (
         select
           observation_id,

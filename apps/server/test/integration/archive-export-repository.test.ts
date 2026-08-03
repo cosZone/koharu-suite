@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -35,6 +36,26 @@ interface CanonicalFixture {
 interface AdvisoryLockRow {
   [key: string]: unknown;
   pid: number;
+}
+
+async function waitForBlockedArchiveSnapshot(
+  databaseConnection: DatabaseConnection,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const rows = await databaseConnection.db.execute<{ [key: string]: unknown; pid: number }>(sql`
+      select pid
+      from pg_stat_activity
+      where datname = current_database()
+        and pid <> pg_backend_pid()
+        and state = 'active'
+        and wait_event_type = 'Lock'
+        and query like '%telegram_channels%'
+        and query not ilike 'lock table%'
+    `);
+    if (rows.length > 0) return;
+    await delay(25);
+  }
+  throw new Error('Archive snapshot query did not reach a blocked PostgreSQL state');
 }
 
 async function insertCanonicalFixture(
@@ -516,6 +537,48 @@ describe('PostgreSQL archive export repository', () => {
       await writer.close();
     }
   });
+
+  it('cancels the active PostgreSQL snapshot query when the export is aborted', async () => {
+    if (!connection || !databaseUrl) throw new Error('Database fixture was not created');
+    await insertCanonicalFixture(connection);
+    const blocker = createDatabaseConnection(databaseUrl);
+    const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+    const controller = new AbortController();
+    let releaseBlocker: (() => void) | undefined;
+    let markLocked: (() => void) | undefined;
+    const locked = new Promise<void>((resolve) => {
+      markLocked = resolve;
+    });
+    const blockerReleased = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const blockingTransaction = blocker.db.transaction(async (transaction) => {
+      await transaction.execute(sql`lock table ${telegramChannels} in access exclusive mode`);
+      markLocked?.();
+      await blockerReleased;
+    });
+
+    try {
+      await locked;
+      const reading = repository.readSnapshot(
+        {
+          includeProvenance: false,
+          selection: { mode: 'all' },
+          signal: controller.signal,
+        },
+        () => undefined,
+      );
+      await waitForBlockedArchiveSnapshot(blocker);
+      controller.abort();
+
+      await expect(reading).rejects.toMatchObject({ code: 'archive_export_aborted' });
+    } finally {
+      releaseBlocker?.();
+      await blockingTransaction;
+      await repository.close();
+      await blocker.close();
+    }
+  }, 30_000);
 
   it('holds one session lease until release and permits the next exporter afterwards', async () => {
     if (!connection || !databaseUrl) throw new Error('Database fixture was not created');

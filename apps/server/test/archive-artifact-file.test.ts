@@ -1,4 +1,15 @@
-import { chmod, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -239,6 +250,42 @@ describe('portable archive artifact filesystem boundary', () => {
     ).rejects.toMatchObject({
       code: 'output_parent_untrusted',
     });
+  });
+
+  it('rejects a private parent beneath a non-sticky writable ancestor', async () => {
+    const root = await privateRoot();
+    const privateChild = join(root, 'private-child');
+    await mkdir(privateChild, { mode: 0o700 });
+    await chmod(root, 0o777);
+
+    await expect(
+      prepareArchiveArtifact({ outputPath: join(privateChild, 'backup.tar.zst') }),
+    ).rejects.toMatchObject({ code: 'output_parent_untrusted' });
+  });
+
+  it('fails closed when the opened output parent is replaced before publication', async () => {
+    const root = await privateRoot();
+    const parent = join(root, 'trusted-parent');
+    const movedParent = join(root, 'moved-parent');
+    await mkdir(parent, { mode: 0o700 });
+    const outputPath = join(parent, 'backup.tar.zst');
+    const workspace = await prepareArchiveArtifact({ outputPath });
+
+    try {
+      await pipeline(Readable.from([await validArchive()]), workspace.createArchiveWriteStream());
+      await rename(parent, movedParent);
+      await mkdir(parent, { mode: 0o700 });
+      await writeFile(join(parent, 'sentinel'), 'replacement', { mode: 0o600 });
+
+      await expect(workspace.validateAndPublish()).rejects.toMatchObject({
+        code: 'output_parent_untrusted',
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+
+    expect(await readFile(join(parent, 'sentinel'), 'utf8')).toBe('replacement');
+    await expect(lstat(outputPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('reports durability as unknown without deleting an already published artifact', async () => {

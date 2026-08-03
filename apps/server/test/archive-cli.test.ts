@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type ArchiveCliDependencies,
   type ArchiveCliInput,
+  renderArchiveCliParseFailure,
   runArchiveCli,
 } from '../src/archive/cli.js';
 import {
@@ -54,7 +55,7 @@ function dependencies() {
     inspectArchive: vi.fn(async () =>
       finishArchiveReport(createArchiveReport({ mode: 'inspect' })),
     ),
-    write: vi.fn<(output: string) => void>(),
+    write: vi.fn<(output: string) => Promise<void> | void>(),
   } satisfies ArchiveCliDependencies;
 }
 
@@ -176,6 +177,23 @@ describe('archive CLI', () => {
       },
       'archive export does not accept duplicate --channel',
     ],
+    [
+      { ...BASE_INPUT, extraPositionals: ['ignored'], outputPath: '/output.tar.zst' },
+      'archive export does not accept extra positional arguments',
+    ],
+    [
+      { ...BASE_INPUT, optionNames: ['apply', 'output'], outputPath: '/output.tar.zst' },
+      'archive export does not accept --apply',
+    ],
+    [
+      {
+        ...BASE_INPUT,
+        inputPath: '/input.tar.zst',
+        optionNames: ['database-url', 'input'],
+        subcommand: 'inspect',
+      },
+      'archive inspect does not accept --database-url',
+    ],
   ] satisfies Array<[ArchiveCliInput, string]>)(
     'rejects an invalid parameter combination',
     async (input, message) => {
@@ -245,5 +263,29 @@ describe('archive CLI', () => {
 
     expect(exitCode).toBe(1);
     expect(JSON.parse(deps.write.mock.calls[0]?.[0] as string)).toEqual(report);
+  });
+
+  it('propagates a downstream output failure after the operation report is ready', async () => {
+    const deps = dependencies();
+    deps.write.mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+
+    await expect(
+      runArchiveCli({ ...BASE_INPUT, outputPath: '/safe/archive.tar.zst' }, deps),
+    ).rejects.toMatchObject({ code: 'EPIPE' });
+    expect(deps.exportArchive).toHaveBeenCalledOnce();
+  });
+
+  it('renders a versioned JSON report for top-level archive parse failures', () => {
+    expect(JSON.parse(renderArchiveCliParseFailure({ json: true, subcommand: 'inspect' }))).toEqual(
+      {
+        error: {
+          code: 'invalid_arguments',
+          message: 'Archive inspect received invalid arguments',
+        },
+        operation: 'inspect',
+        schemaVersion: 1,
+        status: 'fatal',
+      },
+    );
   });
 });
