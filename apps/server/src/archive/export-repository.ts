@@ -303,8 +303,14 @@ function failDatabaseState(): never {
 }
 
 function databaseErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
-  return typeof error.code === 'string' ? error.code : undefined;
+  let current = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (typeof current !== 'object' || current === null) return undefined;
+    if ('code' in current && typeof current.code === 'string') return current.code;
+    if (!('cause' in current)) return undefined;
+    current = current.cause;
+  }
+  return undefined;
 }
 
 function canonicalTimestamp(value: Date | string): string {
