@@ -84,6 +84,47 @@ describe('kodama archive CLI smoke', () => {
     });
   });
 
+  it('does not mistake an old-command option value for the archive command', () => {
+    const serverRoot = fileURLToPath(new URL('..', import.meta.url));
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'src/cli.ts',
+        'import',
+        'telegram-desktop',
+        '--input',
+        'archive',
+        '--json',
+        '--unknown-option',
+      ],
+      { cwd: serverRoot, encoding: 'utf8', env: process.env },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('kodama:');
+  });
+
+  it('finds the archive subcommand when a global option separates the positionals', () => {
+    const serverRoot = fileURLToPath(new URL('..', import.meta.url));
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', 'src/cli.ts', 'archive', '--json', 'inspect', '--unknown-option'],
+      { cwd: serverRoot, encoding: 'utf8', env: process.env },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('');
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      error: { code: 'invalid_arguments' },
+      operation: 'inspect',
+      schemaVersion: 1,
+      status: 'fatal',
+    });
+  });
+
   it('inspects without resolving DATABASE_URL or opening PostgreSQL', () => {
     const serverRoot = fileURLToPath(new URL('..', import.meta.url));
     const env = { ...process.env };

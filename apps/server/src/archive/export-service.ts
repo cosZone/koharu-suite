@@ -5,7 +5,7 @@ import {
   ARCHIVE_FORMAT_VERSION,
   ARCHIVE_SCHEMA_VERSION,
   type ArchiveManifest,
-  type ArchiveWriteEntry,
+  type ArchiveWriteSourceEntry,
   archiveManifestSchema,
   canonicalJsonBytes,
   renderChecksumFile,
@@ -160,7 +160,7 @@ export class ArchiveExportService {
         snapshotAt: snapshot.snapshotAt,
       });
       const manifestBody = Buffer.from(canonicalJsonBytes(manifest, { profile: 'manifest' }));
-      const entries: ArchiveWriteEntry[] = [
+      const entries: ArchiveWriteSourceEntry[] = [
         {
           body: Readable.from([manifestBody]),
           byteLength: manifestBody.byteLength,

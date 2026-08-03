@@ -6,6 +6,7 @@ import { pack as createTarPack } from 'tar-stream';
 import { describe, expect, it } from 'vitest';
 import {
   type ArchiveWriteEntry,
+  type ArchiveWriteSourceEntry,
   assertZstdRuntimeSupport,
   readTarZstd,
   type WriteTarZstdOptions,
@@ -489,7 +490,7 @@ function writeEntries(order: readonly [string, string][]): ArchiveWriteEntry[] {
 }
 
 async function write(
-  entries: readonly ArchiveWriteEntry[],
+  entries: readonly ArchiveWriteSourceEntry[],
   options: WriteTarZstdOptions = {},
 ): Promise<{ archive: Buffer; summary: unknown }> {
   const chunks: Buffer[] = [];
@@ -526,7 +527,7 @@ describe('deterministic tar.zst writer', () => {
 
   it('opens lazy entry bodies only when their entry is consumed', async () => {
     const opened: string[] = [];
-    const entries: ArchiveWriteEntry[] = ['manifest.json', 'checksums.sha256'].map(
+    const entries: ArchiveWriteSourceEntry[] = ['manifest.json', 'checksums.sha256'].map(
       (path, index) => ({
         body: () => {
           opened.push(path);

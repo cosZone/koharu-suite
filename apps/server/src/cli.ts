@@ -195,6 +195,39 @@ function printHelp(): void {
   process.stdout.write(HELP);
 }
 
+function cliOptions() {
+  return {
+    apply: { type: 'boolean' },
+    backend: { type: 'string' },
+    channel: { multiple: true, type: 'string' },
+    'complete-range': { multiple: true, type: 'string' },
+    'database-url': { type: 'string' },
+    'desktop-root': { type: 'string' },
+    email: { type: 'string' },
+    'expires-in': { type: 'string' },
+    from: { type: 'string' },
+    help: { short: 'h', type: 'boolean' },
+    id: { type: 'string' },
+    'import-run': { type: 'string' },
+    input: { type: 'string' },
+    'include-provenance': { type: 'boolean' },
+    json: { type: 'boolean' },
+    name: { type: 'string' },
+    object: { type: 'string' },
+    output: { type: 'string' },
+    overwrite: { type: 'boolean' },
+    'password-stdin': { type: 'boolean' },
+    policy: { type: 'string' },
+    port: { short: 'p', type: 'string' },
+    reason: { type: 'string' },
+    scope: { multiple: true, type: 'string' },
+    'target-bytes': { type: 'string' },
+    'telegram-id': { type: 'string' },
+    to: { type: 'string' },
+    version: { short: 'v', type: 'boolean' },
+  } as const;
+}
+
 function parseCli(): {
   command: string | undefined;
   extraPositionals: string[];
@@ -205,36 +238,7 @@ function parseCli(): {
   const { positionals, values } = parseArgs({
     args: normalizeCliArguments(process.argv.slice(2)),
     allowPositionals: true,
-    options: {
-      apply: { type: 'boolean' },
-      backend: { type: 'string' },
-      channel: { multiple: true, type: 'string' },
-      'complete-range': { multiple: true, type: 'string' },
-      'database-url': { type: 'string' },
-      'desktop-root': { type: 'string' },
-      email: { type: 'string' },
-      'expires-in': { type: 'string' },
-      from: { type: 'string' },
-      help: { short: 'h', type: 'boolean' },
-      id: { type: 'string' },
-      'import-run': { type: 'string' },
-      input: { type: 'string' },
-      'include-provenance': { type: 'boolean' },
-      json: { type: 'boolean' },
-      name: { type: 'string' },
-      object: { type: 'string' },
-      output: { type: 'string' },
-      overwrite: { type: 'boolean' },
-      'password-stdin': { type: 'boolean' },
-      policy: { type: 'string' },
-      port: { short: 'p', type: 'string' },
-      reason: { type: 'string' },
-      scope: { multiple: true, type: 'string' },
-      'target-bytes': { type: 'string' },
-      'telegram-id': { type: 'string' },
-      to: { type: 'string' },
-      version: { short: 'v', type: 'boolean' },
-    },
+    options: cliOptions(),
     strict: true,
   });
 
@@ -249,9 +253,14 @@ function parseCli(): {
 
 function archiveJsonInvocation(): { json: true; subcommand: string | undefined } | null {
   const args = normalizeCliArguments(process.argv.slice(2));
-  const archiveIndex = args.indexOf('archive');
-  if (archiveIndex < 0 || !args.includes('--json')) return null;
-  return { json: true, subcommand: args[archiveIndex + 1] };
+  const { positionals, values } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: cliOptions(),
+    strict: false,
+  });
+  if (positionals[0] !== 'archive' || values.json !== true) return null;
+  return { json: true, subcommand: positionals[1] };
 }
 
 async function writeStandardOutput(output: string): Promise<void> {

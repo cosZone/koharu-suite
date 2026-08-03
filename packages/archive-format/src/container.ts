@@ -40,8 +40,16 @@ export interface ReadTarZstdOptions {
 export interface ArchiveWriteEntry {
   path: string;
   byteLength: number;
-  body: Readable | (() => Readable);
+  body: Readable;
 }
+
+export interface LazyArchiveWriteEntry {
+  path: string;
+  byteLength: number;
+  body: () => Readable;
+}
+
+export type ArchiveWriteSourceEntry = ArchiveWriteEntry | LazyArchiveWriteEntry;
 
 export interface WriteTarZstdOptions {
   limits?: Partial<ArchiveContainerLimits>;
@@ -504,7 +512,7 @@ function assertProjectedTarBytesWithinLimit(
 }
 
 export async function writeTarZstd(
-  entries: readonly ArchiveWriteEntry[],
+  entries: readonly ArchiveWriteSourceEntry[],
   output: Writable,
   options: WriteTarZstdOptions = {},
 ): Promise<ArchiveContainerSummary> {
