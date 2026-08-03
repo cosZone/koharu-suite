@@ -2,6 +2,10 @@
 
 import { parseArgs } from 'node:util';
 import { PostgresAdminOperations } from './admin/operations.js';
+import { runArchiveCli } from './archive/cli.js';
+import { PostgresArchiveExportRepository } from './archive/export-repository.js';
+import { ArchiveExportService } from './archive/export-service.js';
+import { inspectArchiveArtifact } from './archive/inspect-service.js';
 import { OwnerService, PostgresOwnerRepository } from './auth/owner-service.js';
 import { readOwnerPassword } from './auth/password-input.js';
 import {
@@ -70,6 +74,7 @@ Commands:
   token       Create, list, or revoke scoped service tokens
   channel     Add, list, enable, or disable Telegram channels
   import      Import historical content
+  archive     Export or inspect portable archives
   media       Inspect or maintain the optional local media cache
   reconcile   Inspect scoped Telegram archive consistency
   doctor      Run read-only deployment diagnostics
@@ -88,10 +93,13 @@ Options:
       --scope <scope>          Repeatable service token scope
       --expires-in <duration>  Optional token expiry in whole days, for example 30d
       --id <id>                Service token ID
-      --input <path>           Telegram Desktop result.json
+      --input <path>           Archive or Telegram Desktop input file
+      --output <path>          Portable archive output file
       --import-run <uuid>      Exact completed Desktop import run for media cache
       --desktop-root <path>    Process-local Telegram Desktop export root
       --channel <id>           Repeatable canonical Telegram channel ID
+      --include-provenance     Include reachable typed source provenance
+      --overwrite              Replace an existing archive output explicitly
       --complete-range <range> Explicit complete channel:start:end coverage; repeatable, apply only
       --apply                  Apply a supported operation (default: dry-run)
       --reason <text>          Required operator reason for reconciliation apply
@@ -124,6 +132,10 @@ Import command:
 Reconciliation command:
   kodama reconcile telegram --channel -1001234567890 [--channel -1009876543210] [--json]
   kodama reconcile telegram --channel -1001234567890 --apply --reason "approved repair"
+
+Archive commands:
+  kodama archive export --output /safe/path/archive.tar.zst [--channel -1001234567890] [--include-provenance] [--overwrite] [--json]
+  kodama archive inspect --input /safe/path/archive.tar.zst [--json]
 
 Media commands:
   kodama media status [--json]
@@ -162,9 +174,12 @@ interface CliOptions {
   id?: string;
   'import-run'?: string;
   input?: string;
+  'include-provenance'?: boolean;
   json?: boolean;
   name?: string;
   object?: string;
+  output?: string;
+  overwrite?: boolean;
   'password-stdin'?: boolean;
   policy?: string;
   port?: string;
@@ -202,9 +217,12 @@ function parseCli(): {
       id: { type: 'string' },
       'import-run': { type: 'string' },
       input: { type: 'string' },
+      'include-provenance': { type: 'boolean' },
       json: { type: 'boolean' },
       name: { type: 'string' },
       object: { type: 'string' },
+      output: { type: 'string' },
+      overwrite: { type: 'boolean' },
       'password-stdin': { type: 'boolean' },
       policy: { type: 'string' },
       port: { short: 'p', type: 'string' },
@@ -316,6 +334,44 @@ async function main(): Promise<void> {
   if (command === 'migrate') {
     await runMigrations(resolveDatabaseUrl(options['database-url']));
     process.stdout.write('Database migrations applied.\n');
+    return;
+  }
+
+  if (command === 'archive') {
+    const cancellation = registerImportCancellation();
+    try {
+      process.exitCode = await runArchiveCli(
+        {
+          ...(options.channel === undefined ? {} : { channels: options.channel }),
+          includeProvenance: options['include-provenance'] === true,
+          ...(options.input === undefined ? {} : { inputPath: options.input }),
+          json: options.json === true,
+          ...(options.output === undefined ? {} : { outputPath: options.output }),
+          overwrite: options.overwrite === true,
+          signal: cancellation.signal,
+          subcommand,
+        },
+        {
+          exportArchive: async (input) => {
+            const databaseUrl = resolveDatabaseUrl(options['database-url']);
+            const connection = createDatabaseConnection(databaseUrl);
+            const repository = new PostgresArchiveExportRepository(databaseUrl, connection.db);
+            try {
+              return await new ArchiveExportService(repository).run(input);
+            } finally {
+              await closeImportResources(
+                () => repository.close(),
+                () => connection.close(),
+              );
+            }
+          },
+          inspectArchive: (input) => inspectArchiveArtifact(input),
+          write: (output) => process.stdout.write(output),
+        },
+      );
+    } finally {
+      cancellation.cleanup();
+    }
     return;
   }
 

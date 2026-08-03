@@ -204,6 +204,9 @@ importers:
       '@hono/node-server':
         specifier: 'catalog:'
         version: 2.0.11(hono@4.12.31)
+      '@koharu-suite/archive-format':
+        specifier: workspace:*
+        version: link:../../packages/archive-format
       '@smithy/node-http-handler':
         specifier: 4.9.10
         version: 4.9.10

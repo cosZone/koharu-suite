@@ -361,6 +361,66 @@ export const importRuns = pgTable(
   ],
 );
 
+export const archiveExportRuns = pgTable(
+  'archive_export_runs',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    selection: jsonb('selection')
+      .$type<{ mode: 'all' } | { mode: 'channels'; telegramChatIds: string[] }>()
+      .notNull(),
+    includeProvenance: boolean('include_provenance').notNull(),
+    formatVersion: integer('format_version').notNull(),
+    schemaVersion: integer('schema_version').notNull(),
+    status: varchar('status', { length: 16 })
+      .$type<'completed' | 'failed' | 'interrupted' | 'running'>()
+      .notNull(),
+    snapshotAt: timestamp('snapshot_at', { withTimezone: true }),
+    artifactSha256: char('artifact_sha256', { length: 64 }),
+    artifactByteLength: bigint('artifact_byte_length', { mode: 'bigint' }),
+    report: jsonb('report').$type<Record<string, unknown>>().notNull().default({}),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('archive_export_runs_started_idx').on(table.startedAt),
+    check('archive_export_runs_selection_check', sql`jsonb_typeof(${table.selection}) = 'object'`),
+    check('archive_export_runs_report_check', sql`jsonb_typeof(${table.report}) = 'object'`),
+    check(
+      'archive_export_runs_version_check',
+      sql`${table.formatVersion} > 0 and ${table.schemaVersion} > 0`,
+    ),
+    check(
+      'archive_export_runs_status_check',
+      sql`${table.status} in ('running', 'completed', 'failed', 'interrupted')`,
+    ),
+    check(
+      'archive_export_runs_lifecycle_check',
+      sql`(
+          ${table.status} = 'running'
+          and ${table.completedAt} is null
+          and ${table.artifactSha256} is null
+          and ${table.artifactByteLength} is null
+        ) or (
+          ${table.status} = 'completed'
+          and ${table.completedAt} is not null
+          and ${table.snapshotAt} is not null
+          and ${table.artifactSha256} is not null
+          and ${table.artifactByteLength} > 0
+        ) or (
+          ${table.status} in ('failed', 'interrupted')
+          and ${table.completedAt} is not null
+          and ${table.artifactSha256} is null
+          and ${table.artifactByteLength} is null
+        )`,
+    ),
+    check(
+      'archive_export_runs_sha256_check',
+      sql`${table.artifactSha256} is null or ${table.artifactSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
 export const messages = pgTable(
   'messages',
   {
