@@ -1,0 +1,1 @@
+export const WORKER_HEARTBEAT_STALE_AFTER_MS = 30_000;

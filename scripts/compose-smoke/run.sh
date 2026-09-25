@@ -42,7 +42,13 @@ fi
 
 "${compose[@]}" exec --no-TTY server node -e \
   "Promise.all(['/healthz', '/readyz'].map((path) => fetch('http://localhost:3000' + path).then((response) => { if (!response.ok) process.exit(1) })))"
+"${compose[@]}" exec --no-TTY worker node dist/worker-healthcheck.js
 "${compose[@]}" exec --no-TTY worker node dist/cli.js health worker
+if "${compose[@]}" exec --no-TTY worker env HOSTNAME=not-the-running-worker \
+  node dist/worker-healthcheck.js; then
+  printf 'Worker healthcheck accepted a different instance.\n' >&2
+  exit 1
+fi
 
 "${compose[@]}" exec --no-TTY server sh -c \
   'test "${TELEGRAM_BOT_TOKEN+x}" != x && test "${KOHARU_TEST_TELEGRAM_API_ROOT+x}" != x'
@@ -82,6 +88,7 @@ leader_after="$("${compose[@]}" exec --no-TTY db psql \
   --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align \
   --command "select instance_id from worker_runtime where singleton_key = 'telegram'")"
 test "$leader_before" = "$leader_after"
+"${compose[@]}" exec --no-TTY worker node dist/worker-healthcheck.js
 "${compose[@]}" exec --no-TTY worker node dist/cli.js health worker
 
 server_container="$("${compose[@]}" ps --quiet server)"
@@ -97,6 +104,7 @@ if [[ "$server_state" != "false:0" || "$worker_state" != "false:0" ]]; then
 fi
 
 "${compose[@]}" up --detach --no-build --wait --wait-timeout 60 worker
+"${compose[@]}" exec --no-TTY worker node dist/worker-healthcheck.js
 "${compose[@]}" exec --no-TTY worker node dist/cli.js health worker
 "${compose[@]}" stop --timeout 30 worker
 

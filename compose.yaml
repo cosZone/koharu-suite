@@ -158,9 +158,7 @@ services:
       test:
         - CMD
         - node
-        - dist/cli.js
-        - health
-        - worker
+        - dist/worker-healthcheck.js
       interval: 10s
       timeout: 5s
       retries: 5
