@@ -123,9 +123,9 @@ S3_CONNECT_TIMEOUT_MS=5000
 S3_REQUEST_TIMEOUT_MS=30000
 ```
 
-本地容量上限为 5 GiB；S3 应用账本默认 5 GiB、最高 5 TiB。实现使用 AWS SDK v3，但 CI 只以固定
-MinIO 版本作为 compatibility baseline，不承诺所有 S3-compatible provider。目标 provider 上线前
-必须按运维手册执行 full/range read、条件创建、copy/restore、保护、prune preview/apply 和
+本地容量上限为 5 GiB；S3 应用账本默认 5 GiB、最高 5 TiB。实现使用 AWS SDK v3。默认 CI
+运行 S3 后端的模拟单测，不执行 MinIO 容器兼容性测试，也不承诺所有 S3-compatible provider。
+目标 provider 上线前必须按运维手册执行 full/range read、条件创建、copy/restore、保护、prune preview/apply 和
 fallback smoke。公开媒体仍由 server proxy；不要暴露 bucket，也不要把 provider lifecycle 当成
 权威删除路径。
 
