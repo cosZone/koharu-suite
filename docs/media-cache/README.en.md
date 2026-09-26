@@ -93,9 +93,10 @@ and verify required data, and only then switch. The access key and secret are no
 they can be rotated by creating a new provider credential, updating and restarting server and worker
 together, and then revoking the old credential.
 
-The implementation uses `@aws-sdk/client-s3`. Its only CI compatibility baseline is a pinned MinIO release,
-covering create-only put, head, full/range read, and delete. The configuration surface may work with other
-S3-compatible providers, but that does not make every provider verified. Run the smoke at the end of this
+The implementation uses `@aws-sdk/client-s3`. Default CI runs mocked S3 backend unit tests covering
+create-only put, head, full/range read, and delete; it does not run the MinIO container compatibility test.
+The configuration surface may work with other S3-compatible providers, but that does not make
+every provider verified. Run the smoke at the end of this
 guide against the target provider, especially `If-None-Match: *` conditional creation, ranges, timeouts, and
 permissions. If safe conditional creation is unavailable, writes fail instead of degrading to an unsafe
 HEAD-then-PUT overwrite.

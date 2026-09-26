@@ -85,9 +85,9 @@ prefix 与 path-style 共同确定存储 namespace。已有 location 时不要�
 新的部署、复制并验证所需数据后再切换。access key 和 secret 不属于 namespace，可以在 provider
 创建新 credential 后协调更新 server/worker 并重启，再撤销旧 credential。
 
-实现使用 `@aws-sdk/client-s3`，CI compatibility baseline 只有固定版本的 MinIO，覆盖 create-only
-put、head、full/range read 和 delete。配置面可以用于其他 S3-compatible provider，但不能据此声称
-所有 provider 都已验证。上线前必须用目标 provider 做本文末尾的 smoke，尤其确认
+实现使用 `@aws-sdk/client-s3`。默认 CI 的模拟单测覆盖 S3 后端的 create-only put、head、
+full/range read 和 delete，不执行 MinIO 容器兼容性测试。配置面可以用于其他 S3-compatible provider，
+但不能据此声称所有 provider 都已验证。上线前必须用目标 provider 做本文末尾的 smoke，尤其确认
 `If-None-Match: *` 条件创建、range、timeout 与权限；不支持安全条件创建时写入会失败，不会退化为
 可能覆盖对象的 HEAD-then-PUT。
 

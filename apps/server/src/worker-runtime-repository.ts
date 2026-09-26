@@ -1,9 +1,10 @@
 import { and, eq } from 'drizzle-orm';
 import type { Database } from './db/client.js';
 import { workerRuntime } from './db/schema.js';
+import { WORKER_HEARTBEAT_STALE_AFTER_MS } from './worker-heartbeat.js';
 
 export const WORKER_HEARTBEAT_INTERVAL_MS = 10_000;
-export const WORKER_HEARTBEAT_STALE_AFTER_MS = 30_000;
+export { WORKER_HEARTBEAT_STALE_AFTER_MS } from './worker-heartbeat.js';
 
 export type CollectorState = 'running' | 'stale' | 'stopped';
 

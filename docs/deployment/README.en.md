@@ -131,9 +131,9 @@ S3_REQUEST_TIMEOUT_MS=30000
 ```
 
 Local capacity is capped at 5 GiB. The S3 application ledger defaults to 5 GiB and is capped at 5 TiB. The
-implementation uses AWS SDK v3, but CI has only a pinned MinIO compatibility baseline and does not promise
-every S3-compatible provider. Before production, run the operations guide's conditional-create, full/range
-read, copy/restore, protection, prune preview/apply, and fallback smoke against the target provider. Public
+implementation uses AWS SDK v3. Default CI runs mocked S3 backend unit tests, not a MinIO container
+compatibility test, and does not promise every S3-compatible provider. Before production, run the
+operations guide's conditional-create, full/range read, copy/restore, protection, prune preview/apply, and fallback smoke against the target provider. Public
 media remains server-proxied. Do not expose the bucket or make provider lifecycle rules the authoritative
 deletion path.
 
